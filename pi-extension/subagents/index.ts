@@ -57,12 +57,12 @@ import {
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
-// Survive /reload: clear timers and abort poll loops from the previous module load.
-// /reload re-imports this file, giving fresh module-level state, but closures from
-// the old module keep running. These global symbols preserve reload compatibility.
+// Survive /reload: replace presentation timers while keeping active completion
+// watchers and their registry alive. Old module closures continue watching the
+// children; the reloaded module adopts the shared registry for status/interrupts.
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
-const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
+const RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -75,13 +75,6 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
     clearInterval(prevStatusInterval);
     (globalThis as any)[STATUS_INTERVAL_KEY] = null;
   }
-  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-  if (prevAbort) prevAbort.abort();
-  (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
-}
-
-function getModuleAbortSignal(): AbortSignal {
-  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
 }
 
 const SubagentParams = Type.Object({
@@ -504,6 +497,8 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
+  /** False after terminal parent shutdown; watcher results must not be delivered. */
+  completionDeliveryEnabled?: boolean;
   cli?: string;
   sentinelFile?: string;
   statusState: SubagentStatusState;
@@ -516,13 +511,50 @@ interface RunningSubagent {
   interactive: boolean;
 }
 
-/** All currently running subagents, keyed by id. */
-const runningSubagents = new Map<string, RunningSubagent>();
+interface SubagentRuntime {
+  runningSubagents: Map<string, RunningSubagent>;
+  pi?: ExtensionAPI;
+  latestCtx?: ExtensionContext;
+}
+
+function createSubagentRuntime(): SubagentRuntime {
+  return { runningSubagents: new Map<string, RunningSubagent>() };
+}
+
+/** Runtime state preserved across /reload. */
+const runtime: SubagentRuntime =
+  (globalThis as any)[RUNTIME_KEY] ??
+  ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
+const runningSubagents = runtime.runningSubagents;
+
+export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
+  return reason === "reload";
+}
+
+export function cleanupSubagentsForShutdown(
+  reason: unknown,
+  agents: Map<string, Pick<RunningSubagent, "abortController" | "completionDeliveryEnabled">>,
+): void {
+  if (shouldPreserveSubagentsOnShutdown(reason)) return;
+
+  for (const agent of agents.values()) {
+    agent.completionDeliveryEnabled = false;
+    agent.abortController?.abort();
+  }
+  agents.clear();
+}
+
+export function shouldDeliverSubagentCompletion(
+  running: Pick<RunningSubagent, "completionDeliveryEnabled">,
+): boolean {
+  return running.completionDeliveryEnabled !== false;
+}
+
+export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
+  return current ?? previous;
+}
 
 // ── Widget management ──
-
-/** Latest ExtensionContext from session_start, used for widget updates. */
-let latestCtx: ExtensionContext | null = null;
 
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
@@ -635,6 +667,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 }
 
 function updateWidget() {
+  const latestCtx = runtime.latestCtx;
   if (!latestCtx?.hasUI) return;
 
   if (runningSubagents.size === 0) {
@@ -1262,7 +1295,7 @@ async function watchSubagent(
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
-    const result = await waitForCompletion(AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await waitForCompletion(signal, {
       intervalMs: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
@@ -1374,13 +1407,21 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
-  // Capture the UI context for widget updates
+  runtime.pi = pi;
+
+  // Capture the UI context for widget updates and restore presentation for
+  // subagents whose watchers survived a reload.
   pi.on("session_start", (_event, ctx) => {
-    latestCtx = ctx;
+    runtime.latestCtx = ctx;
+    if (runningSubagents.size > 0) {
+      startWidgetRefresh();
+      startStatusRefresh(pi);
+      updateWidget();
+    }
   });
 
   // Clean up on session shutdown
-  pi.on("session_shutdown", (_event, _ctx) => {
+  pi.on("session_shutdown", (event, _ctx) => {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1391,12 +1432,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
-    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (moduleAbort) moduleAbort.abort();
-    for (const [_id, agent] of runningSubagents) {
-      agent.abortController?.abort();
-    }
-    runningSubagents.clear();
+
+    cleanupSubagentsForShutdown((event as any).reason, runningSubagents);
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1477,12 +1514,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            if (!shouldDeliverSubagentCompletion(running)) return;
             updateWidget(); // reflect removal from Map immediately
+            const completionApi = selectCompletionApi(pi, runtime.pi);
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
               const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
-              pi.sendMessage(
+              completionApi.sendMessage(
                 {
                   customType: "subagent_ping",
                   content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
@@ -1501,7 +1540,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
             const presentation = resolveResultPresentation(result, running.name);
 
-            pi.sendMessage(
+            completionApi.sendMessage(
               {
                 customType: "subagent_result",
                 content: presentation,
@@ -1521,8 +1560,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
+            if (!shouldDeliverSubagentCompletion(running)) return;
             updateWidget();
-            pi.sendMessage(
+            selectCompletionApi(pi, runtime.pi).sendMessage(
               {
                 customType: "subagent_result",
                 content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
@@ -1904,11 +1944,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            if (!shouldDeliverSubagentCompletion(running)) return;
             updateWidget();
+            const completionApi = selectCompletionApi(pi, runtime.pi);
 
             if (result.ping) {
               const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
-              pi.sendMessage(
+              completionApi.sendMessage(
                 {
                   customType: "subagent_ping",
                   content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
@@ -1936,7 +1978,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               name,
             );
 
-            pi.sendMessage(
+            completionApi.sendMessage(
               {
                 customType: "subagent_result",
                 content: presentation,
@@ -1954,8 +1996,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
+            if (!shouldDeliverSubagentCompletion(running)) return;
             updateWidget();
-            pi.sendMessage(
+            selectCompletionApi(pi, runtime.pi).sendMessage(
               {
                 customType: "subagent_result",
                 content: `Resume error: ${err?.message ?? String(err)}`,

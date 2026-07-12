@@ -2,8 +2,6 @@
 
 Async subagents for [pi](https://github.com/badlogic/pi-mono) running exclusively in [herdr](https://herdr.dev). Spawn, orchestrate, and manage sub-agent sessions in dedicated herdr tabs or panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
-https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
-
 ## How It Works
 
 Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `starting`, `active`, `waiting`, `stalled`, or `running`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
@@ -25,13 +23,15 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 
 ## Install
 
-Install the package explicitly from this repository (replace the URL if you use a fork):
+Install the package from npm:
 
 ```bash
-pi install git:github.com/0xRichardH/pi-herdr-subagents
+pi install npm:pi-herdr-subagents
 ```
 
 This project does not install or load `HazAT/pi-interactive-subagents` automatically.
+
+For maintainers publishing a release to npm, see [RELEASING.md](RELEASING.md).
 
 Start herdr, then run pi inside it:
 
