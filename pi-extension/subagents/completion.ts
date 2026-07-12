@@ -13,7 +13,13 @@ export interface CompletionResult {
 export interface CompletionOptions {
   intervalMs: number;
   readTerminalTail: () => Promise<string>;
-  isPanePresent?: () => Promise<boolean>;
+  inspectPane?: () => Promise<import("./lifecycle.ts").PaneInspection>;
+  /** Bounded artifact grace after explicit pane disappearance. Default: 500ms. */
+  paneDisappearanceGraceMs?: number;
+  onPaneInspection?: (
+    inspection: import("./lifecycle.ts").PaneInspection,
+    observedAt: number,
+  ) => void;
   sessionFile?: string;
   sentinelFile?: string;
   onTick?: (elapsedSeconds: number) => void;
@@ -76,6 +82,33 @@ function terminalExitCode(screen: string): number | null {
   return match ? Number.parseInt(match[1], 10) : null;
 }
 
+function completionArtifact(options: CompletionOptions): CompletionResult | null {
+  const sidecar = consumeExitSidecar(options.sessionFile);
+  if (sidecar) return sidecar;
+  if (options.sentinelFile && existsSync(options.sentinelFile)) {
+    return { reason: "sentinel", exitCode: 0 };
+  }
+  return null;
+}
+
+async function waitForDisappearanceArtifacts(
+  signal: AbortSignal,
+  options: CompletionOptions,
+): Promise<CompletionResult | null> {
+  const immediate = completionArtifact(options);
+  if (immediate) return immediate;
+
+  const graceMs = Math.max(0, options.paneDisappearanceGraceMs ?? 500);
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline) {
+    const remaining = deadline - Date.now();
+    await abortableDelay(Math.min(25, remaining), signal);
+    const result = completionArtifact(options);
+    if (result) return result;
+  }
+  return null;
+}
+
 function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.reject(new Error(ABORT_MESSAGE));
 
@@ -112,24 +145,24 @@ export async function waitForCompletion(
       const exitCode = terminalExitCode(await options.readTerminalTail());
       if (exitCode !== null) return { reason: "sentinel", exitCode };
     } catch {
-      // Pane reads can fail transiently while herdr updates or closes a pane.
-      // Presence checks must also be non-fatal: only an explicit false means missing.
-      let panePresent = true;
-      if (options.isPanePresent) {
-        try {
-          panePresent = await options.isPanePresent();
-        } catch {
-          panePresent = true;
-        }
+      // Terminal reads are only sentinel/output probes; Herdr status is polled
+      // independently below, even when terminal reads succeed.
+    }
+
+    if (options.inspectPane) {
+      let inspection: import("./lifecycle.ts").PaneInspection;
+      try {
+        inspection = await options.inspectPane();
+      } catch {
+        inspection = { kind: "unavailable", error: "inspectPane threw" };
       }
-      if (!panePresent) {
-        // Recheck completion artifacts after observing disappearance to close
-        // the race with a child writing its sidecar while the pane exits.
-        const racedSidecar = consumeExitSidecar(options.sessionFile);
-        if (racedSidecar) return racedSidecar;
-        if (options.sentinelFile && existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
-        }
+      const observedAt = Date.now();
+      options.onPaneInspection?.(inspection, observedAt);
+      if (inspection.kind === "missing") {
+        // Pane closure and atomic artifact publication are separate operations.
+        // Allow a short bounded grace window before declaring evidence lost.
+        const racedCompletion = await waitForDisappearanceArtifacts(signal, options);
+        if (racedCompletion) return racedCompletion;
         return {
           reason: "error",
           exitCode: 1,

@@ -26,7 +26,7 @@ import {
   renameCurrentWorkspace,
   readPane,
   readPaneAsync,
-  isPanePresent,
+  inspectPane,
 } from "./terminal.ts";
 import { waitForCompletion } from "./completion.ts";
 
@@ -60,9 +60,11 @@ import {
   markInterruptRequested,
   markProcessRunning,
   observeActivity,
+  observePaneInspection,
   projectLifecycle,
   type LifecycleProjection,
   type SubagentLifecycle,
+  type PaneInspection,
 } from "./lifecycle.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
@@ -640,6 +642,7 @@ function formatLifecycleWidgetLabel(
   if (projection.kind === "active") return projection.label
     ? ` active · ${projection.label}${duration} `
     : ` active${duration} `;
+  if (projection.kind === "blocked") return ` blocked${duration} `;
   if (projection.kind === "running") return " running… ";
   if (projection.kind === "waiting") return ` waiting${duration} `;
   if (projection.kind === "interrupted") return ` interrupted${duration} `;
@@ -663,7 +666,8 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
   const activeCount = rendered.filter(({ projection }) =>
     projection.kind === "active" ||
     projection.kind === "starting" ||
-    projection.kind === "running"
+    projection.kind === "running" ||
+    projection.kind === "blocked"
   ).length;
   const openCount = agents.length - activeCount;
   const info = activeCount > 0
@@ -789,7 +793,15 @@ function ensureLifecycle(running: RunningSubagent): SubagentLifecycle {
   if (state?.activityLabel === "interrupted" && state.localOverrideAtMs != null) {
     lifecycle = markInterruptRequested(lifecycle, state.localOverrideAtMs);
   } else if (state?.phase === "done") {
-    lifecycle = markCompletionDetected(lifecycle, { reason: "done", exitCode: 0 }, state.lastActivityAtMs ?? running.startTime);
+    // Legacy activity "done" means the turn ended, not that completion
+    // evidence was recorded. Hydrate as Herdr-style waiting and let the
+    // preserved watcher consume sidecar/sentinel evidence.
+    const observedAt = state.lastActivityAtMs ?? running.startTime;
+    lifecycle = observePaneInspection(
+      lifecycle,
+      { kind: "present", observedAt, agentStatus: "done" },
+      observedAt,
+    );
   } else if (state?.phase === "active" || state?.phase === "waiting" || state?.phase === "starting") {
     lifecycle = observeActivity(lifecycle, {
       ok: true,
@@ -1345,7 +1357,12 @@ async function watchSubagent(
       sessionFile,
       sentinelFile: running.sentinelFile,
       readTerminalTail: () => readPaneAsync(surface, 5),
-      isPanePresent: () => isPanePresent(surface),
+      inspectPane: async () => inspectPane(surface),
+      onPaneInspection: (inspection: PaneInspection, observedAt: number) => {
+        ensureLifecycle(running);
+        running.lifecycle = observePaneInspection(running.lifecycle, inspection, observedAt);
+        updateWidget();
+      },
       onTick() {
         observeRunningSubagent(running);
       },

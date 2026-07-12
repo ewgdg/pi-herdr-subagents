@@ -169,21 +169,69 @@ export async function readHerdrScreenAsync(surface: string, lines = 50): Promise
   return herdrExecAsync(["pane", "read", surface, "--source", "visible", "--lines", String(lines)]);
 }
 
+export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";
+
+type PaneInspectionResult =
+  | { kind: "present"; agent?: string; agentStatus: "idle" | "working" | "blocked" | "done" | "unknown" }
+  | { kind: "missing"; error?: string }
+  | { kind: "unavailable"; error: string };
+
+function parsePaneGetOutput(output: string, surface: string): PaneInspectionResult {
+  const parsed = parseHerdrJson(output) as
+    | { result?: { pane?: unknown }; error?: { code?: unknown; message?: unknown } }
+    | null;
+  const errorObj = parsed?.error;
+  if (errorObj?.code === "pane_not_found" || errorObj?.code === "not_found") {
+    return { kind: "missing", error: typeof errorObj.message === "string" ? errorObj.message : "pane not found" };
+  }
+  const pane = parsed?.result?.pane;
+  if (!pane || typeof pane !== "object") return { kind: "unavailable", error: "pane get returned no pane record" };
+  const record = pane as { pane_id?: unknown; agent?: unknown; agent_status?: unknown };
+  if (record.pane_id !== surface) return { kind: "unavailable", error: "pane id mismatch" };
+  const agent = typeof record.agent === "string" ? record.agent : undefined;
+  const rawStatus = typeof record.agent_status === "string" ? record.agent_status : "unknown";
+  const agentStatus = rawStatus === "idle" ||
+      rawStatus === "working" ||
+      rawStatus === "blocked" ||
+      rawStatus === "done" ||
+      rawStatus === "unknown"
+    ? rawStatus
+    : "unknown";
+  return { kind: "present", ...(agent ? { agent } : {}), agentStatus };
+}
+
+function parsePaneGetError(error: any): PaneInspectionResult {
+  for (const raw of [error?.stderr, error?.stdout]) {
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    try {
+      const parsed = parsePaneGetOutput(raw, "");
+      if (parsed.kind === "missing") return parsed;
+    } catch {
+      // A CLI may emit plain diagnostics on one stream and structured JSON on
+      // the other. Parse each stream independently before giving up.
+    }
+    // Older/alternate Herdr builds may print the stable error code as plain
+    // text rather than JSON. Only match explicit identifiers, not generic
+    // prose such as "pane unavailable".
+    if (/\b(?:pane_not_found|not_found)\b/.test(raw)) {
+      return { kind: "missing", error: raw.trim() };
+    }
+  }
+  const message = error?.message ? String(error.message) : "herdr pane get failed";
+  return { kind: "unavailable", error: message };
+}
+
 /**
- * Check whether a herdr pane is still present.
- * Returns `true` when presence is unknown (list/parse failures) so callers
- * never treat infrastructure glitches as pane disappearance.
- * Returns `false` only when the list is successfully parsed and the pane is absent.
+ * Structured pane query.
+ * - present: pane is reachable; agent/agentStatus may be present when detected
+ * - missing: server responded, pane is gone
+ * - unavailable: server command failed; caller should keep polling
  */
-export async function isHerdrPanePresent(surface: string): Promise<boolean> {
+export async function inspectHerdrPane(surface: string): Promise<PaneInspectionResult> {
   try {
-    const output = await herdrExecAsync(["pane", "list"]);
-    const parsed = parseHerdrJson(output) as { result?: { panes?: Array<{ pane_id?: unknown }> } } | null;
-    const panes = parsed?.result?.panes;
-    if (!Array.isArray(panes)) return true;
-    return panes.some((pane) => pane?.pane_id === surface);
-  } catch {
-    return true;
+    return parsePaneGetOutput(await herdrExecAsync(["pane", "get", surface]), surface);
+  } catch (error: any) {
+    return parsePaneGetError(error);
   }
 }
 
@@ -215,4 +263,6 @@ export const __herdrTest__ = {
   parseHerdrJson,
   extractHerdrPaneId,
   extractHerdrRootPaneId,
+  parsePaneGetOutput,
+  parsePaneGetError,
 };
