@@ -7,8 +7,9 @@
  *
  * Duration: ~30-120s per test, depending on the selected model.
  *
- * Run `PI_TEST_MODEL="deepseek/deepseek-v4-flash" npm run test:integration`
- * from inside herdr. The explicit model keeps real-LLM runs predictable.
+ * Run `PI_TEST_MODEL="deepseek/deepseek-v4-flash" PI_TEST_TIMEOUT=180000
+ * npm run test:integration` from inside herdr. The explicit model keeps
+ * real-LLM runs predictable and the longer timeout covers the lifecycle suite.
  *
  * Configuration:
  *   PI_TEST_MODEL     — model for all pi sessions (default: openrouter/free; recommended: deepseek/deepseek-v4-flash)
