@@ -134,24 +134,28 @@ export interface TestEnv {
   dir: string;
   /** Active mux backend for this test run */
   backend: MuxBackend;
-  /** Workspace where the suite is running. */
+  /** Dedicated workspace owned by this test environment. */
   workspaceId: string;
-  /** Pane IDs that existed before this test environment started. */
-  baselinePanes: Set<string>;
+  /** Parent workspace restored after cleanup. */
+  previousWorkspaceId: string | undefined;
   /** Surfaces created directly by the harness. */
   surfaces: string[];
   /** Temp files to clean up */
   tempFiles: string[];
 }
 
-function listWorkspacePaneIds(workspaceId: string): string[] {
-  const output = execFileSync("herdr", ["pane", "list", "--workspace", workspaceId], {
-    encoding: "utf8",
-  });
-  const parsed = JSON.parse(output) as { result?: { panes?: Array<{ pane_id?: unknown }> } };
-  return (parsed.result?.panes ?? [])
-    .map((pane) => pane.pane_id)
-    .filter((paneId): paneId is string => typeof paneId === "string" && paneId.length > 0);
+function createTestWorkspace(cwd: string): string {
+  const output = execFileSync(
+    "herdr",
+    ["workspace", "create", "--cwd", cwd, "--label", `pi-integ-${Date.now()}`, "--no-focus"],
+    { encoding: "utf8" },
+  );
+  const parsed = JSON.parse(output) as { result?: { workspace?: { workspace_id?: unknown } } };
+  const workspaceId = parsed.result?.workspace?.workspace_id;
+  if (typeof workspaceId !== "string" || workspaceId.length === 0) {
+    throw new Error(`Unexpected herdr workspace create output: ${output.trim() || "(empty)"}`);
+  }
+  return workspaceId;
 }
 
 /**
@@ -161,9 +165,12 @@ function listWorkspacePaneIds(workspaceId: string): string[] {
 export function createTestEnv(backend: MuxBackend): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
   const agentsDir = join(dir, ".pi", "agents");
-  const workspaceId = process.env.HERDR_WORKSPACE_ID;
-  if (!workspaceId) throw new Error("HERDR_WORKSPACE_ID is required for integration cleanup");
-  const baselinePanes = new Set(listWorkspacePaneIds(workspaceId));
+  const previousWorkspaceId = process.env.HERDR_WORKSPACE_ID;
+  if (!previousWorkspaceId) throw new Error("HERDR_WORKSPACE_ID is required for integration tests");
+  const workspaceId = createTestWorkspace(dir);
+  // Herdr creates subagent tabs in the workspace identified by this env var.
+  // Point the harness at its dedicated workspace without changing the parent's pane.
+  process.env.HERDR_WORKSPACE_ID = workspaceId;
   mkdirSync(agentsDir, { recursive: true });
 
   // Copy test agent definitions into the project-local agents dir and pin
@@ -181,29 +188,27 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
     }
   }
 
-  return { dir, backend, workspaceId, baselinePanes, surfaces: [], tempFiles: [] };
+  return { dir, backend, workspaceId, previousWorkspaceId, surfaces: [], tempFiles: [] };
 }
 
 /**
  * Clean up all resources created during the test.
  */
 export function cleanupTestEnv(env: TestEnv): void {
-  // Close every pane created since the environment started, not only the
-  // parent surfaces registered by the harness. Subagent panes are created by
-  // the extension itself and otherwise leak when a test times out or a child
-  // remains interactive unexpectedly.
-  let currentPanes: string[] = [];
-  try {
-    currentPanes = listWorkspacePaneIds(env.workspaceId);
-  } catch {}
-  const createdPanes = new Set([
-    ...env.surfaces,
-    ...currentPanes.filter((paneId) => !env.baselinePanes.has(paneId)),
-  ]);
-  for (const surface of createdPanes) {
+  // Close only surfaces explicitly owned by the harness. The dedicated
+  // workspace is then closed as a final safety net for extension-created panes.
+  for (const surface of env.surfaces) {
     try {
       closePane(surface);
     } catch {}
+  }
+  try {
+    execFileSync("herdr", ["workspace", "close", env.workspaceId], { encoding: "utf8" });
+  } catch {}
+  if (env.previousWorkspaceId) {
+    process.env.HERDR_WORKSPACE_ID = env.previousWorkspaceId;
+  } else {
+    delete process.env.HERDR_WORKSPACE_ID;
   }
   for (const file of env.tempFiles) {
     try {
