@@ -17,6 +17,7 @@ import {
   getLeafId,
   getNewEntries,
   findLastAssistantMessage,
+  findObservedSessionRuntime,
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
@@ -102,16 +103,22 @@ function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
   const registeredCommands: Array<any> = [];
   const registeredMessageRenderers: Array<any> = [];
+  const eventHandlers = new Map<string, Array<Function>>();
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
   return {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
+    eventHandlers,
     sentUserMessages,
     sentMessages,
     api: {
-      on() {},
+      on(event: string, handler: Function) {
+        const handlers = eventHandlers.get(event) ?? [];
+        handlers.push(handler);
+        eventHandlers.set(event, handlers);
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -378,6 +385,19 @@ describe("session.ts", () => {
         },
       };
       assert.equal(findLastAssistantMessage([msg] as any[]), null);
+    });
+  });
+
+  describe("findObservedSessionRuntime", () => {
+    it("extracts the latest model and thinking entries", () => {
+      assert.deepEqual(
+        findObservedSessionRuntime([
+          { type: "model_change", id: "m1", provider: "fake", modelId: "old" },
+          { type: "thinking_level_change", id: "t1", thinkingLevel: "medium" },
+          { type: "model_change", id: "m2", provider: "other", modelId: "new" },
+        ]),
+        { provider: "other", modelId: "new", thinking: "medium" },
+      );
     });
   });
 
@@ -1039,24 +1059,24 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled agents select role-appropriate models, thinking, and interaction modes", () => {
-    const expected = {
-      scout: { model: "anthropic/claude-haiku-4-5", thinking: "minimal", interactive: false },
-      worker: { model: "anthropic/claude-sonnet-4-6", thinking: "minimal", interactive: false },
-      reviewer: { model: "anthropic/claude-opus-4-6", thinking: "medium", interactive: false },
-      planner: { model: "anthropic/claude-opus-4-6", thinking: "medium", interactive: true },
-      "visual-tester": { model: "anthropic/claude-sonnet-4-6", thinking: "minimal", interactive: false },
+  it("bundled agents inherit parent runtime and preserve interaction modes", () => {
+    const expectedInteraction = {
+      scout: false,
+      worker: false,
+      reviewer: false,
+      planner: true,
+      "visual-tester": false,
     } as const;
 
-    for (const [name, wanted] of Object.entries(expected)) {
+    for (const [name, interactive] of Object.entries(expectedInteraction)) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(defs.model, wanted.model, `${name} should use the expected model tier`);
-      assert.equal(defs.thinking, wanted.thinking, `${name} should use the expected thinking level`);
+      assert.equal(defs.model, undefined, `${name} should inherit the parent model`);
+      assert.equal(defs.thinking, undefined, `${name} should inherit the parent thinking level`);
       assert.equal(
         testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        wanted.interactive,
-        `${name} should use the expected interaction mode`,
+        interactive,
+        `${name} should preserve its interaction mode`,
       );
     }
   });
@@ -1788,6 +1808,35 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("refreshes subagent routing guidance from the live authenticated model registry", () => {
+    const { api, registeredTools, eventHandlers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const subagent = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagent);
+    const sessionStart = eventHandlers.get("session_start")?.[0];
+    assert.ok(sessionStart);
+    sessionStart({}, {
+      hasUI: false,
+      modelRegistry: {
+        find: (provider: string, id: string) => ({ provider, id, reasoning: true }),
+        getAvailable: () => [{
+          provider: "fake",
+          id: "fast",
+          reasoning: true,
+          input: ["text"],
+          contextWindow: 128_000,
+          maxTokens: 16_000,
+          cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+        }],
+        hasConfiguredAuth: () => true,
+      },
+    });
+
+    assert.match(subagent.promptGuidelines.join("\n"), /fake\/fast/);
+    assert.match(subagent.promptGuidelines.join("\n"), /inherit the parent runtime/);
+  });
+
   it("ignores an inherited deny list in a parent process", () => {
     delete process.env.PI_SUBAGENT_ID;
     process.env.PI_DENY_TOOLS = "subagent,subagent_interrupt,subagent_resume,subagents_list";
