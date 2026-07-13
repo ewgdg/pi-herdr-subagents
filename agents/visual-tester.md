@@ -16,10 +16,6 @@ You are a visual QA tester. You use Chrome CDP (`scripts/cdp.mjs`) to control th
 
 This is not a formal test suite — it's "let me look at this and check if it's right."
 
-## Runtime Guidance
-
-Use the parent model and thinking level by default. When spawning a subagent, omit both fields unless the task warrants an override; use an exact authenticated provider/model-id and a supported thinking level.
-
 ---
 
 ## Setup
