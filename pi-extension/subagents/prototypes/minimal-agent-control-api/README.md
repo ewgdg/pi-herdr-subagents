@@ -1,10 +1,10 @@
-# PROTOTYPE — minimal agent-facing control interface
+# PROTOTYPE — minimal agent-facing messaging interface
 
 Throwaway logic prototype for **Prototype the minimal agent-facing control API**.
 
 ## Question
 
-What is the smallest coherent agent-facing interface for explicit completion, actionable messages, Answers, escalation, and post-message disposition across autonomous, human-in-the-loop, and reviewer–implementer workflows?
+Can one explicit message operation cover Signal, Request, Answer, spawn-with-initial-work, authorized automatic resume, post-acceptance settlement, and completion without exposing transport or lifecycle machinery?
 
 ## Run
 
@@ -12,126 +12,183 @@ What is the smallest coherent agent-facing interface for explicit completion, ac
 npm run prototype:agent-control
 ```
 
-Choose a workflow, press `n` to advance it, and inspect the full Agent and Request state after every action.
+Controls:
 
-- `v` switches the entire model-facing protocol: three semantic tools versus one command envelope.
-- `c` independently switches final-message completion: Answer then Complete versus completion fused into the final Answer. Switching either axis preserves the current scenario step for direct comparison.
+- `1` — autonomous worker
+- `2` — human-in-the-loop escalation
+- `3` — reviewer–implementer with automatic resume
+- `n` — advance one step
+- `z` — reset
+- `q` — quit
 
-## Protocol A — three semantic tools (recommended)
+The simulator renders every call and the complete Agent, activation, waiting-reason, and Request state after each transition.
 
-Three model-facing tools backed by one deep Agent Control module:
+## Candidate interface
+
+One model-facing communication tool backed by a deep Agent Messaging module:
 
 ```ts
 agent_send({
-  kind: "signal" | "request",
-  to: AgentId,
+  target:
+    | { agent: AgentId }
+    | { spawn: SpawnSpec }
+    | { request: RequestId },
+
   message: string,
+
+  response?:
+    | "none"
+    | {
+        required: true,
+        delivery: "steer" | "deferred",
+      },
+
   delivery?: "steer" | "deferred",
-  answerDelivery?: "steer" | "deferred", // Request only; default: steer
-  onAccepted: "continue" | "settle",
-})
 
-agent_answer({
-  request: RequestId,
-  outcome: "fulfilled" | "unable",
-  message: string,
-  onAccepted: "continue" | "settle",
+  onAccepted:
+    | "continue"
+    | "settle"
+    | "complete",
 })
-
-agent_complete({ result: string })
 ```
 
-Receipts report durable queue acceptance and runtime-generated identities. They do not report delivery, reading, understanding, or execution.
+This is represented internally as a discriminated union, not a permissive bag of optional fields. Each target branch admits only its valid fields.
 
-### Why three tools
+## Derivation rules
 
-- `agent_send` combines Signal and Request because both have a recipient and delivery choice.
-- `agent_answer` remains separate because the Request determines authority, destination, correlation, and return delivery timing. Accepting a recipient here would weaken the established Answer contract.
-- `agent_complete` remains separate because completion is the sole agent-declared terminal lifecycle action.
+### Signal
 
-This is a small external interface over a deep implementation: workflow validation, IDs, durable acceptance, dependencies, inbox routing, delivery timing, wake scheduling, transcript projection, recovery, and ownership fencing remain behind the seam.
-
-## Protocol B — one command envelope
-
-The same domain operations can instead use one model-facing tool:
+An existing Agent target with no Answer requirement:
 
 ```ts
-agent_control({
-  command:
-    | { type: "message.signal"; to: AgentId; message: string; delivery?: Delivery }
-    | { type: "message.request"; to: AgentId; message: string; delivery?: Delivery; answerDelivery?: Delivery }
-    | { type: "message.answer"; request: RequestId; outcome: AnswerOutcome; message: string }
-    | { type: "agent.complete"; result: string },
-  onAccepted?: "continue" | "settle",
+agent_send({
+  target: { agent: reviewerId },
+  message: "Revision def456 is ready.",
+  response: "none",
+  delivery: "steer",
+  onAccepted: "continue",
 })
 ```
 
-This genuinely changes the protocol surface: every scenario renders `agent_control`, including completion as the `agent.complete` command. It minimizes tool inventory but makes one larger discriminated schema less immediately discoverable to the model.
+### Request
 
-## Post-message disposition
-
-`onAccepted` must be explicit:
-
-- `continue` returns the receipt to the model and permits another model turn.
-- `settle` returns a terminating tool result after durable acceptance, suppressing Pi's otherwise automatic follow-up model turn. At `agent_settled`, unresolved Requests produce `waiting(agent)`; otherwise the open activation becomes `waiting(human)` unless an operation dependency exists.
-
-There is no standalone `wait`, `yield`, or `settle` tool.
-
-Pi requires this field in practice. A normal tool result causes another model turn. Pi skips that turn only when every result in the tool batch is terminating, so “send a Request and just end the turn” is not an agent action unless disposition reaches the tool result.
-
-## Escalation
-
-Escalation is not another message kind or tool. It is an ordinary Request to an Agent whose address is already known—normally the direct Spawner.
-
-There is no implicit Workflow Owner alias. A nested Agent can contact the Workflow Owner directly only if the Owner's session UUID was explicitly shared. Otherwise escalation follows the Spawner chain.
-
-Human waiting also needs no tool. An Agent asks its question in ordinary assistant text and naturally settles with no terminal action or unresolved dependency.
-
-## Deliberately excluded
-
-- `inspect` and passive status queries: observability decision
-- interrupt, lifecycle cancel, and resume: Child Control interface
-- Request cancellation and deadlock policy: failure-handling decision
-- caller-selected Message IDs: retry and transport detail
-- Answer destination or delivery fields: already fixed by the Request
-- opaque Answer Slots or Escalation Routes: conflict with established Request-ID correlation and UUID addressability
-- global discovery, Workflow Owner relay, `interactive`, `autoExit`, and `wait`
-
-## Other alternatives considered
-
-### Five semantic methods
-
-Separate `signal`, `request`, `answer`, `cancelRequest`, and `complete` calls are highly discoverable, but Request cancellation belongs to the failure ticket and separate Signal/Request methods duplicate recipient and delivery concepts.
-
-### Capability objects
-
-Opaque Answer Slots and Escalation Routes make authority structural, but they replace decisions already made: an Agent's session UUID is its bearer address, and `inReplyTo` Request identity determines Answer authority and routing. Child Control remains a genuinely separate capability-bearing interface.
-
-## Independent final-message completion comparison
-
-Separate completion uses `agent_complete` under Protocol A and the `agent.complete` command under Protocol B. A final Answer followed by completion may require one additional model turn. This preserves one explicit terminal lifecycle operation and leaves a safe, visible partial outcome if the Agent crashes after the Answer is accepted but before completion.
-
-This setting affects only a message immediately followed by the sender's completion. Standalone autonomous completion and non-final messages are intentionally identical in both modes.
-
-The orthogonal fused-completion setting allows:
+An existing Agent target with a required Answer:
 
 ```ts
-agent_answer({
-  request,
-  outcome: "fulfilled",
-  message: "Approved.",
-  onAccepted: { complete: "Review finished." },
+agent_send({
+  target: { agent: reviewerId },
+  message: "Review revision def456.",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle",
 })
 ```
 
-That saves a model turn and can define message-acceptance-before-completion ordering, but it makes messaging a second completion entry point and enlarges every messaging disposition. The prototype exists to decide whether that optimization earns its interface cost.
+The `response.delivery` value is the eventual Answer's delivery timing. The Request creates one sender dependency atomically with acceptance.
+
+### Spawn with initial Request
+
+```ts
+agent_send({
+  target: {
+    spawn: {
+      agent: "worker",
+      name: "Pagination worker",
+    },
+  },
+  message: "Implement pagination and run the tests.",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle",
+})
+```
+
+The operation atomically creates the Agent and Spawner relationship, establishes Child Control, records the Request dependency, places the Request in the child's initial context, and starts its first activation. There is no empty Agent followed by a second task-message call.
+
+A spawn target must require an Answer so the initial work has an explicit result route.
+
+### Answer
+
+A Request target identifies a terminal Answer:
+
+```ts
+agent_send({
+  target: { request: requestId },
+  message: "Implemented pagination; all tests pass.",
+  onAccepted: "complete",
+})
+```
+
+The Request determines Answer authority, destination, correlation, and return delivery timing. The content remains one plain `message` string. There is no `outcome`, `result`, `unable`, recipient, response, or delivery field on this branch.
+
+Every accepted Answer terminally closes its Request. An inability is expressed directly:
+
+```ts
+agent_send({
+  target: { request: requestId },
+  message: "Cannot access the deployment credentials.",
+  onAccepted: "complete",
+})
+```
+
+The requester wakes and interprets the content. The runtime does not parse prose into work-success categories.
+
+## Post-acceptance disposition
+
+`onAccepted` is evaluated only after durable message acceptance succeeds:
+
+- `continue` — return the acceptance receipt and permit another model turn.
+- `settle` — suppress the automatic follow-up model turn and derive typed waiting from unresolved dependencies.
+- `complete` — atomically accept the final outbound Signal or Answer and end the sender's activation.
+
+Acceptance failure never settles or completes the sender.
+
+`complete` is valid only for a Signal or Answer. It is invalid for a Request because a Request creates a new unresolved dependency.
+
+There is no `agent_complete`, `agent.complete`, standalone wait, yield, or settle operation. Every completing subagent sends a useful final outbound Signal or Answer.
+
+## Automatic resume on Request
+
+A Request to an existing Agent behaves according to recipient state and caller authority:
+
+| Recipient | Signal | Request |
+|---|---|---|
+| active | queue/deliver | queue/deliver |
+| waiting | wake | wake |
+| interrupted | queue without resume | create/start work only with Child Control or Workflow Owner authority |
+| ended | reject | create a new activation only with Child Control or Workflow Owner authority |
+
+An ended activation remains immutable. Authorized Request delivery creates a new activation for the same durable Agent/session.
+
+Activation creation, Request acceptance, dependency creation, and ownership fencing must commit as one idempotent operation. Retrying the same canonical tool call cannot create duplicate activations.
+
+Addressability alone never grants automatic resume. An unauthorized peer Request to an interrupted or ended Agent is rejected.
+
+## Why one tool remains coherent
+
+Unlike a generic `agent_control` envelope, `agent_send` performs exactly one conceptual operation: send one actionable message. Target and response shape derive the message kind and any necessary recipient creation or activation.
+
+The deep implementation hides:
+
+- Message and Request identity allocation
+- Workflow membership and authority validation
+- spawn and activation creation
+- Child Control checks
+- atomic Request dependency creation
+- Answer authority and routing
+- durable recipient acceptance
+- Pending Message Pointers
+- Steer and Deferred delivery
+- typed waiting and wake scheduling
+- completion preconditions and commitment
+- retries, crash recovery, and Agent Run ownership fencing
+
+Transport, SQLite, transcript paths, processes, panes, and session files do not cross the interface.
 
 ## Workflow verdicts represented
 
-- **Autonomous:** ordinary work needs only `agent_complete`; completion result replaces a redundant parent notification.
-- **Human-in-the-loop:** a nested Agent sends a Request to its Spawner with `onAccepted: "settle"`; the Spawner asks the human with ordinary text, then Answers by Request ID.
-- **Reviewer–implementer:** change requests use `onAccepted: "settle"` so the reviewer remains open and message-wakeable for another revision; final approval exposes the separate-versus-fused completion tradeoff.
+- **Autonomous:** spawn carries the initial Request; the worker's terminal Answer is also completion.
+- **Human-in-the-loop:** a nested Request wakes the Spawner; the Spawner asks the human with ordinary assistant text and returns the decision through a plain Answer.
+- **Reviewer–implementer:** the Implementer spawns a Reviewer through the first review Request; a later authorized Request automatically starts a new Reviewer activation after its earlier completion.
 
 ## Prototype boundaries
 
-This simulator performs no Pi, IPC, SQLite, transcript, or lifecycle operations. It renders the proposed calls and reduces them into visible Agent work states and Request states. It is intentionally throwaway and must not be merged into production code.
+This simulator performs no Pi, IPC, SQLite, transcript, process, or lifecycle operations. It reduces proposed calls into visible domain state. It is intentionally throwaway and must not be merged into production code.

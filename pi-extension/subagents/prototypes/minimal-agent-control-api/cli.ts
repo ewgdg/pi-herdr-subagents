@@ -1,18 +1,19 @@
 #!/usr/bin/env node
 
-/** PROTOTYPE — interactive walkthrough of the candidate agent-facing control interface. */
+/** PROTOTYPE — interactive walkthrough of the candidate agent-facing messaging interface. */
 
 import { createInterface } from "node:readline";
 
-type InterfaceVariant = "semantic-tools" | "command-envelope";
-type CompletionComposition = "separate" | "fused";
 type ScenarioName = "autonomous" | "hitl" | "review";
-type WorkState = "active" | "waiting(human)" | "waiting(agent)" | "ended(completed)";
+type WaitingReason = "human" | "agent" | "operation";
+type WorkPhase = "active" | "waiting" | "ended(completed)";
 
 type AgentState = {
   id: string;
-  work: WorkState;
-  unresolved: string[];
+  activation: number;
+  phase: WorkPhase;
+  waitingOn: WaitingReason[];
+  unresolvedRequests: string[];
 };
 
 type RequestState = {
@@ -23,8 +24,6 @@ type RequestState = {
 };
 
 type PrototypeState = {
-  interfaceVariant: InterfaceVariant;
-  completionComposition: CompletionComposition;
   scenario: ScenarioName;
   step: number;
   agents: Record<string, AgentState>;
@@ -35,7 +34,7 @@ type PrototypeState = {
 
 type ScenarioStep = {
   label: string;
-  call: (state: PrototypeState) => string;
+  call: string;
   apply: (state: PrototypeState) => void;
 };
 
@@ -47,370 +46,365 @@ const red = "\x1b[31m";
 const cyan = "\x1b[36m";
 const reset = "\x1b[0m";
 
-function agent(id: string, work: WorkState = "active"): AgentState {
-  return { id, work, unresolved: [] };
+function agent(id: string): AgentState {
+  return {
+    id,
+    activation: 1,
+    phase: "active",
+    waitingOn: [],
+    unresolvedRequests: [],
+  };
 }
 
-function initialState(
-  interfaceVariant: InterfaceVariant,
-  completionComposition: CompletionComposition,
-  scenario: ScenarioName,
-): PrototypeState {
-  const agents =
-    scenario === "autonomous"
-      ? { worker: agent("worker-session") }
-      : scenario === "hitl"
-        ? { worker: agent("worker-session"), spawner: agent("spawner-session") }
-        : { implementer: agent("implementer-session"), reviewer: agent("reviewer-session") };
-
+function initialState(scenario: ScenarioName): PrototypeState {
+  const rootName = scenario === "review" ? "owner" : "spawner";
   return {
-    interfaceVariant,
-    completionComposition,
     scenario,
     step: 0,
-    agents,
+    agents: { [rootName]: agent(`${rootName}-session`) },
     requests: [],
     lastCall: "(none yet)",
     events: ["Scenario initialized."],
   };
 }
 
-function sendCall(
+function spawnAgent(state: PrototypeState, name: string, id: string): void {
+  state.agents[name] = agent(id);
+}
+
+function setActive(state: PrototypeState, name: string): void {
+  state.agents[name]!.phase = "active";
+  state.agents[name]!.waitingOn = [];
+}
+
+function settle(state: PrototypeState, name: string, extraReasons: WaitingReason[] = []): void {
+  const current = state.agents[name]!;
+  const reasons = new Set<WaitingReason>(extraReasons);
+  if (current.unresolvedRequests.length > 0) reasons.add("agent");
+  current.phase = "waiting";
+  current.waitingOn = [...reasons];
+  if (current.waitingOn.length === 0) current.waitingOn = ["human"];
+}
+
+function complete(state: PrototypeState, name: string): void {
+  const current = state.agents[name]!;
+  current.phase = "ended(completed)";
+  current.waitingOn = [];
+}
+
+function addRequest(
   state: PrototypeState,
-  input: {
-    kind: "signal" | "request";
-    to: string;
-    message: string;
-    delivery?: "steer" | "deferred";
-    answerDelivery?: "steer" | "deferred";
-    onAccepted: "continue" | "settle";
-  },
-): string {
-  const messageFields = [
-    `  to: "${input.to}",`,
-    `  message: "${input.message}",`,
-    input.delivery ? `  delivery: "${input.delivery}",` : undefined,
-    input.answerDelivery ? `  answerDelivery: "${input.answerDelivery}",` : undefined,
-  ].filter((field): field is string => field !== undefined);
-
-  if (state.interfaceVariant === "semantic-tools") {
-    return `agent_send({\n  kind: "${input.kind}",\n${messageFields.join("\n")}\n  onAccepted: "${input.onAccepted}"\n})`;
-  }
-
-  return `agent_control({\n  command: {\n    type: "message.${input.kind}",\n${messageFields.map((field) => `  ${field}`).join("\n")}\n  },\n  onAccepted: "${input.onAccepted}"\n})`;
+  id: string,
+  from: string,
+  to: string,
+  status: RequestState["status"],
+): void {
+  state.requests.push({ id, from, to, status });
+  state.agents[from]!.unresolvedRequests.push(id);
 }
 
-function answerCall(
-  state: PrototypeState,
-  input: {
-    request: string;
-    outcome: "fulfilled" | "unable";
-    message: string;
-    onAccepted: "continue" | "settle" | { complete: string };
-  },
-): string {
-  const onAccepted =
-    typeof input.onAccepted === "string"
-      ? `"${input.onAccepted}"`
-      : `{ complete: "${input.onAccepted.complete}" }`;
-
-  if (state.interfaceVariant === "semantic-tools") {
-    return `agent_answer({\n  request: "${input.request}",\n  outcome: "${input.outcome}",\n  message: "${input.message}",\n  onAccepted: ${onAccepted}\n})`;
-  }
-
-  return `agent_control({\n  command: {\n    type: "message.answer",\n    request: "${input.request}",\n    outcome: "${input.outcome}",\n    message: "${input.message}"\n  },\n  onAccepted: ${onAccepted}\n})`;
+function acceptAnswer(state: PrototypeState, requestId: string): void {
+  state.requests.find((request) => request.id === requestId)!.status = "answered";
 }
 
-function completeCall(state: PrototypeState, result: string): string {
-  if (state.interfaceVariant === "semantic-tools") {
-    return `agent_complete({ result: "${result}" })`;
-  }
-  return `agent_control({\n  command: { type: "agent.complete", result: "${result}" }\n})`;
-}
-
-function setWork(state: PrototypeState, name: string, work: WorkState): void {
-  state.agents[name]!.work = work;
-}
-
-function addRequest(state: PrototypeState, id: string, from: string, to: string): void {
-  state.requests.push({ id, from, to, status: "queued" });
-  state.agents[from]!.unresolved.push(id);
-}
-
-function resolveRequest(state: PrototypeState, id: string): void {
-  const request = state.requests.find((candidate) => candidate.id === id)!;
+function deliverAnswer(state: PrototypeState, requestId: string): void {
+  const request = state.requests.find((candidate) => candidate.id === requestId)!;
   request.status = "resolved";
-  const sender = state.agents[request.from]!;
-  sender.unresolved = sender.unresolved.filter((requestId) => requestId !== id);
-  sender.work = "active";
+  const requester = state.agents[request.from]!;
+  requester.unresolvedRequests = requester.unresolvedRequests.filter((id) => id !== requestId);
+  setActive(state, request.from);
 }
 
 const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: ScenarioStep[] }> = {
   autonomous: {
     title: "Autonomous worker",
-    purpose: "Completion is the only collaboration action required for ordinary autonomous work.",
+    purpose: "Spawn carries the initial Request; the terminal Answer is also completion.",
     steps: [
       {
-        label: "Worker completes explicitly",
-        call: (state) => completeCall(state, "Implemented parser validation; tests pass."),
+        label: "Spawner creates the Worker with its initial Request",
+        call: `agent_send({
+  target: {
+    spawn: { agent: "worker", name: "Pagination worker" }
+  },
+  message: "Implement pagination and run the tests.",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle"
+})`,
         apply(state) {
-          setWork(state, "worker", "ended(completed)");
-          state.events.push("Completion result committed before the activation ended.");
-          state.events.push("No redundant Signal to the Spawner was needed.");
+          spawnAgent(state, "worker", "worker-session");
+          addRequest(state, "req-task", "spawner", "worker", "delivered");
+          settle(state, "spawner");
+          state.events.push("Spawn, initial Request, dependency creation, and first activation committed together.");
+          state.events.push("The Worker began with the Request already in its initial context.");
+        },
+      },
+      {
+        label: "Worker sends its terminal Answer and completes",
+        call: `agent_send({
+  target: { request: "req-task" },
+  message: "Implemented pagination; all tests pass.",
+  onAccepted: "complete"
+})`,
+        apply(state) {
+          acceptAnswer(state, "req-task");
+          complete(state, "worker");
+          state.events.push("Answer acceptance and Worker completion committed as one operation.");
+          state.events.push("No agent_complete call or duplicate completion result exists.");
+        },
+      },
+      {
+        label: "Terminal Answer reaches the Spawner",
+        call: `(runtime commits the Answer for req-task to spawner-session)`,
+        apply(state) {
+          deliverAnswer(state, "req-task");
+          state.events.push("Answer delivery resolved the dependency and woke the Spawner.");
         },
       },
     ],
   },
+
   hitl: {
     title: "Human-in-the-loop escalation",
-    purpose: "Escalation is an ordinary Request to the known Spawner; asking a human uses no control call.",
+    purpose: "A nested Request wakes the Spawner; its plain-text Answer returns the decision.",
     steps: [
       {
-        label: "Worker requests a decision and settles",
-        call: (state) =>
-          sendCall(state, {
-            kind: "request",
-            to: "spawner-session",
-            message: "Schema v1 and v2 conflict. Which should I use?",
-            answerDelivery: "steer",
-            onAccepted: "settle",
-          }),
+        label: "Spawner creates the Worker with its initial Request",
+        call: `agent_send({
+  target: {
+    spawn: { agent: "worker", name: "Migration worker" }
+  },
+  message: "Prepare the migration.",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle"
+})`,
         apply(state) {
-          addRequest(state, "req-schema", "worker", "spawner");
-          setWork(state, "worker", "waiting(agent)");
-          state.events.push("Request acceptance and dependency creation committed atomically.");
-          state.events.push("onAccepted=settle suppressed the otherwise automatic follow-up model turn.");
+          spawnAgent(state, "worker", "worker-session");
+          addRequest(state, "req-task", "spawner", "worker", "delivered");
+          settle(state, "spawner");
+          state.events.push("The initial task was carried by spawn instead of a second message call.");
         },
       },
       {
-        label: "Spawner receives the Request",
-        call: () => `(runtime commits Inbox Batch containing req-schema)`,
+        label: "Worker requests a human decision through its Spawner",
+        call: `agent_send({
+  target: { agent: "spawner-session" },
+  message: "Schema v1 and v2 conflict. Which should I use?",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle"
+})`,
         apply(state) {
-          state.requests[0]!.status = "delivered";
-          setWork(state, "spawner", "active");
-          state.events.push("Actionable delivery started the waiting recipient.");
+          addRequest(state, "req-schema", "worker", "spawner", "delivered");
+          settle(state, "worker");
+          setActive(state, "spawner");
+          state.events.push("The Request woke the waiting Spawner without a lifecycle-control call.");
         },
       },
       {
         label: "Spawner asks the human",
-        call: () => `assistant: "Should the worker use schema v1 or v2?"\n(no control call)`,
+        call: `assistant: "Should the Worker use schema v1 or v2?"
+(no control call)`,
         apply(state) {
-          setWork(state, "spawner", "waiting(human)");
-          state.events.push("Natural settlement with no dependency became waiting(human).");
+          settle(state, "spawner", ["human"]);
+          state.events.push("The Spawner now waits on both its child result and human input.");
         },
       },
       {
-        label: "Human answers",
-        call: () => `user: "Use v2; v1 is obsolete."`,
+        label: "Human provides the decision",
+        call: `user: "Use v2; v1 is obsolete."`,
         apply(state) {
-          setWork(state, "spawner", "active");
+          setActive(state, "spawner");
           state.events.push("Human input started a new Spawner run.");
         },
       },
       {
-        label: "Spawner answers the Worker",
-        call: (state) =>
-          answerCall(state, {
-            request: "req-schema",
-            outcome: "fulfilled",
-            message: "Use v2; v1 is obsolete.",
-            onAccepted: "settle",
-          }),
+        label: "Spawner answers the Worker's Request",
+        call: `agent_send({
+  target: { request: "req-schema" },
+  message: "Use v2; v1 is obsolete.",
+  onAccepted: "settle"
+})`,
         apply(state) {
-          state.requests[0]!.status = "answered";
-          setWork(state, "spawner", "waiting(human)");
-          state.events.push("Request ID determined Answer authority, destination, and delivery timing.");
-          state.events.push("The Spawner settled without inventing an escalation or resume operation.");
+          acceptAnswer(state, "req-schema");
+          settle(state, "spawner");
+          state.events.push("The Request target supplied Answer authority, routing, and delivery timing.");
         },
       },
       {
-        label: "Answer reaches the Worker",
-        call: () => `(runtime commits Answer for req-schema to the Worker transcript)`,
+        label: "Decision reaches the Worker",
+        call: `(runtime commits the Answer for req-schema to worker-session)`,
         apply(state) {
-          resolveRequest(state, "req-schema");
-          state.events.push("Answer delivery—not acceptance—resolved the dependency and woke the Worker.");
+          deliverAnswer(state, "req-schema");
+          state.events.push("The Worker woke and continued the original task.");
         },
       },
       {
-        label: "Worker completes",
-        call: (state) => completeCall(state, "Implemented schema v2; tests pass."),
+        label: "Worker sends its final Answer and completes",
+        call: `agent_send({
+  target: { request: "req-task" },
+  message: "Migration prepared with schema v2; tests pass.",
+  onAccepted: "complete"
+})`,
         apply(state) {
-          setWork(state, "worker", "ended(completed)");
-          state.events.push("The durable Agent remained the same across both runs.");
+          acceptAnswer(state, "req-task");
+          complete(state, "worker");
+          state.events.push("The final work message itself completed the Worker.");
+        },
+      },
+      {
+        label: "Final result reaches the Spawner",
+        call: `(runtime commits the Answer for req-task to spawner-session)`,
+        apply(state) {
+          deliverAnswer(state, "req-task");
+          state.events.push("The Spawner's original task dependency resolved.");
         },
       },
     ],
   },
+
   review: {
     title: "Reviewer–implementer loop",
-    purpose: "Requests preserve peer collaboration; disposition controls whether each peer continues or becomes message-wakeable.",
+    purpose: "A Request can spawn a reviewer and later auto-resume its ended Agent when the requester has Child Control.",
     steps: [
       {
-        label: "Implementer requests review",
-        call: (state) =>
-          sendCall(state, {
-            kind: "request",
-            to: "reviewer-session",
-            message: "Review revision abc123.",
-            delivery: "deferred",
-            onAccepted: "settle",
-          }),
+        label: "Owner spawns the Implementer with its initial Request",
+        call: `agent_send({
+  target: {
+    spawn: { agent: "worker", name: "Implementer" }
+  },
+  message: "Implement the routing change and obtain review approval.",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle"
+})`,
         apply(state) {
-          addRequest(state, "req-review-1", "implementer", "reviewer");
-          setWork(state, "implementer", "waiting(agent)");
-          state.events.push("The Workflow Owner did not relay or receive the peer Request.");
+          spawnAgent(state, "implementer", "implementer-session");
+          addRequest(state, "req-implementation", "owner", "implementer", "delivered");
+          settle(state, "owner");
+          state.events.push("The Owner waits on the Implementer's terminal Answer.");
         },
       },
       {
-        label: "Reviewer receives the first review Request",
-        call: () => `(runtime delivers req-review-1 to reviewer-session)`,
+        label: "Implementer spawns a Reviewer with the review Request",
+        call: `agent_send({
+  target: {
+    spawn: { agent: "reviewer", name: "Routing reviewer" }
+  },
+  message: "Review revision abc123.",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle"
+})`,
         apply(state) {
-          state.requests[0]!.status = "delivered";
-          setWork(state, "reviewer", "active");
-          state.events.push("Deferred delivery began after the recipient's prior work settled.");
+          spawnAgent(state, "reviewer", "reviewer-session");
+          addRequest(state, "req-review-1", "implementer", "reviewer", "delivered");
+          settle(state, "implementer");
+          state.events.push("The review Request was present in the Reviewer's first model context.");
         },
       },
       {
-        label: "Reviewer requests changes and remains reusable",
-        call: (state) =>
-          answerCall(state, {
-            request: "req-review-1",
-            outcome: "fulfilled",
-            message: "Changes required: serialize the retry path.",
-            onAccepted: "settle",
-          }),
+        label: "Reviewer requests changes and completes",
+        call: `agent_send({
+  target: { request: "req-review-1" },
+  message: "Changes required: serialize the retry path.",
+  onAccepted: "complete"
+})`,
         apply(state) {
-          state.requests[0]!.status = "answered";
-          setWork(state, "reviewer", "waiting(human)");
-          resolveRequest(state, "req-review-1");
-          state.events.push("The reviewer settled instead of completing, so a later Request can wake it.");
+          acceptAnswer(state, "req-review-1");
+          complete(state, "reviewer");
+          state.events.push("The terminal review Answer completed the first Reviewer activation.");
         },
       },
       {
-        label: "Implementer fixes and requests another review",
-        call: (state) =>
-          sendCall(state, {
-            kind: "request",
-            to: "reviewer-session",
-            message: "Retry path fixed in def456; review again.",
-            onAccepted: "settle",
-          }),
+        label: "Change request reaches the Implementer",
+        call: `(runtime commits the Answer for req-review-1 to implementer-session)`,
         apply(state) {
-          addRequest(state, "req-review-2", "implementer", "reviewer");
-          setWork(state, "implementer", "waiting(agent)");
-          setWork(state, "reviewer", "active");
-          state.events.push("Messaging a waiting reviewer scheduled a new run without lifecycle authority.");
+          deliverAnswer(state, "req-review-1");
+          state.events.push("The Implementer woke to apply the requested change.");
         },
       },
       {
-        label: "Reviewer approves",
-        call: (state) =>
-          answerCall(state, {
-            request: "req-review-2",
-            outcome: "fulfilled",
-            message: "Approved.",
-            onAccepted:
-              state.completionComposition === "separate"
-                ? "continue"
-                : { complete: "Review finished." },
-          }),
+        label: "Authorized Request automatically resumes the ended Reviewer",
+        call: `agent_send({
+  target: { agent: "reviewer-session" },
+  message: "Retry path fixed in def456; review again.",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle"
+})`,
         apply(state) {
-          state.requests[1]!.status = "answered";
-          if (state.completionComposition === "separate") {
-            setWork(state, "reviewer", "active");
-            state.events.push("Separate completion preserves one terminal lifecycle operation but needs another model turn.");
-          } else {
-            setWork(state, "reviewer", "ended(completed)");
-            state.events.push("Fused disposition saves a model turn but makes messaging another completion entry point.");
-          }
+          state.agents.reviewer!.activation += 1;
+          setActive(state, "reviewer");
+          addRequest(state, "req-review-2", "implementer", "reviewer", "delivered");
+          settle(state, "implementer");
+          state.events.push("Child Control authorized a new Reviewer activation.");
+          state.events.push("Activation creation and initial Request acceptance were atomic and idempotent.");
         },
       },
       {
-        label: "Reviewer completes under the separate-completion variant",
-        call: (state) =>
-          state.completionComposition === "separate"
-            ? completeCall(state, "Review finished; def456 approved.")
-            : `(no call — completion was fused into the Answer command)`,
+        label: "Reviewer approves and completes again",
+        call: `agent_send({
+  target: { request: "req-review-2" },
+  message: "Approved.",
+  onAccepted: "complete"
+})`,
         apply(state) {
-          if (state.completionComposition === "separate") {
-            setWork(state, "reviewer", "ended(completed)");
-            state.events.push("The extra turn ends with the sole explicit completion operation.");
-          } else {
-            state.events.push("Fused completion already ended the reviewer activation.");
-          }
+          acceptAnswer(state, "req-review-2");
+          complete(state, "reviewer");
+          state.events.push("No separate resume, Answer, or completion calls were required.");
         },
       },
       {
         label: "Approval reaches the Implementer",
-        call: () => `(runtime commits Answer for req-review-2 to implementer-session)`,
+        call: `(runtime commits the Answer for req-review-2 to implementer-session)`,
         apply(state) {
-          resolveRequest(state, "req-review-2");
-          state.events.push("Accepted outbound Answers remain deliverable after the responder completes.");
+          deliverAnswer(state, "req-review-2");
+          state.events.push("The Implementer woke with approval.");
         },
       },
       {
-        label: "Implementer completes",
-        call: (state) => completeCall(state, "Implemented and approved revision def456."),
+        label: "Implementer answers the Owner and completes",
+        call: `agent_send({
+  target: { request: "req-implementation" },
+  message: "Revision def456 implemented and approved.",
+  onAccepted: "complete"
+})`,
         apply(state) {
-          setWork(state, "implementer", "ended(completed)");
-          state.events.push("Both peers ended explicitly; the Workflow Owner stayed supervisory.");
+          acceptAnswer(state, "req-implementation");
+          complete(state, "implementer");
+          state.events.push("The final Answer is the implementation result and terminal action.");
+        },
+      },
+      {
+        label: "Implementation result reaches the Owner",
+        call: `(runtime commits the Answer for req-implementation to owner-session)`,
+        apply(state) {
+          deliverAnswer(state, "req-implementation");
+          state.events.push("Every spawned Agent completed through a useful outbound Answer.");
         },
       },
     ],
   },
 };
 
-function replayState(
-  interfaceVariant: InterfaceVariant,
-  completionComposition: CompletionComposition,
-  scenario: ScenarioName,
-  completedSteps: number,
-): PrototypeState {
-  const replayed = initialState(interfaceVariant, completionComposition, scenario);
-  for (const step of scenarios[scenario].steps.slice(0, completedSteps)) {
-    replayed.lastCall = step.call(replayed);
-    step.apply(replayed);
-    replayed.events.push(step.label);
-    replayed.step += 1;
-  }
-  return replayed;
-}
+let state = initialState("autonomous");
 
-let state = initialState("semantic-tools", "separate", "autonomous");
-
-function colorWork(work: WorkState): string {
-  if (work === "active") return `${green}${work}${reset}`;
-  if (work.startsWith("waiting")) return `${yellow}${work}${reset}`;
-  return `${red}${work}${reset}`;
+function formatWork(current: AgentState): string {
+  if (current.phase === "active") return `${green}active${reset}`;
+  if (current.phase === "ended(completed)") return `${red}ended(completed)${reset}`;
+  return `${yellow}waiting(${current.waitingOn.join("+")})${reset}`;
 }
 
 function renderInterface(): void {
   console.log(`${bold}Candidate interface${reset}`);
-  if (state.interfaceVariant === "semantic-tools") {
-    console.log(`${cyan}agent_send${reset}({ kind, to, message, delivery?, answerDelivery?, onAccepted })`);
-    console.log(`${cyan}agent_answer${reset}({ request, outcome, message, onAccepted })`);
-    console.log(`${cyan}agent_complete${reset}({ result })`);
-  } else {
-    console.log(`${cyan}agent_control${reset}({ command: { type: "message.signal" | "message.request" | "message.answer" | "agent.complete", ... }, onAccepted? })`);
-    console.log(`${dim}One tool; command type selects the protocol operation.${reset}`);
-  }
-  console.log(`${dim}Runtime allocates Message IDs. Answer destination and timing derive from the Request.${reset}`);
-  console.log(`${dim}No inspect, wait, escalate, cancel, resume, or Workflow Owner alias is included.${reset}`);
-  if (state.completionComposition === "separate") {
-    console.log(`${dim}onAccepted = continue | settle; completion remains a separate operation.${reset}`);
-    console.log(`${yellow}final message:${reset} Answer(onAccepted="continue") → Complete(result)`);
-  } else {
-    console.log(`${dim}onAccepted also accepts { complete: result } for a final outbound message.${reset}`);
-    console.log(`${yellow}final message:${reset} Answer(onAccepted={ complete: result })`);
-  }
+  console.log(`${cyan}agent_send${reset}({ target, message, response?, delivery?, onAccepted })`);
+  console.log(`${dim}target = { agent: AgentId } | { spawn: SpawnSpec } | { request: RequestId }${reset}`);
+  console.log(`${dim}response = "none" | { required: true, delivery: "steer" | "deferred" }${reset}`);
+  console.log(`${dim}onAccepted = "continue" | "settle" | "complete"${reset}`);
+  console.log(`${dim}The target and response requirement derive Signal, Request, Answer, spawn, and authorized auto-resume behavior.${reset}`);
+  console.log(`${dim}All content uses one plain message string. There is no agent_answer or agent_complete tool.${reset}`);
 }
 
 function render(): void {
   console.clear();
   const scenario = scenarios[state.scenario];
-  console.log(`${bold}PROTOTYPE — Minimal agent-facing control interface${reset}`);
-  console.log(`${dim}Protocol: ${state.interfaceVariant === "semantic-tools" ? "three semantic tools" : "single command envelope"}${reset}`);
-  console.log(`${dim}Final-message completion: ${state.completionComposition === "separate" ? "Answer, then separate Complete" : "fused into the Answer"}${reset}\n`);
+  console.log(`${bold}PROTOTYPE — Minimal agent-facing messaging interface${reset}\n`);
   renderInterface();
 
   console.log(`\n${bold}${scenario.title}${reset}`);
@@ -422,8 +416,13 @@ function render(): void {
 
   console.log(`\n${bold}Agents${reset}`);
   for (const [name, current] of Object.entries(state.agents)) {
-    const dependencies = current.unresolved.length > 0 ? `  requests=[${current.unresolved.join(", ")}]` : "";
-    console.log(`${bold}${name.padEnd(12)}${reset} ${colorWork(current.work)}${dependencies}`);
+    const dependencies =
+      current.unresolvedRequests.length > 0
+        ? `  requests=[${current.unresolvedRequests.join(", ")}]`
+        : "";
+    console.log(
+      `${bold}${name.padEnd(12)}${reset} ${formatWork(current)}  activation=${current.activation}${dependencies}`,
+    );
   }
 
   console.log(`\n${bold}Requests${reset}`);
@@ -431,34 +430,30 @@ function render(): void {
     console.log(`${dim}(none)${reset}`);
   } else {
     for (const request of state.requests) {
-      console.log(
-        `${bold}${request.id}${reset}  ${request.from} → ${request.to}  ${request.status}`,
-      );
+      console.log(`${bold}${request.id}${reset}  ${request.from} → ${request.to}  ${request.status}`);
     }
   }
 
   console.log(`\n${bold}Recent events${reset}`);
-  for (const event of state.events.slice(-5)) console.log(`${dim}•${reset} ${event}`);
+  for (const event of state.events.slice(-6)) console.log(`${dim}•${reset} ${event}`);
 
   console.log(`\n${bold}Actions${reset}`);
   console.log(`${bold}1${reset} autonomous   ${bold}2${reset} human-in-loop   ${bold}3${reset} reviewer–implementer`);
-  console.log(`${bold}n${reset} next step    ${bold}v${reset} switch protocol    ${bold}c${reset} switch final-message completion`);
-  console.log(`${bold}z${reset} reset        ${bold}q${reset} quit`);
+  console.log(`${bold}n${reset} next step    ${bold}z${reset} reset    ${bold}q${reset} quit`);
   process.stdout.write(`\n${bold}>${reset} `);
 }
 
 function chooseScenario(scenario: ScenarioName): void {
-  state = initialState(state.interfaceVariant, state.completionComposition, scenario);
+  state = initialState(scenario);
 }
 
 function nextStep(): void {
-  const steps = scenarios[state.scenario].steps;
-  const step = steps[state.step];
+  const step = scenarios[state.scenario].steps[state.step];
   if (!step) {
     state.events.push("Scenario already complete.");
     return;
   }
-  state.lastCall = step.call(state);
+  state.lastCall = step.call;
   step.apply(state);
   state.events.push(step.label);
   state.step += 1;
@@ -479,24 +474,8 @@ readline.on("line", (line) => {
     case "n":
       nextStep();
       break;
-    case "v":
-      state = replayState(
-        state.interfaceVariant === "semantic-tools" ? "command-envelope" : "semantic-tools",
-        state.completionComposition,
-        state.scenario,
-        state.step,
-      );
-      break;
-    case "c":
-      state = replayState(
-        state.interfaceVariant,
-        state.completionComposition === "separate" ? "fused" : "separate",
-        state.scenario,
-        state.step,
-      );
-      break;
     case "z":
-      state = initialState(state.interfaceVariant, state.completionComposition, state.scenario);
+      state = initialState(state.scenario);
       break;
     case "q":
       readline.close();
