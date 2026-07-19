@@ -300,54 +300,66 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
         },
       },
       {
-        label: "Reviewer requests changes and completes",
+        label: "Reviewer answers and requests the revision in one message",
         call: `agent_send({
   target: { request: "req-review-1" },
-  message: "Changes required: serialize the retry path.",
-  onAccepted: "complete"
-})`,
-        apply(state) {
-          acceptAnswer(state, "req-review-1");
-          complete(state, "reviewer");
-          state.events.push("The terminal review Answer completed the first Reviewer activation.");
-        },
-      },
-      {
-        label: "Change request reaches the Implementer",
-        call: `(runtime commits the Answer for req-review-1 to implementer-session)`,
-        apply(state) {
-          deliverAnswer(state, "req-review-1");
-          state.events.push("The Implementer woke to apply the requested change.");
-        },
-      },
-      {
-        label: "Authorized Request automatically resumes the ended Reviewer",
-        call: `agent_send({
-  target: { agent: "reviewer-session" },
-  message: "Retry path fixed in def456; review again.",
+  message: "Changes required: serialize the retry path, then send the revision.",
   response: { required: true, delivery: "steer" },
   onAccepted: "settle"
 })`,
         apply(state) {
-          state.agents.reviewer!.activation += 1;
-          setActive(state, "reviewer");
-          addRequest(state, "req-review-2", "implementer", "reviewer", "delivered");
-          settle(state, "implementer");
-          state.events.push("Child Control authorized a new Reviewer activation.");
-          state.events.push("Activation creation and initial Request acceptance were atomic and idempotent.");
+          acceptAnswer(state, "req-review-1");
+          addRequest(state, "req-revision", "reviewer", "implementer", "queued");
+          settle(state, "reviewer");
+          state.events.push("One accepted message closed req-review-1 and opened req-revision atomically.");
+          state.events.push("The message ID of the Answer is also the new Request ID.");
         },
       },
       {
-        label: "Reviewer approves and completes again",
+        label: "Answer-and-Request reaches the Implementer",
+        call: `(runtime commits one message that answers req-review-1 and delivers req-revision)`,
+        apply(state) {
+          deliverAnswer(state, "req-review-1");
+          state.requests.find((request) => request.id === "req-revision")!.status = "delivered";
+          state.events.push("The Implementer woke with the review result and its next reply obligation.");
+        },
+      },
+      {
+        label: "Implementer answers the revision Request and requests re-review",
+        call: `agent_send({
+  target: { request: "req-revision" },
+  message: "Retry path fixed in def456; please review again.",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle"
+})`,
+        apply(state) {
+          acceptAnswer(state, "req-revision");
+          addRequest(state, "req-review-2", "implementer", "reviewer", "queued");
+          settle(state, "implementer");
+          state.events.push("The reverse message closed req-revision and opened req-review-2 atomically.");
+        },
+      },
+      {
+        label: "Revision Answer and re-review Request reach the Reviewer",
+        call: `(runtime commits one message that answers req-revision and delivers req-review-2)`,
+        apply(state) {
+          deliverAnswer(state, "req-revision");
+          state.requests.find((request) => request.id === "req-review-2")!.status = "delivered";
+          state.events.push("The Reviewer woke with the revision and a new Request to answer.");
+        },
+      },
+      {
+        label: "Reviewer approves and completes",
         call: `agent_send({
   target: { request: "req-review-2" },
   message: "Approved.",
+  response: "none",
   onAccepted: "complete"
 })`,
         apply(state) {
           acceptAnswer(state, "req-review-2");
           complete(state, "reviewer");
-          state.events.push("No separate resume, Answer, or completion calls were required.");
+          state.events.push("No new response obligation allowed the final Answer to complete the Reviewer.");
         },
       },
       {
@@ -359,10 +371,50 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
         },
       },
       {
+        label: "Authorized Request automatically resumes the ended Reviewer",
+        call: `agent_send({
+  target: { agent: "reviewer-session" },
+  message: "Verify the final release note.",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle"
+})`,
+        apply(state) {
+          state.agents.reviewer!.activation += 1;
+          setActive(state, "reviewer");
+          addRequest(state, "req-release-note", "implementer", "reviewer", "delivered");
+          settle(state, "implementer");
+          state.events.push("Child Control authorized a new Reviewer activation.");
+          state.events.push("Activation creation and Request acceptance committed atomically.");
+        },
+      },
+      {
+        label: "Reviewer answers the follow-up and completes again",
+        call: `agent_send({
+  target: { request: "req-release-note" },
+  message: "Release note verified.",
+  response: "none",
+  onAccepted: "complete"
+})`,
+        apply(state) {
+          acceptAnswer(state, "req-release-note");
+          complete(state, "reviewer");
+          state.events.push("The resumed activation also ended through its useful final Answer.");
+        },
+      },
+      {
+        label: "Release-note Answer reaches the Implementer",
+        call: `(runtime commits the Answer for req-release-note to implementer-session)`,
+        apply(state) {
+          deliverAnswer(state, "req-release-note");
+          state.events.push("The follow-up dependency resolved.");
+        },
+      },
+      {
         label: "Implementer answers the Owner and completes",
         call: `agent_send({
   target: { request: "req-implementation" },
-  message: "Revision def456 implemented and approved.",
+  message: "Revision def456 implemented, approved, and release-note verified.",
+  response: "none",
   onAccepted: "complete"
 })`,
         apply(state) {
@@ -397,7 +449,8 @@ function renderInterface(): void {
   console.log(`${dim}target = { agent: AgentId } | { spawn: SpawnSpec } | { request: RequestId }${reset}`);
   console.log(`${dim}response = "none" | { required: true, delivery: "steer" | "deferred" }${reset}`);
   console.log(`${dim}onAccepted = "continue" | "settle" | "complete"${reset}`);
-  console.log(`${dim}The target and response requirement derive Signal, Request, Answer, spawn, and authorized auto-resume behavior.${reset}`);
+  console.log(`${dim}Target and response are orthogonal: a Request target plus required response is Answer + new Request.${reset}`);
+  console.log(`${dim}The same shape also derives Signal, Request, spawn, and authorized auto-resume behavior.${reset}`);
   console.log(`${dim}All content uses one plain message string. There is no agent_answer or agent_complete tool.${reset}`);
 }
 

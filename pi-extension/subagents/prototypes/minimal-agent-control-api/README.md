@@ -113,11 +113,12 @@ A Request target identifies a terminal Answer:
 agent_send({
   target: { request: requestId },
   message: "Implemented pagination; all tests pass.",
+  response: "none",
   onAccepted: "complete",
 })
 ```
 
-The Request determines Answer authority, destination, correlation, and return delivery timing. The content remains one plain `message` string. There is no `outcome`, `result`, `unable`, recipient, response, or delivery field on this branch.
+The Request determines Answer authority, destination, correlation, and return delivery timing. The content remains one plain `message` string. There is no `outcome`, `result`, `unable`, recipient, or outbound-delivery field on this branch.
 
 Every accepted Answer terminally closes its Request. An inability is expressed directly:
 
@@ -125,11 +126,35 @@ Every accepted Answer terminally closes its Request. An inability is expressed d
 agent_send({
   target: { request: requestId },
   message: "Cannot access the deployment credentials.",
+  response: "none",
   onAccepted: "complete",
 })
 ```
 
 The requester wakes and interprets the content. The runtime does not parse prose into work-success categories.
+
+### Answer and Request in one message
+
+`response` is orthogonal to the target. A message may answer one Request while creating another:
+
+```ts
+agent_send({
+  target: { request: implementationRequestId },
+  message: "Implemented the fix. Please review revision def456.",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle",
+})
+```
+
+Acceptance atomically closes `implementationRequestId` and creates a new Request addressed to its requester. The outbound Message ID is also the new Request ID, while the message retains its reference to the Request it answered.
+
+| Target | Response | Derived semantics |
+|---|---|---|
+| Agent | none | Signal |
+| Agent | required | Request |
+| Request | none | Answer |
+| Request | required | Answer and new Request |
+| Spawn | required | Spawn with initial Request |
 
 ## Post-acceptance disposition
 
@@ -141,7 +166,7 @@ The requester wakes and interprets the content. The runtime does not parse prose
 
 Acceptance failure never settles or completes the sender.
 
-`complete` is valid only for a Signal or Answer. It is invalid for a Request because a Request creates a new unresolved dependency.
+`complete` is valid only when `response` is `"none"`. It is invalid whenever the same message creates a new Request dependency, including an Answer-and-Request composition.
 
 There is no `agent_complete`, `agent.complete`, standalone wait, yield, or settle operation. Every completing subagent sends a useful final outbound Signal or Answer.
 
