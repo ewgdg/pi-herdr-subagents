@@ -15,7 +15,7 @@ npm run prototype:agent-control
 Choose a workflow, press `n` to advance it, and inspect the full Agent and Request state after every action.
 
 - `v` switches the entire model-facing protocol: three semantic tools versus one command envelope.
-- `c` independently switches completion composition: separate completion versus completion fused after a final message.
+- `c` independently switches final-message completion: Answer then Complete versus completion fused into the final Answer. Switching either axis preserves the current scenario step for direct comparison.
 
 ## Protocol A — three semantic tools (recommended)
 
@@ -107,9 +107,11 @@ Separate `signal`, `request`, `answer`, `cancelRequest`, and `complete` calls ar
 
 Opaque Answer Slots and Escalation Routes make authority structural, but they replace decisions already made: an Agent's session UUID is its bearer address, and `inReplyTo` Request identity determines Answer authority and routing. Child Control remains a genuinely separate capability-bearing interface.
 
-## Independent completion comparison
+## Independent final-message completion comparison
 
 Separate completion uses `agent_complete` under Protocol A and the `agent.complete` command under Protocol B. A final Answer followed by completion may require one additional model turn. This preserves one explicit terminal lifecycle operation and leaves a safe, visible partial outcome if the Agent crashes after the Answer is accepted but before completion.
+
+This setting affects only a message immediately followed by the sender's completion. Standalone autonomous completion and non-final messages are intentionally identical in both modes.
 
 The orthogonal fused-completion setting allows:
 

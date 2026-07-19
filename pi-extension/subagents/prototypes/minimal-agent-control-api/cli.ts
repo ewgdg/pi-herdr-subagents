@@ -360,6 +360,22 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
   },
 };
 
+function replayState(
+  interfaceVariant: InterfaceVariant,
+  completionComposition: CompletionComposition,
+  scenario: ScenarioName,
+  completedSteps: number,
+): PrototypeState {
+  const replayed = initialState(interfaceVariant, completionComposition, scenario);
+  for (const step of scenarios[scenario].steps.slice(0, completedSteps)) {
+    replayed.lastCall = step.call(replayed);
+    step.apply(replayed);
+    replayed.events.push(step.label);
+    replayed.step += 1;
+  }
+  return replayed;
+}
+
 let state = initialState("semantic-tools", "separate", "autonomous");
 
 function colorWork(work: WorkState): string {
@@ -382,8 +398,10 @@ function renderInterface(): void {
   console.log(`${dim}No inspect, wait, escalate, cancel, resume, or Workflow Owner alias is included.${reset}`);
   if (state.completionComposition === "separate") {
     console.log(`${dim}after = continue | settle; completion remains a separate operation.${reset}`);
+    console.log(`${yellow}final message:${reset} Answer(after="continue") → Complete(result)`);
   } else {
     console.log(`${dim}after also accepts { complete: result } for a final outbound message.${reset}`);
+    console.log(`${yellow}final message:${reset} Answer(after={ complete: result })`);
   }
 }
 
@@ -392,7 +410,7 @@ function render(): void {
   const scenario = scenarios[state.scenario];
   console.log(`${bold}PROTOTYPE — Minimal agent-facing control interface${reset}`);
   console.log(`${dim}Protocol: ${state.interfaceVariant === "semantic-tools" ? "three semantic tools" : "single command envelope"}${reset}`);
-  console.log(`${dim}Completion: ${state.completionComposition === "separate" ? "separate operation" : "fused after final message"}${reset}\n`);
+  console.log(`${dim}Final-message completion: ${state.completionComposition === "separate" ? "Answer, then separate Complete" : "fused into the Answer"}${reset}\n`);
   renderInterface();
 
   console.log(`\n${bold}${scenario.title}${reset}`);
@@ -424,7 +442,7 @@ function render(): void {
 
   console.log(`\n${bold}Actions${reset}`);
   console.log(`${bold}1${reset} autonomous   ${bold}2${reset} human-in-loop   ${bold}3${reset} reviewer–implementer`);
-  console.log(`${bold}n${reset} next step    ${bold}v${reset} switch protocol    ${bold}c${reset} switch completion composition`);
+  console.log(`${bold}n${reset} next step    ${bold}v${reset} switch protocol    ${bold}c${reset} switch final-message completion`);
   console.log(`${bold}z${reset} reset        ${bold}q${reset} quit`);
   process.stdout.write(`\n${bold}>${reset} `);
 }
@@ -462,17 +480,19 @@ readline.on("line", (line) => {
       nextStep();
       break;
     case "v":
-      state = initialState(
+      state = replayState(
         state.interfaceVariant === "semantic-tools" ? "command-envelope" : "semantic-tools",
         state.completionComposition,
         state.scenario,
+        state.step,
       );
       break;
     case "c":
-      state = initialState(
+      state = replayState(
         state.interfaceVariant,
         state.completionComposition === "separate" ? "fused" : "separate",
         state.scenario,
+        state.step,
       );
       break;
     case "z":
