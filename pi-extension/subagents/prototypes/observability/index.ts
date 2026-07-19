@@ -25,6 +25,8 @@ type AgentState = "active" | "waiting-human" | "waiting-agent" | "waiting-operat
 interface PrototypeAgent {
   name: string;
   role: string;
+  model: string;
+  effort: string;
   state: AgentState;
   duration: string;
   reason: string;
@@ -60,6 +62,8 @@ const AGENTS: PrototypeAgent[] = [
   {
     name: "Main",
     role: "Workflow Owner",
+    model: "openai-codex/gpt-5.6-sol",
+    effort: "high",
     state: "active",
     duration: "00:42",
     reason: "integrating independent results",
@@ -69,6 +73,8 @@ const AGENTS: PrototypeAgent[] = [
   {
     name: "Auth scout",
     role: "scout",
+    model: "google/gemini-3-flash",
+    effort: "low",
     state: "waiting-agent",
     duration: "04:18",
     reason: "Request req-31 → Security review",
@@ -78,6 +84,8 @@ const AGENTS: PrototypeAgent[] = [
   {
     name: "Security review",
     role: "reviewer",
+    model: "anthropic/claude-opus-4.6",
+    effort: "high",
     state: "active",
     duration: "02:07",
     reason: "reviewing token rotation",
@@ -87,6 +95,8 @@ const AGENTS: PrototypeAgent[] = [
   {
     name: "Database research",
     role: "researcher",
+    model: "openai-codex/gpt-5.4-mini",
+    effort: "medium",
     state: "waiting-operation",
     duration: "11:03",
     reason: "CI index job op-8",
@@ -96,6 +106,8 @@ const AGENTS: PrototypeAgent[] = [
   {
     name: "Observability prototype",
     role: "designer",
+    model: "openai-codex/gpt-5.6-sol",
+    effort: "high",
     state: "waiting-human",
     duration: "01:26",
     reason: "choose a rendering direction",
@@ -105,6 +117,8 @@ const AGENTS: PrototypeAgent[] = [
   {
     name: "Migration worker",
     role: "worker",
+    model: "google/gemini-3-pro",
+    effort: "medium",
     state: "stalled",
     duration: "03:12",
     reason: "Recipient Inbox Router unreachable",
@@ -161,7 +175,9 @@ export default function observabilityPrototype(pi: ExtensionAPI): void {
 class ObservabilityPrototype implements Component {
   private variantIndex = 0;
   private selectedAgentIndex = 0;
+  private selectedAttentionIndex = 0;
   private showDetail = true;
+  private showRoster = false;
 
   constructor(
     private readonly tui: TUI,
@@ -183,11 +199,21 @@ class ObservabilityPrototype implements Component {
     } else if (matchesKey(data, Key.right)) {
       this.variantIndex = (this.variantIndex + 1) % VARIANTS.length;
     } else if (matchesKey(data, Key.up)) {
-      this.selectedAgentIndex = Math.max(0, this.selectedAgentIndex - 1);
+      if (this.currentVariantKey() === "B" && !this.showRoster) {
+        this.selectedAttentionIndex = Math.max(0, this.selectedAttentionIndex - 1);
+      } else {
+        this.selectedAgentIndex = Math.max(0, this.selectedAgentIndex - 1);
+      }
     } else if (matchesKey(data, Key.down)) {
-      this.selectedAgentIndex = Math.min(AGENTS.length - 1, this.selectedAgentIndex + 1);
+      if (this.currentVariantKey() === "B" && !this.showRoster) {
+        this.selectedAttentionIndex = Math.min(ATTENTION_ITEMS.length - 1, this.selectedAttentionIndex + 1);
+      } else {
+        this.selectedAgentIndex = Math.min(AGENTS.length - 1, this.selectedAgentIndex + 1);
+      }
     } else if (matchesKey(data, Key.space)) {
       this.showDetail = !this.showDetail;
+    } else if (data.toLowerCase() === "r" && this.currentVariantKey() === "B") {
+      this.showRoster = !this.showRoster;
     } else {
       return;
     }
@@ -208,7 +234,7 @@ class ObservabilityPrototype implements Component {
       ),
       this.theme.fg(
         "dim",
-        "←/→ variant  ↑/↓ inspect Agent  space details  enter choose  esc close",
+        "←/→ variant  ↑/↓ select  r roster  space details  enter choose  esc close",
       ),
     ];
 
@@ -242,6 +268,7 @@ class ObservabilityPrototype implements Component {
       const left = `${prefix} ${agent.duration}  ${name} (${agent.role})`;
       const right = `${this.stateLabel(agent.state)}  ${agent.queue}`;
       lines.push(this.splitLine(left, right, width));
+      lines.push(`    ${this.theme.fg("dim", `${agent.model} · effort ${agent.effort}`)}`);
       lines.push(`    ${this.theme.fg("dim", "↳")} ${this.reasonText(agent)}`);
     }
 
@@ -261,13 +288,15 @@ class ObservabilityPrototype implements Component {
       this.section("Needs attention", "2 actions · 1 watch"),
     ];
 
-    for (const item of ATTENTION_ITEMS) {
+    for (const [index, item] of ATTENTION_ITEMS.entries()) {
+      const selected = !this.showRoster && index === this.selectedAttentionIndex;
+      const prefix = selected ? this.theme.fg("accent", "▶") : " ";
       const badge = item.level === "act"
         ? this.theme.fg("error", this.theme.bold("ACT"))
         : item.level === "decide"
           ? this.theme.fg("warning", this.theme.bold("DECIDE"))
           : this.theme.fg("muted", "WATCH");
-      lines.push(`${badge}  ${this.theme.bold(item.title)}`);
+      lines.push(`${prefix} ${badge}  ${this.theme.bold(item.title)}`);
       lines.push(`     ${this.theme.fg("muted", item.detail)}`);
       if (this.showDetail) lines.push(`     ${this.theme.fg("accent", "↳")} ${item.action}`);
       lines.push("");
@@ -276,12 +305,21 @@ class ObservabilityPrototype implements Component {
     lines.push(this.section("Everything else", "quiet by default"));
     lines.push(this.splitLine("3 Agents active", "1 Request · 1 Answer queued", width));
     lines.push(this.splitLine("2 Agents waiting normally", "human 1 · agent 1 · operation 1", width));
-    lines.push(
-      this.theme.fg(
-        "dim",
-        "Open the roster for full state. Healthy transitions remain passive runtime events.",
-      ),
-    );
+    lines.push(this.theme.fg("dim", "Press r to open the roster. Healthy transitions remain passive runtime events."));
+
+    if (this.showRoster) {
+      lines.push("");
+      lines.push(this.section("Roster", "↑/↓ inspect · r close"));
+      for (const [index, agent] of AGENTS.entries()) {
+        const selected = index === this.selectedAgentIndex;
+        const prefix = selected ? this.theme.fg("accent", "▶") : " ";
+        lines.push(this.splitLine(`${prefix} ${agent.name} (${agent.role})`, this.stateLabel(agent.state), width));
+        lines.push(`    ${this.theme.fg("dim", `${agent.model} · effort ${agent.effort}`)}`);
+        if (selected && this.showDetail) {
+          lines.push(`    ${this.theme.fg("muted", "↳")} ${agent.reason} · ${agent.queue}`);
+        }
+      }
+    }
     return lines;
   }
 
@@ -301,6 +339,7 @@ class ObservabilityPrototype implements Component {
       "",
       this.section("Path inspector", selected.name),
       `  State: ${this.stateLabel(selected.state)} · ${selected.duration}`,
+      `  Runtime: ${this.theme.fg("muted", `${selected.model} · effort ${selected.effort}`)}`,
       `  Reason: ${this.reasonText(selected)}`,
     ];
 
@@ -326,6 +365,10 @@ class ObservabilityPrototype implements Component {
     if (state === "waiting-agent") return this.theme.fg("muted", "waiting · agent");
     if (state === "waiting-operation") return this.theme.fg("muted", "waiting · operation");
     return this.theme.fg("error", this.theme.bold("stalled"));
+  }
+
+  private currentVariantKey(): VariantKey {
+    return VARIANTS[this.variantIndex].key;
   }
 
   private stateGlyph(state: AgentState): string {
