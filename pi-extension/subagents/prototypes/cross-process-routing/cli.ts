@@ -58,7 +58,7 @@ function render(): void {
   console.clear();
   console.log(`${bold}PROTOTYPE — Cross-process routing and delivery${reset}`);
   console.log(
-    `${dim}Candidate: recipient-finalized acceptance + Unix socket + SQLite + fenced ownership${reset}\n`,
+    `${dim}Candidate: recipient-finalized acceptance + local IPC + SQLite + fenced ownership${reset}\n`,
   );
 
   console.log(`${bold}Recipient Agent${reset}`);

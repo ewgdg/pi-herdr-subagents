@@ -2,7 +2,7 @@
  * PROTOTYPE — throwaway state model for GitHub issue:
  * "Prototype cross-process routing and delivery guarantees"
  *
- * Question: Does a recipient-owned local-socket + transactional coordination
+ * Question: Does recipient-finalized local IPC + transactional coordination
  * contract remain coherent through lost acknowledgements, process crashes,
  * transcript/pointer crash windows, duplicate resumes, and terminal recipient
  * disappearance?
