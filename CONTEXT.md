@@ -40,17 +40,37 @@ _Avoid_: Ownership, addressability
 The assumption that Agents follow their instructions rather than acting as adversaries. Capability and ownership rules prevent routing mistakes and accidental authority transfer; they are not a security sandbox.
 _Avoid_: Permission sandbox, adversarial isolation
 
+**Message Target**:
+The routing intent of one actionable message: an addressable existing Agent, a new direct child created with the message as its initial work, or an existing Request whose requester becomes the recipient. A Request target supplies Answer authority and return routing; an Agent ID alone never supplies lifecycle authority.
+_Avoid_: Caller-selected Answer destination, implicit spawn, implicit control
+
+**Response Requirement**:
+Whether an actionable message creates one correlated Answer obligation. It is independent of the Message Target, so a message targeting a Request may simultaneously Answer that Request and create a new Request.
+_Avoid_: Message kind switch, conversation thread
+
 **Signal**:
-An actionable direct message that gives another Agent work or context without requiring an answer. Sending a Signal creates no dependency for the sender.
+An actionable message to an Agent with no Response Requirement. Sending a Signal creates no dependency for the sender.
 _Avoid_: Notification, event
 
 **Request**:
-An actionable direct message that requires one correlated answer from another Agent. Sending a Request records an Agent dependency and may select when its eventual Answer is delivered; if the dependency remains unresolved when the sender settles, the sender waits on it.
+The Answer obligation created by an actionable message with a Response Requirement. The message ID is the Request ID; acceptance records one sender dependency and selects the eventual Answer's delivery timing. A message may create a Request while simultaneously answering an earlier Request.
 _Avoid_: Signal, passive status update
 
 **Answer**:
-The single terminal response that resolves one Request by its request ID. An Answer reports either fulfillment or explicit inability and uses the delivery timing chosen by the requester, defaulting to Steer Delivery; clarification and follow-up use new Requests rather than partial responses or conversation threads.
+An actionable message targeting one Request, sent only by the Agent that received it. Acceptance terminally closes that Request, while delivery resolves the requester's dependency. Its plain message content may report completion, inability, or any other terminal response; adding a Response Requirement makes the same message a new Request.
 _Avoid_: Progress update, uncorrelated reply
+
+**Spawned Initial Request**:
+The first Request carried by creation of a direct child Agent. Agent creation, Spawner relationship, Child Control, dependency creation, initial-context delivery, and first activation form one operation; an empty spawn followed by a separate task message is not exposed.
+_Avoid_: Empty Agent, post-spawn kickoff
+
+**Post-Acceptance Disposition**:
+The sender's declared action after durable message acceptance: `continue` permits another model turn, `settle` ends the current run and derives typed waiting, and `complete` ends the activation. Acceptance failure applies no disposition. Completion is invalid when the same message creates a Response Requirement.
+_Avoid_: Wait operation, delivery status, implicit auto-exit
+
+**Terminal Message Completion**:
+Completion of a subagent activation by durable acceptance of its useful final outbound Signal or Answer with Post-Acceptance Disposition `complete`. The final message is the result and terminal action; there is no separate completion operation or duplicate completion-result message.
+_Avoid_: Recipientless completion, separate done message
 
 **Steer Delivery**:
 Delivery of an actionable message to an active Agent at the next LLM-turn boundary, after the current generation's tool calls finish and before the next generation begins. It does not abort generation or tool execution.
@@ -73,15 +93,15 @@ Passive transport and session facts: `queued` means durably accepted into the re
 _Avoid_: Agent lifecycle state, acknowledgement message
 
 **Message Wake Rule**:
-An actionable message schedules immediate work for a waiting Agent and enters an active Agent according to its delivery timing. It may queue for an interrupted Agent but cannot resume it, and it is rejected for an Agent whose activation has ended; messaging alone grants no lifecycle authority.
-_Avoid_: Implicit activation, interrupt cancellation
+An actionable message schedules immediate work for a waiting Agent and enters an active Agent according to its delivery timing. Signals may queue for an interrupted Agent and are rejected for an ended Agent. A Request from a direct Spawner or Workflow Owner may restart interrupted work or create a new activation for an ended Agent; the same Request from a merely addressable peer is rejected.
+_Avoid_: Addressability as resume authority, revival by Signal
 
 **Independent Dependency Wakeup**:
 Delivery of any Answer starts its requester independently of other outstanding Requests. Unresolved Requests remain dependencies, and the Agent may return to `waiting(agent)` after processing the delivered Answer; transport provides no `all` or `any` synchronization.
 _Avoid_: Barrier, join policy
 
 **Message Identity**:
-One immutable, Workflow-unique ID assigned to every actionable message. A Request's message ID is also its request ID; an Answer has its own message ID and references that Request with `inReplyTo`. Signals have no correlation or conversation-thread identity beyond their own message ID.
+One immutable, Workflow-unique ID assigned to every actionable message. A Request's message ID is also its Request ID. An Answer has its own ID and references the Request it closes; if that Answer also has a Response Requirement, its own ID is simultaneously the new Request ID.
 _Avoid_: Separate correlation ID, thread ID
 
 **Answer Authority**:
@@ -101,7 +121,7 @@ The sender records its messaging tool call and immediate result, while the recip
 _Avoid_: Audit-log duplication, status notification message
 
 **Atomic Messaging Acceptance**:
-A messaging operation succeeds only when its durable effects commit together: queueing a Request also records its dependency, queueing an Answer also marks its Request answered, and cancelling a Request also removes its dependency. Failure leaves none of those effects behind; delivery is not part of caller-facing acceptance.
+A messaging operation succeeds only when its durable effects commit together: a Request records its dependency, an Answer closes its target Request, an Answer-and-Request also creates the new dependency, a Spawned Initial Request creates and starts its child, an authorized Request may create a new activation, and cancellation removes its dependency. Failure leaves none of those effects behind; delivery is not part of caller-facing acceptance.
 _Avoid_: Partial send, delivery acknowledgement
 
 **Pending Message Pointer**:
