@@ -104,6 +104,10 @@ _Avoid_: Audit-log duplication, status notification message
 A messaging operation succeeds only when its durable effects commit together: queueing a Request also records its dependency, queueing an Answer also marks its Request answered, and cancelling a Request also removes its dependency. Failure leaves none of those effects behind; delivery is not part of caller-facing acceptance.
 _Avoid_: Partial send, delivery acknowledgement
 
+**Durable Acceptance Receipt**:
+The Recipient Inbox Router's idempotent acknowledgement returned only after Atomic Messaging Acceptance commits. It reports `queued`, Message Identity, and recipient acceptance sequence; it does not mean delivered, read, or acted upon. Retrying the same Message Identity returns the same receipt.
+_Avoid_: Delivery receipt, read receipt
+
 **Pending Message Pointer**:
 A temporary durable recipient-inbox record that references the canonical outbound messaging tool call in the sender transcript. It stores only routing, ordering, and delivery metadata—not message payload—and is removed after delivery commits to the recipient transcript. The live queue is rebuilt from these pointers.
 _Avoid_: Duplicate message store, permanent workflow audit log
