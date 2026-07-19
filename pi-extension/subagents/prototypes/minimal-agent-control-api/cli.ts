@@ -4,7 +4,8 @@
 
 import { createInterface } from "node:readline";
 
-type Variant = "separate" | "fused";
+type InterfaceVariant = "semantic-tools" | "command-envelope";
+type CompletionComposition = "separate" | "fused";
 type ScenarioName = "autonomous" | "hitl" | "review";
 type WorkState = "active" | "waiting(human)" | "waiting(agent)" | "ended(completed)";
 
@@ -22,7 +23,8 @@ type RequestState = {
 };
 
 type PrototypeState = {
-  variant: Variant;
+  interfaceVariant: InterfaceVariant;
+  completionComposition: CompletionComposition;
   scenario: ScenarioName;
   step: number;
   agents: Record<string, AgentState>;
@@ -33,7 +35,7 @@ type PrototypeState = {
 
 type ScenarioStep = {
   label: string;
-  call: (variant: Variant) => string;
+  call: (state: PrototypeState) => string;
   apply: (state: PrototypeState) => void;
 };
 
@@ -49,7 +51,11 @@ function agent(id: string, work: WorkState = "active"): AgentState {
   return { id, work, unresolved: [] };
 }
 
-function initialState(variant: Variant, scenario: ScenarioName): PrototypeState {
+function initialState(
+  interfaceVariant: InterfaceVariant,
+  completionComposition: CompletionComposition,
+  scenario: ScenarioName,
+): PrototypeState {
   const agents =
     scenario === "autonomous"
       ? { worker: agent("worker-session") }
@@ -58,7 +64,8 @@ function initialState(variant: Variant, scenario: ScenarioName): PrototypeState 
         : { implementer: agent("implementer-session"), reviewer: agent("reviewer-session") };
 
   return {
-    variant,
+    interfaceVariant,
+    completionComposition,
     scenario,
     step: 0,
     agents,
@@ -66,6 +73,59 @@ function initialState(variant: Variant, scenario: ScenarioName): PrototypeState 
     lastCall: "(none yet)",
     events: ["Scenario initialized."],
   };
+}
+
+function sendCall(
+  state: PrototypeState,
+  input: {
+    kind: "signal" | "request";
+    to: string;
+    message: string;
+    delivery?: "steer" | "deferred";
+    answerDelivery?: "steer" | "deferred";
+    after: "continue" | "settle";
+  },
+): string {
+  const messageFields = [
+    `  to: "${input.to}",`,
+    `  message: "${input.message}",`,
+    input.delivery ? `  delivery: "${input.delivery}",` : undefined,
+    input.answerDelivery ? `  answerDelivery: "${input.answerDelivery}",` : undefined,
+  ].filter((field): field is string => field !== undefined);
+
+  if (state.interfaceVariant === "semantic-tools") {
+    return `agent_send({\n  kind: "${input.kind}",\n${messageFields.join("\n")}\n  after: "${input.after}"\n})`;
+  }
+
+  return `agent_control({\n  command: {\n    type: "message.${input.kind}",\n${messageFields.map((field) => `  ${field}`).join("\n")}\n  },\n  after: "${input.after}"\n})`;
+}
+
+function answerCall(
+  state: PrototypeState,
+  input: {
+    request: string;
+    outcome: "fulfilled" | "unable";
+    message: string;
+    after: "continue" | "settle" | { complete: string };
+  },
+): string {
+  const after =
+    typeof input.after === "string"
+      ? `"${input.after}"`
+      : `{ complete: "${input.after.complete}" }`;
+
+  if (state.interfaceVariant === "semantic-tools") {
+    return `agent_answer({\n  request: "${input.request}",\n  outcome: "${input.outcome}",\n  message: "${input.message}",\n  after: ${after}\n})`;
+  }
+
+  return `agent_control({\n  command: {\n    type: "message.answer",\n    request: "${input.request}",\n    outcome: "${input.outcome}",\n    message: "${input.message}"\n  },\n  after: ${after}\n})`;
+}
+
+function completeCall(state: PrototypeState, result: string): string {
+  if (state.interfaceVariant === "semantic-tools") {
+    return `agent_complete({ result: "${result}" })`;
+  }
+  return `agent_control({\n  command: { type: "agent.complete", result: "${result}" }\n})`;
 }
 
 function setWork(state: PrototypeState, name: string, work: WorkState): void {
@@ -92,7 +152,7 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
     steps: [
       {
         label: "Worker completes explicitly",
-        call: () => `agent_complete({\n  result: "Implemented parser validation; tests pass."\n})`,
+        call: (state) => completeCall(state, "Implemented parser validation; tests pass."),
         apply(state) {
           setWork(state, "worker", "ended(completed)");
           state.events.push("Completion result committed before the activation ended.");
@@ -107,7 +167,14 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
     steps: [
       {
         label: "Worker requests a decision and settles",
-        call: () => `agent_send({\n  kind: "request",\n  to: "spawner-session",\n  message: "Schema v1 and v2 conflict. Which should I use?",\n  answerDelivery: "steer",\n  after: "settle"\n})`,
+        call: (state) =>
+          sendCall(state, {
+            kind: "request",
+            to: "spawner-session",
+            message: "Schema v1 and v2 conflict. Which should I use?",
+            answerDelivery: "steer",
+            after: "settle",
+          }),
         apply(state) {
           addRequest(state, "req-schema", "worker", "spawner");
           setWork(state, "worker", "waiting(agent)");
@@ -142,7 +209,13 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
       },
       {
         label: "Spawner answers the Worker",
-        call: () => `agent_answer({\n  request: "req-schema",\n  outcome: "fulfilled",\n  message: "Use v2; v1 is obsolete.",\n  after: "settle"\n})`,
+        call: (state) =>
+          answerCall(state, {
+            request: "req-schema",
+            outcome: "fulfilled",
+            message: "Use v2; v1 is obsolete.",
+            after: "settle",
+          }),
         apply(state) {
           state.requests[0]!.status = "answered";
           setWork(state, "spawner", "waiting(human)");
@@ -160,7 +233,7 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
       },
       {
         label: "Worker completes",
-        call: () => `agent_complete({ result: "Implemented schema v2; tests pass." })`,
+        call: (state) => completeCall(state, "Implemented schema v2; tests pass."),
         apply(state) {
           setWork(state, "worker", "ended(completed)");
           state.events.push("The durable Agent remained the same across both runs.");
@@ -174,7 +247,14 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
     steps: [
       {
         label: "Implementer requests review",
-        call: () => `agent_send({\n  kind: "request",\n  to: "reviewer-session",\n  message: "Review revision abc123.",\n  delivery: "deferred",\n  after: "settle"\n})`,
+        call: (state) =>
+          sendCall(state, {
+            kind: "request",
+            to: "reviewer-session",
+            message: "Review revision abc123.",
+            delivery: "deferred",
+            after: "settle",
+          }),
         apply(state) {
           addRequest(state, "req-review-1", "implementer", "reviewer");
           setWork(state, "implementer", "waiting(agent)");
@@ -192,7 +272,13 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
       },
       {
         label: "Reviewer requests changes and remains reusable",
-        call: () => `agent_answer({\n  request: "req-review-1",\n  outcome: "fulfilled",\n  message: "Changes required: serialize the retry path.",\n  after: "settle"\n})`,
+        call: (state) =>
+          answerCall(state, {
+            request: "req-review-1",
+            outcome: "fulfilled",
+            message: "Changes required: serialize the retry path.",
+            after: "settle",
+          }),
         apply(state) {
           state.requests[0]!.status = "answered";
           setWork(state, "reviewer", "waiting(human)");
@@ -202,7 +288,13 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
       },
       {
         label: "Implementer fixes and requests another review",
-        call: () => `agent_send({\n  kind: "request",\n  to: "reviewer-session",\n  message: "Retry path fixed in def456; review again.",\n  after: "settle"\n})`,
+        call: (state) =>
+          sendCall(state, {
+            kind: "request",
+            to: "reviewer-session",
+            message: "Retry path fixed in def456; review again.",
+            after: "settle",
+          }),
         apply(state) {
           addRequest(state, "req-review-2", "implementer", "reviewer");
           setWork(state, "implementer", "waiting(agent)");
@@ -212,13 +304,19 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
       },
       {
         label: "Reviewer approves",
-        call: (variant) =>
-          variant === "separate"
-            ? `agent_answer({\n  request: "req-review-2",\n  outcome: "fulfilled",\n  message: "Approved.",\n  after: "continue"\n})`
-            : `agent_answer({\n  request: "req-review-2",\n  outcome: "fulfilled",\n  message: "Approved.",\n  after: { complete: "Review finished." }\n})`,
+        call: (state) =>
+          answerCall(state, {
+            request: "req-review-2",
+            outcome: "fulfilled",
+            message: "Approved.",
+            after:
+              state.completionComposition === "separate"
+                ? "continue"
+                : { complete: "Review finished." },
+          }),
         apply(state) {
           state.requests[1]!.status = "answered";
-          if (state.variant === "separate") {
+          if (state.completionComposition === "separate") {
             setWork(state, "reviewer", "active");
             state.events.push("Separate completion preserves one terminal lifecycle operation but needs another model turn.");
           } else {
@@ -229,12 +327,12 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
       },
       {
         label: "Reviewer completes under the separate-completion variant",
-        call: (variant) =>
-          variant === "separate"
-            ? `agent_complete({ result: "Review finished; def456 approved." })`
-            : `(no call — completion was fused into agent_answer)`,
+        call: (state) =>
+          state.completionComposition === "separate"
+            ? completeCall(state, "Review finished; def456 approved.")
+            : `(no call — completion was fused into the Answer command)`,
         apply(state) {
-          if (state.variant === "separate") {
+          if (state.completionComposition === "separate") {
             setWork(state, "reviewer", "ended(completed)");
             state.events.push("The extra turn ends with the sole explicit completion operation.");
           } else {
@@ -252,7 +350,7 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
       },
       {
         label: "Implementer completes",
-        call: () => `agent_complete({ result: "Implemented and approved revision def456." })`,
+        call: (state) => completeCall(state, "Implemented and approved revision def456."),
         apply(state) {
           setWork(state, "implementer", "ended(completed)");
           state.events.push("Both peers ended explicitly; the Workflow Owner stayed supervisory.");
@@ -262,7 +360,7 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
   },
 };
 
-let state = initialState("separate", "autonomous");
+let state = initialState("semantic-tools", "separate", "autonomous");
 
 function colorWork(work: WorkState): string {
   if (work === "active") return `${green}${work}${reset}`;
@@ -272,15 +370,20 @@ function colorWork(work: WorkState): string {
 
 function renderInterface(): void {
   console.log(`${bold}Candidate interface${reset}`);
-  console.log(`${cyan}agent_send${reset}({ kind, to, message, delivery?, answerDelivery?, after })`);
-  console.log(`${cyan}agent_answer${reset}({ request, outcome, message, after })`);
-  console.log(`${cyan}agent_complete${reset}({ result })`);
+  if (state.interfaceVariant === "semantic-tools") {
+    console.log(`${cyan}agent_send${reset}({ kind, to, message, delivery?, answerDelivery?, after })`);
+    console.log(`${cyan}agent_answer${reset}({ request, outcome, message, after })`);
+    console.log(`${cyan}agent_complete${reset}({ result })`);
+  } else {
+    console.log(`${cyan}agent_control${reset}({ command: { type: "message.signal" | "message.request" | "message.answer" | "agent.complete", ... }, after? })`);
+    console.log(`${dim}One tool; command type selects the protocol operation.${reset}`);
+  }
   console.log(`${dim}Runtime allocates Message IDs. Answer destination and timing derive from the Request.${reset}`);
   console.log(`${dim}No inspect, wait, escalate, cancel, resume, or Workflow Owner alias is included.${reset}`);
-  if (state.variant === "separate") {
+  if (state.completionComposition === "separate") {
     console.log(`${dim}after = continue | settle; completion remains a separate operation.${reset}`);
   } else {
-    console.log(`${dim}comparison variant: after also accepts { complete: result }.${reset}`);
+    console.log(`${dim}after also accepts { complete: result } for a final outbound message.${reset}`);
   }
 }
 
@@ -288,7 +391,8 @@ function render(): void {
   console.clear();
   const scenario = scenarios[state.scenario];
   console.log(`${bold}PROTOTYPE — Minimal agent-facing control interface${reset}`);
-  console.log(`${dim}Variant: ${state.variant === "separate" ? "separate completion (recommended)" : "fused completion (comparison)"}${reset}\n`);
+  console.log(`${dim}Protocol: ${state.interfaceVariant === "semantic-tools" ? "three semantic tools" : "single command envelope"}${reset}`);
+  console.log(`${dim}Completion: ${state.completionComposition === "separate" ? "separate operation" : "fused after final message"}${reset}\n`);
   renderInterface();
 
   console.log(`\n${bold}${scenario.title}${reset}`);
@@ -320,12 +424,13 @@ function render(): void {
 
   console.log(`\n${bold}Actions${reset}`);
   console.log(`${bold}1${reset} autonomous   ${bold}2${reset} human-in-loop   ${bold}3${reset} reviewer–implementer`);
-  console.log(`${bold}n${reset} next step    ${bold}v${reset} toggle completion variant    ${bold}z${reset} reset    ${bold}q${reset} quit`);
+  console.log(`${bold}n${reset} next step    ${bold}v${reset} switch protocol    ${bold}c${reset} switch completion composition`);
+  console.log(`${bold}z${reset} reset        ${bold}q${reset} quit`);
   process.stdout.write(`\n${bold}>${reset} `);
 }
 
 function chooseScenario(scenario: ScenarioName): void {
-  state = initialState(state.variant, scenario);
+  state = initialState(state.interfaceVariant, state.completionComposition, scenario);
 }
 
 function nextStep(): void {
@@ -335,7 +440,7 @@ function nextStep(): void {
     state.events.push("Scenario already complete.");
     return;
   }
-  state.lastCall = step.call(state.variant);
+  state.lastCall = step.call(state);
   step.apply(state);
   state.events.push(step.label);
   state.step += 1;
@@ -357,10 +462,21 @@ readline.on("line", (line) => {
       nextStep();
       break;
     case "v":
-      state = initialState(state.variant === "separate" ? "fused" : "separate", state.scenario);
+      state = initialState(
+        state.interfaceVariant === "semantic-tools" ? "command-envelope" : "semantic-tools",
+        state.completionComposition,
+        state.scenario,
+      );
+      break;
+    case "c":
+      state = initialState(
+        state.interfaceVariant,
+        state.completionComposition === "separate" ? "fused" : "separate",
+        state.scenario,
+      );
       break;
     case "z":
-      state = initialState(state.variant, state.scenario);
+      state = initialState(state.interfaceVariant, state.completionComposition, state.scenario);
       break;
     case "q":
       readline.close();

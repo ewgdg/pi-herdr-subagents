@@ -12,9 +12,12 @@ What is the smallest coherent agent-facing interface for explicit completion, ac
 npm run prototype:agent-control
 ```
 
-Choose a workflow, press `n` to advance it, and inspect the full Agent and Request state after every action. Press `v` to compare separate completion with a fused post-message completion disposition.
+Choose a workflow, press `n` to advance it, and inspect the full Agent and Request state after every action.
 
-## Recommended candidate
+- `v` switches the entire model-facing protocol: three semantic tools versus one command envelope.
+- `c` independently switches completion composition: separate completion versus completion fused after a final message.
+
+## Protocol A — three semantic tools (recommended)
 
 Three model-facing tools backed by one deep Agent Control module:
 
@@ -48,6 +51,23 @@ Receipts report durable queue acceptance and runtime-generated identities. They 
 
 This is a small external interface over a deep implementation: workflow validation, IDs, durable acceptance, dependencies, inbox routing, delivery timing, wake scheduling, transcript projection, recovery, and ownership fencing remain behind the seam.
 
+## Protocol B — one command envelope
+
+The same domain operations can instead use one model-facing tool:
+
+```ts
+agent_control({
+  command:
+    | { type: "message.signal"; to: AgentId; message: string; delivery?: Delivery }
+    | { type: "message.request"; to: AgentId; message: string; delivery?: Delivery; answerDelivery?: Delivery }
+    | { type: "message.answer"; request: RequestId; outcome: AnswerOutcome; message: string }
+    | { type: "agent.complete"; result: string },
+  after?: "continue" | "settle",
+})
+```
+
+This genuinely changes the protocol surface: every scenario renders `agent_control`, including completion as the `agent.complete` command. It minimizes tool inventory but makes one larger discriminated schema less immediately discoverable to the model.
+
 ## Post-message disposition
 
 `after` must be explicit:
@@ -77,11 +97,7 @@ Human waiting also needs no tool. An Agent asks its question in ordinary assista
 - opaque Answer Slots or Escalation Routes: conflict with established Request-ID correlation and UUID addressability
 - global discovery, Workflow Owner relay, `interactive`, `autoExit`, and `wait`
 
-## Interface alternatives considered
-
-### One `perform` / `dispatch` tool
-
-This has the fewest entry points but produces one large discriminated schema containing unrelated recipient-bearing sends, recipient-free Answers, cancellation, and completion. It is deeper as a TypeScript module than as a model-facing tool. The recommended interface keeps one internal dispatch seam while presenting three clearer tool adapters.
+## Other alternatives considered
 
 ### Five semantic methods
 
@@ -91,11 +107,11 @@ Separate `signal`, `request`, `answer`, `cancelRequest`, and `complete` calls ar
 
 Opaque Answer Slots and Escalation Routes make authority structural, but they replace decisions already made: an Agent's session UUID is its bearer address, and `inReplyTo` Request identity determines Answer authority and routing. Child Control remains a genuinely separate capability-bearing interface.
 
-## Completion comparison
+## Independent completion comparison
 
-The recommended variant keeps `agent_complete` separate. A final Answer followed by completion may require one additional model turn. This preserves one explicit terminal lifecycle operation and leaves a safe, visible partial outcome if the Agent crashes after the Answer is accepted but before completion.
+Separate completion uses `agent_complete` under Protocol A and the `agent.complete` command under Protocol B. A final Answer followed by completion may require one additional model turn. This preserves one explicit terminal lifecycle operation and leaves a safe, visible partial outcome if the Agent crashes after the Answer is accepted but before completion.
 
-The prototype's comparison variant allows:
+The orthogonal fused-completion setting allows:
 
 ```ts
 agent_answer({
