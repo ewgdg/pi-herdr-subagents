@@ -77,4 +77,22 @@ The prototype uses the recommended initial Adapter: local IPC plus SQLite.
 
 The caller Interface should not expose which Adapter is used. Hidden transport failover is rejected because it obscures diagnosis and ordering.
 
+## Workflow storage layout
+
+The Workflow Owner remains in Pi's normal project session directory. Its session UUID names one nested Workflow directory containing every descendant session and the coordination database:
+
+```text
+<pi-session-dir>/
+  <owner-session>.jsonl
+
+  <owner-session-uuid>/
+    routing.sqlite
+    <child-session>.jsonl
+    <nested-child-session>.jsonl
+```
+
+Every descendant receives the nested directory as its explicit Pi `sessionDir`. Pi writes session files directly there without adding another cwd-derived directory. Nested Agents inherit the same directory.
+
+This keeps human-created owner sessions visible in Pi's ordinary session selector while hiding extension-owned descendant sessions from its non-recursive project listing. Descendants remain resumable through their exact session paths and the subagent control Interface.
+
 The architecture is actor-model inspired: Agents have durable identities, Agent Runs are temporary activations, Recipient Inbox Routers are mailboxes, and lifecycle authorities supervise recovery. Actor terminology remains an analogy rather than the domain Interface.
