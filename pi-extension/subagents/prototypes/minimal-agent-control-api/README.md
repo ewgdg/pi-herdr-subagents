@@ -156,6 +156,45 @@ Acceptance atomically closes `implementationRequestId` and creates a new Request
 | Request | required | Answer and new Request |
 | Spawn | required | Spawn with initial Request |
 
+## Reviewer–implementer flow alternatives
+
+The interface supports two coherent review loops.
+
+### Keep the original review Request open
+
+The Reviewer does not answer the original review Request until approval. Findings are sent as a separate Request:
+
+```ts
+// req-review remains unresolved.
+agent_send({
+  target: { agent: implementerId },
+  message: "Found an issue in the retry path. Please fix it.",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle",
+})
+```
+
+The Implementer answers the fix Request. The Reviewer verifies the result and finally answers the still-open original review Request with approval.
+
+This preserves one stable Request for the entire review, but temporarily gives Reviewer and Implementer dependencies on each other. The failure contract must distinguish this productive cycle from a deadlock.
+
+### Chain Answer-and-Request messages
+
+The Reviewer closes the first review Request while opening the fix Request in the same message:
+
+```ts
+agent_send({
+  target: { request: reviewRequestId },
+  message: "Found an issue in the retry path. Please fix it.",
+  response: { required: true, delivery: "steer" },
+  onAccepted: "settle",
+})
+```
+
+After fixing it, the Implementer answers that Request while opening a new review Request. This creates a chain of terminal exchanges rather than one long-lived review Request.
+
+The interactive prototype demonstrates this second flow. Neither flow requires a special review operation.
+
 ## Post-acceptance disposition
 
 `onAccepted` is evaluated only after durable message acceptance succeeds:
