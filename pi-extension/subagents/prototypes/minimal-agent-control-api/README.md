@@ -28,14 +28,14 @@ agent_send({
   message: string,
   delivery?: "steer" | "deferred",
   answerDelivery?: "steer" | "deferred", // Request only; default: steer
-  after: "continue" | "settle",
+  onAccepted: "continue" | "settle",
 })
 
 agent_answer({
   request: RequestId,
   outcome: "fulfilled" | "unable",
   message: string,
-  after: "continue" | "settle",
+  onAccepted: "continue" | "settle",
 })
 
 agent_complete({ result: string })
@@ -62,7 +62,7 @@ agent_control({
     | { type: "message.request"; to: AgentId; message: string; delivery?: Delivery; answerDelivery?: Delivery }
     | { type: "message.answer"; request: RequestId; outcome: AnswerOutcome; message: string }
     | { type: "agent.complete"; result: string },
-  after?: "continue" | "settle",
+  onAccepted?: "continue" | "settle",
 })
 ```
 
@@ -70,7 +70,7 @@ This genuinely changes the protocol surface: every scenario renders `agent_contr
 
 ## Post-message disposition
 
-`after` must be explicit:
+`onAccepted` must be explicit:
 
 - `continue` returns the receipt to the model and permits another model turn.
 - `settle` returns a terminating tool result after durable acceptance, suppressing Pi's otherwise automatic follow-up model turn. At `agent_settled`, unresolved Requests produce `waiting(agent)`; otherwise the open activation becomes `waiting(human)` unless an operation dependency exists.
@@ -120,7 +120,7 @@ agent_answer({
   request,
   outcome: "fulfilled",
   message: "Approved.",
-  after: { complete: "Review finished." },
+  onAccepted: { complete: "Review finished." },
 })
 ```
 
@@ -129,8 +129,8 @@ That saves a model turn and can define message-acceptance-before-completion orde
 ## Workflow verdicts represented
 
 - **Autonomous:** ordinary work needs only `agent_complete`; completion result replaces a redundant parent notification.
-- **Human-in-the-loop:** a nested Agent sends a Request to its Spawner with `after: "settle"`; the Spawner asks the human with ordinary text, then Answers by Request ID.
-- **Reviewer–implementer:** change requests use `after: "settle"` so the reviewer remains open and message-wakeable for another revision; final approval exposes the separate-versus-fused completion tradeoff.
+- **Human-in-the-loop:** a nested Agent sends a Request to its Spawner with `onAccepted: "settle"`; the Spawner asks the human with ordinary text, then Answers by Request ID.
+- **Reviewer–implementer:** change requests use `onAccepted: "settle"` so the reviewer remains open and message-wakeable for another revision; final approval exposes the separate-versus-fused completion tradeoff.
 
 ## Prototype boundaries
 

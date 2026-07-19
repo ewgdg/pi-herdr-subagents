@@ -83,7 +83,7 @@ function sendCall(
     message: string;
     delivery?: "steer" | "deferred";
     answerDelivery?: "steer" | "deferred";
-    after: "continue" | "settle";
+    onAccepted: "continue" | "settle";
   },
 ): string {
   const messageFields = [
@@ -94,10 +94,10 @@ function sendCall(
   ].filter((field): field is string => field !== undefined);
 
   if (state.interfaceVariant === "semantic-tools") {
-    return `agent_send({\n  kind: "${input.kind}",\n${messageFields.join("\n")}\n  after: "${input.after}"\n})`;
+    return `agent_send({\n  kind: "${input.kind}",\n${messageFields.join("\n")}\n  onAccepted: "${input.onAccepted}"\n})`;
   }
 
-  return `agent_control({\n  command: {\n    type: "message.${input.kind}",\n${messageFields.map((field) => `  ${field}`).join("\n")}\n  },\n  after: "${input.after}"\n})`;
+  return `agent_control({\n  command: {\n    type: "message.${input.kind}",\n${messageFields.map((field) => `  ${field}`).join("\n")}\n  },\n  onAccepted: "${input.onAccepted}"\n})`;
 }
 
 function answerCall(
@@ -106,19 +106,19 @@ function answerCall(
     request: string;
     outcome: "fulfilled" | "unable";
     message: string;
-    after: "continue" | "settle" | { complete: string };
+    onAccepted: "continue" | "settle" | { complete: string };
   },
 ): string {
-  const after =
-    typeof input.after === "string"
-      ? `"${input.after}"`
-      : `{ complete: "${input.after.complete}" }`;
+  const onAccepted =
+    typeof input.onAccepted === "string"
+      ? `"${input.onAccepted}"`
+      : `{ complete: "${input.onAccepted.complete}" }`;
 
   if (state.interfaceVariant === "semantic-tools") {
-    return `agent_answer({\n  request: "${input.request}",\n  outcome: "${input.outcome}",\n  message: "${input.message}",\n  after: ${after}\n})`;
+    return `agent_answer({\n  request: "${input.request}",\n  outcome: "${input.outcome}",\n  message: "${input.message}",\n  onAccepted: ${onAccepted}\n})`;
   }
 
-  return `agent_control({\n  command: {\n    type: "message.answer",\n    request: "${input.request}",\n    outcome: "${input.outcome}",\n    message: "${input.message}"\n  },\n  after: ${after}\n})`;
+  return `agent_control({\n  command: {\n    type: "message.answer",\n    request: "${input.request}",\n    outcome: "${input.outcome}",\n    message: "${input.message}"\n  },\n  onAccepted: ${onAccepted}\n})`;
 }
 
 function completeCall(state: PrototypeState, result: string): string {
@@ -173,13 +173,13 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
             to: "spawner-session",
             message: "Schema v1 and v2 conflict. Which should I use?",
             answerDelivery: "steer",
-            after: "settle",
+            onAccepted: "settle",
           }),
         apply(state) {
           addRequest(state, "req-schema", "worker", "spawner");
           setWork(state, "worker", "waiting(agent)");
           state.events.push("Request acceptance and dependency creation committed atomically.");
-          state.events.push("after=settle suppressed the otherwise automatic follow-up model turn.");
+          state.events.push("onAccepted=settle suppressed the otherwise automatic follow-up model turn.");
         },
       },
       {
@@ -214,7 +214,7 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
             request: "req-schema",
             outcome: "fulfilled",
             message: "Use v2; v1 is obsolete.",
-            after: "settle",
+            onAccepted: "settle",
           }),
         apply(state) {
           state.requests[0]!.status = "answered";
@@ -253,7 +253,7 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
             to: "reviewer-session",
             message: "Review revision abc123.",
             delivery: "deferred",
-            after: "settle",
+            onAccepted: "settle",
           }),
         apply(state) {
           addRequest(state, "req-review-1", "implementer", "reviewer");
@@ -277,7 +277,7 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
             request: "req-review-1",
             outcome: "fulfilled",
             message: "Changes required: serialize the retry path.",
-            after: "settle",
+            onAccepted: "settle",
           }),
         apply(state) {
           state.requests[0]!.status = "answered";
@@ -293,7 +293,7 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
             kind: "request",
             to: "reviewer-session",
             message: "Retry path fixed in def456; review again.",
-            after: "settle",
+            onAccepted: "settle",
           }),
         apply(state) {
           addRequest(state, "req-review-2", "implementer", "reviewer");
@@ -309,7 +309,7 @@ const scenarios: Record<ScenarioName, { title: string; purpose: string; steps: S
             request: "req-review-2",
             outcome: "fulfilled",
             message: "Approved.",
-            after:
+            onAccepted:
               state.completionComposition === "separate"
                 ? "continue"
                 : { complete: "Review finished." },
@@ -387,21 +387,21 @@ function colorWork(work: WorkState): string {
 function renderInterface(): void {
   console.log(`${bold}Candidate interface${reset}`);
   if (state.interfaceVariant === "semantic-tools") {
-    console.log(`${cyan}agent_send${reset}({ kind, to, message, delivery?, answerDelivery?, after })`);
-    console.log(`${cyan}agent_answer${reset}({ request, outcome, message, after })`);
+    console.log(`${cyan}agent_send${reset}({ kind, to, message, delivery?, answerDelivery?, onAccepted })`);
+    console.log(`${cyan}agent_answer${reset}({ request, outcome, message, onAccepted })`);
     console.log(`${cyan}agent_complete${reset}({ result })`);
   } else {
-    console.log(`${cyan}agent_control${reset}({ command: { type: "message.signal" | "message.request" | "message.answer" | "agent.complete", ... }, after? })`);
+    console.log(`${cyan}agent_control${reset}({ command: { type: "message.signal" | "message.request" | "message.answer" | "agent.complete", ... }, onAccepted? })`);
     console.log(`${dim}One tool; command type selects the protocol operation.${reset}`);
   }
   console.log(`${dim}Runtime allocates Message IDs. Answer destination and timing derive from the Request.${reset}`);
   console.log(`${dim}No inspect, wait, escalate, cancel, resume, or Workflow Owner alias is included.${reset}`);
   if (state.completionComposition === "separate") {
-    console.log(`${dim}after = continue | settle; completion remains a separate operation.${reset}`);
-    console.log(`${yellow}final message:${reset} Answer(after="continue") → Complete(result)`);
+    console.log(`${dim}onAccepted = continue | settle; completion remains a separate operation.${reset}`);
+    console.log(`${yellow}final message:${reset} Answer(onAccepted="continue") → Complete(result)`);
   } else {
-    console.log(`${dim}after also accepts { complete: result } for a final outbound message.${reset}`);
-    console.log(`${yellow}final message:${reset} Answer(after={ complete: result })`);
+    console.log(`${dim}onAccepted also accepts { complete: result } for a final outbound message.${reset}`);
+    console.log(`${yellow}final message:${reset} Answer(onAccepted={ complete: result })`);
   }
 }
 
