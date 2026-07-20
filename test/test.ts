@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -66,6 +66,11 @@ import {
   observePaneInspection,
   projectLifecycle,
 } from "../pi-extension/subagents/lifecycle.ts";
+import {
+  createLegacyAgentRunAdapters,
+  superviseLegacyAgentRun,
+  type LegacyAgentRunAdapters,
+} from "../pi-extension/subagents/legacy-agent-run.ts";
 
 // Tool-registration behavior is environment-sensitive for child subagents.
 // Isolate the unit suite from inherited parent/child capability variables.
@@ -143,6 +148,9 @@ function createMockExtensionApi() {
       getAllTools() {
         return [];
       },
+      getThinkingLevel() {
+        return "medium";
+      },
     } as any,
   };
 }
@@ -153,6 +161,38 @@ function restoreEnvVar(name: string, value: string | undefined) {
     return;
   }
   process.env[name] = value;
+}
+
+async function withFakeHerdr<T>(run: () => Promise<T>): Promise<T> {
+  const commandDir = createTestDir();
+  const previous = new Map(
+    ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "PATH"]
+      .map((name) => [name, process.env[name]]),
+  );
+  writeFileSync(
+    join(commandDir, "herdr"),
+    [
+      "#!/bin/sh",
+      "if [ \"$1 $2\" = \"tab create\" ]; then",
+      "  echo '{\"result\":{\"root_pane\":{\"pane_id\":\"fake:p1\"}}}'",
+      "else",
+      "  echo '{\"result\":{}}'",
+      "fi",
+    ].join("\n"),
+  );
+  chmodSync(join(commandDir, "herdr"), 0o755);
+  process.env.HERDR_ENV = "1";
+  process.env.HERDR_PANE_ID = "fake:owner";
+  process.env.HERDR_TAB_ID = "fake:tab";
+  process.env.HERDR_WORKSPACE_ID = "fake:workspace";
+  process.env.PATH = `${commandDir}:${previous.get("PATH") ?? ""}`;
+
+  try {
+    return await run();
+  } finally {
+    for (const [name, value] of previous) restoreEnvVar(name, value);
+    rmSync(commandDir, { recursive: true, force: true });
+  }
 }
 
 function withMockedNow<T>(now: number, fn: () => T): T {
@@ -1871,6 +1911,117 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("preserves the legacy public tool surface", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    assert.deepEqual(
+      registeredTools.map((tool) => tool.name).sort(),
+      ["subagent", "subagent_interrupt", "subagent_resume", "subagents_list"],
+    );
+    const spawn = registeredTools.find((tool) => tool.name === "subagent");
+    const resume = registeredTools.find((tool) => tool.name === "subagent_resume");
+    assert.deepEqual(Object.keys(spawn.parameters.properties).sort(), [
+      "agent",
+      "cwd",
+      "fork",
+      "interactive",
+      "model",
+      "name",
+      "resumeSessionId",
+      "skills",
+      "systemPrompt",
+      "task",
+      "thinking",
+      "tools",
+    ]);
+    assert.deepEqual(Object.keys(resume.parameters.properties).sort(), [
+      "autoExit",
+      "message",
+      "name",
+      "sessionPath",
+    ]);
+  });
+
+  it("keeps public launch behavior while routing Agent Runs through injected adapters", async () => {
+    await withFakeHerdr(async () => {
+      const events: string[] = [];
+      const fakeRun = {
+        id: "adapter-run",
+        name: "Adapter",
+        task: "Do work",
+        surface: "pane",
+        startTime: 1,
+        sessionFile: "/tmp/adapter.jsonl",
+        interactive: false,
+        runtimePlan: undefined,
+        launchKind: "spawn" as const,
+        lifecycle: createLifecycle(1),
+        abortController: undefined as AbortController | undefined,
+      };
+      const adapters = {
+        launcher: {
+          async launch(request: any) {
+            assert.equal(request.params.name, "Adapter");
+            assert.equal(request.parentThinking, "medium");
+            events.push("launched");
+            return fakeRun;
+          },
+          async resume() {
+            assert.fail("resume must not be called");
+          },
+        },
+        supervisor: {
+          async watch() {
+            events.push("watched");
+            return { summary: "done" };
+          },
+        },
+        resultRelay: {
+          completed() {
+            events.push("relayed");
+          },
+          failed() {
+            assert.fail("failure must not be relayed");
+          },
+        },
+        ui: {
+          sessionStarted() {},
+          sessionShutdown() {},
+          runStarted() {
+            events.push("presented");
+          },
+        },
+      };
+      const { api, registeredTools } = createMockExtensionApi();
+      const extension = subagentsModule.createSubagentsExtension({
+        legacyAgentRunAdapters: () => adapters as any,
+      });
+      extension(api);
+      const subagent = registeredTools.find((tool) => tool.name === "subagent");
+      assert.ok(subagent);
+
+      const result = await subagent.execute(
+        "call",
+        { name: "Adapter", task: "Do work" },
+        new AbortController().signal,
+        () => {},
+        {
+          sessionManager: {
+            getSessionFile: () => "/tmp/owner.jsonl",
+            getSessionId: () => "owner",
+            getSessionDir: () => "/tmp",
+          },
+        },
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      assert.equal(result.details.id, "adapter-run");
+      assert.equal(result.details.status, "started");
+      assert.deepEqual(events, ["launched", "presented", "watched", "relayed"]);
+    });
+  });
+
   it("refreshes subagent routing guidance from the live authenticated model registry", () => {
     const { api, registeredTools, eventHandlers } = createMockExtensionApi();
     (subagentsModule as any).default(api);
@@ -1985,6 +2136,174 @@ describe("tool registration", () => {
 });
 
 describe("subagent parent lifecycle", () => {
+  it("resumes the same session and relays only newly appended output", async () => {
+    await withFakeHerdr(async () => {
+      const dir = createTestDir();
+      try {
+        const sessionFile = createSessionFile(dir, [SESSION_HEADER]);
+        const { api, sentMessages } = createMockExtensionApi();
+        const runningSubagents = new Map<string, any>();
+        const adapters = createLegacyAgentRunAdapters<any>({
+          pi: api,
+          subagentsDir: join(process.cwd(), "pi-extension", "subagents"),
+          runningSubagents,
+          currentExtensionApi: () => api,
+          async launch() {
+            assert.fail("spawn must not be called");
+          },
+          async watch(run) {
+            const appended = {
+              type: "message",
+              id: "resume-output",
+              parentId: SESSION_HEADER.id,
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "resumed output" }],
+              },
+            };
+            writeFileSync(run.sessionFile, `${readFileSync(run.sessionFile, "utf8")}${JSON.stringify(appended)}\n`);
+            return {
+              name: run.name,
+              task: run.task,
+              summary: "stale watcher summary",
+              sessionFile: run.sessionFile,
+              exitCode: 0,
+              elapsed: 2,
+            };
+          },
+          getArtifactDir: (sessionDir, sessionId) => join(sessionDir, "artifacts", sessionId),
+          getShellReadyDelayMs: () => 0,
+          resolveResumeLaunchBehavior: subagentsModule.__test__.resolveResumeLaunchBehavior,
+          resolveResultPresentation: subagentsModule.__test__.resolveResultPresentation,
+          shouldDeliverCompletion: shouldDeliverSubagentCompletion,
+          selectCompletionApi,
+          formatElapsed: subagentsModule.__test__.formatElapsed,
+          updateWidget() {},
+          sessionStarted() {},
+          sessionShutdown() {},
+          runStarted() {},
+        });
+
+        const running = await adapters.launcher.resume({
+          params: { sessionPath: sessionFile, name: "Resume" },
+          context: {
+            sessionManager: {
+              getSessionId: () => "owner",
+              getSessionDir: () => dir,
+            },
+          },
+        });
+
+        assert.equal(running.sessionFile, sessionFile);
+        assert.equal(runningSubagents.get(running.id), running);
+        assert.match(readFileSync(running.launchScriptFile!, "utf8"), new RegExp(`--session '${sessionFile}'`));
+
+        await superviseLegacyAgentRun(running, adapters);
+
+        assert.equal(sentMessages.length, 1);
+        assert.equal(sentMessages[0].message.customType, "subagent_result");
+        assert.match(sentMessages[0].message.content, /resumed output/);
+        assert.doesNotMatch(sentMessages[0].message.content, /stale watcher summary/);
+        assert.equal(sentMessages[0].message.details.sessionFile, sessionFile);
+        assert.equal(runningSubagents.size, 0);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("supervises a legacy Agent Run through replaceable adapters", async () => {
+    const events: string[] = [];
+    const running = { id: "child", abortController: undefined as AbortController | undefined };
+    const adapters: LegacyAgentRunAdapters<typeof running, { summary: string }> = {
+      supervisor: {
+        async watch(_running, signal) {
+          assert.equal(signal.aborted, false);
+          events.push("watched");
+          return { summary: "done" };
+        },
+      },
+      resultRelay: {
+        completed(relayedRun, result) {
+          assert.equal(relayedRun, running);
+          assert.equal(result.summary, "done");
+          events.push("completed");
+        },
+        failed() {
+          events.push("failed");
+        },
+      },
+      ui: {
+        runStarted(startedRun) {
+          assert.equal(startedRun, running);
+          events.push("started");
+        },
+      },
+    };
+
+    await superviseLegacyAgentRun(running, adapters);
+
+    assert.ok(running.abortController);
+    assert.deepEqual(events, ["started", "watched", "completed"]);
+  });
+
+  it("relays legacy Agent Run supervision failures once", async () => {
+    const relayedErrors: unknown[] = [];
+    const running = { id: "child", abortController: undefined as AbortController | undefined };
+    const adapters: LegacyAgentRunAdapters<typeof running, never> = {
+      supervisor: {
+        async watch() {
+          throw new Error("watch failed");
+        },
+      },
+      resultRelay: {
+        completed() {
+          assert.fail("completion must not be relayed");
+        },
+        failed(_run, error) {
+          relayedErrors.push(error);
+        },
+      },
+      ui: {
+        runStarted() {},
+      },
+    };
+
+    await superviseLegacyAgentRun(running, adapters);
+
+    assert.equal(relayedErrors.length, 1);
+    assert.match(String(relayedErrors[0]), /watch failed/);
+  });
+
+  it("does not reclassify completion relay failures as run failures", async () => {
+    let failedRelays = 0;
+    const running = { id: "child", abortController: undefined as AbortController | undefined };
+    const adapters: LegacyAgentRunAdapters<typeof running, { summary: string }> = {
+      supervisor: {
+        async watch() {
+          return { summary: "done" };
+        },
+      },
+      resultRelay: {
+        completed() {
+          throw new Error("completion relay failed");
+        },
+        failed() {
+          failedRelays += 1;
+        },
+      },
+      ui: {
+        runStarted() {},
+      },
+    };
+
+    await assert.rejects(
+      superviseLegacyAgentRun(running, adapters),
+      /completion relay failed/,
+    );
+    assert.equal(failedRelays, 0);
+  });
+
   it("preserves active subagents during extension reload", () => {
     const abortController = new AbortController();
     const agents = new Map([["child", {
