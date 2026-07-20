@@ -25,7 +25,7 @@ The main Agent whose Pi session identifies the Workflow. Ownership remains with 
 _Avoid_: Spawner, parent
 
 **Moderator**:
-A fresh Agent created for one operational incident so diagnostic work does not pollute the Workflow Owner's task context. It receives temporary administrative visibility and lifecycle control only over the incident's participant subtree and Request-dependency closure, never ownership or control of the Workflow Owner. It resolves operational matters independently and escalates only domain judgment; its authority ends with the incident.
+A fresh runtime-created administrative Agent for one Operational Incident, with no Spawner or Child Control relationship. It receives a fixed Moderator Agent Definition plus Incident Visibility and Incident Control, cannot spawn children, and uses one durable session identity across its single permitted recovery activation. The Workflow Owner retains workflow-wide control without receiving automatic model context. The Moderator resolves operational matters independently, hands domain judgment to the Owner, and is never reused across incidents.
 _Avoid_: Workflow Owner, permanent supervisor, workflow-wide administrator
 
 **Addressability**:
@@ -127,6 +127,54 @@ _Avoid_: Cycle rejection, timeout-only diagnosis, active collaboration
 **Autonomous Request Chain**:
 A causal sequence in which an Answer also creates the next Response Requirement. Chain depth is observable but not capped by the protocol because hop count does not distinguish useful iteration from waste. Explicit Workflow resource policy may impose operational limits without changing Request semantics.
 _Avoid_: Mandatory hop limit, conversation thread, deadlock proxy
+
+**Operational Incident**:
+One deduplicated episode where a runtime-confirmed operational condition blocks progress or safe cleanup, deterministic recovery or reconciliation is exhausted or cannot choose safely, and resolution requires temporary diagnostic visibility or lifecycle authority. Confirmed Dependency Deadlock, exhausted Automatic Recovery, and persistent cancellation, ownership, acceptance, or side-effect uncertainty after bounded reconciliation qualify. Ordinary watch conditions, domain decisions, bare timeouts, and failures with recovery still available do not.
+_Avoid_: Suspicion, attention item, timeout alert, domain escalation
+
+**Incident Scope**:
+The durable authority boundary of one Operational Incident. Its seed is the confirmed deadlock component, recovery-exhausted Agent, or Agents, Runs, messages, and operations implicated in persistent uncertainty. It includes seeded Agents' descendant subtrees and the transitive Agents connected by unresolved Requests in either direction. While the incident is open, newly implicated descendants and Request neighbors are added monotonically; the scope never expands through Signals, Addressability, or transcript references and never shrinks before termination. A Moderator cannot widen it manually.
+_Avoid_: Workflow-wide access, mutable allowlist, message-history reachability
+
+**Incident Visibility**:
+Temporary read access granted to a Moderator over any runtime record, configuration, or transcript portion belonging to non-Owner Agents within its Incident Scope. The Moderator initially receives only incident-facing Requests, relevant state, and a compact diagnostic summary, then pulls broader scoped material on demand. The Workflow Owner is the exception: only its incident-facing records are visible, never its general transcript. Inspection does not inject diagnostics into Owner context and grants no authority outside the Incident Scope.
+_Avoid_: Eager transcript injection, Workflow Owner transcript access, workflow-wide visibility
+
+**Incident Control**:
+Temporary operational authority granted to a Moderator over non-Owner Agents within its Incident Scope. It may message them, interrupt active work, restart interrupted work, create recovery activations for failed Agents, cancel activations, and declare Recovery Abandonment. Every mutation is durably attributed to the incident with the Moderator's rationale. It cannot answer or cancel a Request for its owner, declare another Agent complete, alter identity, transcripts, Agent Definitions, tools, or capabilities, spawn unrelated Agents, reparent Agents, transfer authority, widen Incident Scope, or control the Workflow Owner.
+_Avoid_: Child Control, Workflow ownership, proxy Request authority, unrestricted administration
+
+**Incident Brief**:
+The compact durable initial context for a fresh Moderator. It identifies the incident and operational question; captures triggering evidence, the Incident Scope roster and dependency graph, incident-facing Requests, relevant runtime state, prior deterministic recovery attempts, applicable policies, authority boundaries, allowed verdicts, and termination conditions; and supplies durable pointers for broader inspection. The embedded state is a consistent creation-time snapshot, while inspection reads current live state. Large transcripts and unrelated history are not loaded eagerly.
+_Avoid_: Full transcript dump, live state substitute, Workflow Owner context injection
+
+**Moderator Outcome**:
+The terminal result of one Moderator engagement. `Operationally resolved` records the rationale, revokes the Moderator's authority, ends it, and closes the incident after runtime verification confirms the blocking or unsafe condition cleared. `Owner handoff` durably delivers a compact actionable escalation, revokes Moderator authority, ends it, transfers Incident Control to the Workflow Owner, and leaves the incident open as `owner-handled`. A voluntary outcome requires all Moderator-created Requests to be answered or cancelled. Failure or process loss is not an outcome.
+_Avoid_: Silent completion, timeout closure, incident closure on handoff
+
+**Owner Handoff**:
+Transfer of an unresolved Operational Incident from its Moderator to the Workflow Owner after durable acceptance of an actionable escalation packet. The incident remains open and retains an `ACT` human-attention entry until the Owner records operational resolution, even after the packet reaches Owner context. Full diagnostics remain available through pointers rather than eager context injection.
+_Avoid_: Incident resolution, passive notification, cleared human attention
+
+**Incident Escalation**:
+The runtime-owned actionable input that performs Owner Handoff. Its canonical compact packet lives in the incident record and is delivered exactly once to the Workflow Owner without creating an Answer obligation; it may wake or reactivate the permanent Owner. A voluntary Moderator remains active until durable acceptance, while failure fallback remains pending without a Moderator. Acceptance transfers Incident Control and ends the Moderator engagement; the Owner acts through incident operations rather than replying to the former Moderator.
+_Avoid_: Signal, Request, Answer, passive runtime event
+
+**Moderator Failure Fallback**:
+The non-recursive recovery path when a Moderator cannot start, exhausts its single automatic replacement activation, or cannot produce a valid outcome. The runtime produces one deduplicated Owner Handoff packet containing the required decision, immediate risk, attempted actions, recommended choices and consequences, and pointers to the Incident Brief, Moderator transcript, and diagnostics. Until the Workflow Owner accepts it, the incident stays open without usable Moderator authority and surfaces as `ACT`; failed delivery remains durably pending rather than spawning another Moderator.
+_Avoid_: Nested moderation, incident closure, repeated Owner alerts, full diagnostic injection
+
+**Moderator Escalation Boundary**:
+The boundary between operational judgment a Moderator may exercise and domain judgment reserved for the Workflow Owner and human. A Moderator may apply protocol invariants and existing Workflow policy, including Recovery Abandonment when evidence establishes that recovery is unavailable or policy-forbidden. It must use Owner Handoff when choices depend on task value or intent, change goals, priorities, policy, or risk tolerance, authorize uncertain irreversible side effects, sacrifice potentially valuable work without operational necessity, require action beyond Incident Scope or against the Owner, or cannot be mechanically verified as safe.
+_Avoid_: Domain decision by Moderator, escalation of routine operational choice
+
+**Risk Acceptance**:
+The Workflow Owner's human-confirmed terminal decision to close an Operational Incident whose remaining uncertainty cannot be eliminated or mechanically verified. It records what remains unknown, possible consequences, attempted recovery or mitigation, and the chosen next action, then closes the incident and clears `ACT` without representing the uncertain operation as successful. A Moderator may recommend Risk Acceptance but cannot commit it.
+_Avoid_: Successful resolution, Moderator verdict, silent dismissal, uncertainty erasure
+
+**Overlapping Incidents**:
+Distinct Operational Incidents whose Incident Scopes share one or more Agents. Scope overlap alone does not merge them, while repeated detection of the same condition episode is deduplicated. Their Moderators may inspect the same Agent, but mutating Incident Control operations use ownership fences and state preconditions so one conflicting operation commits and stale competitors must re-inspect. Each Moderator sees incident-control mutations affecting its scope and must independently verify and record resolution even when another incident's action clears its trigger.
+_Avoid_: Scope-based incident merging, unfenced concurrent control, implicit incident closure
 
 **Deadlock Escalation**:
 One deduplicated runtime-generated operational incident for each confirmed Dependency Deadlock episode. A fresh incident-scoped Moderator handles it without waking the Workflow Owner when available; otherwise a compact decision packet wakes or reactivates the Owner. Full diagnostics remain outside Owner model context for on-demand inspection. If neither route is available, the incident remains durably pending and surfaces through human attention until delivered exactly once. Detection and bookkeeping are runtime-owned but their module placement is implementation-defined.
