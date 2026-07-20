@@ -7,10 +7,13 @@ import { SQLiteWorkflowStore } from "../../pi-extension/subagents/protocol/sqlit
 import { WorkflowControlPlane } from "../../pi-extension/subagents/protocol/workflow-control-plane.ts";
 import {
   PI_TIMEOUT,
+  closePane,
   cleanupTestEnv,
   createTestEnv,
   createTrackedSurface,
   getAvailableBackends,
+  interruptPane,
+  readPane,
   restoreBackend,
   setBackend,
   sleep,
@@ -18,7 +21,6 @@ import {
   trackTempFile,
   uniqueId,
   waitForFile,
-  waitForScreen,
   type TestEnv,
 } from "./harness.ts";
 
@@ -49,15 +51,10 @@ for (const backend of getAvailableBackends()) {
         `  name: "Workflow-${id}"`,
         "  agent: \"test-echo\"",
         `  task: "Run this bash command: echo 'WORKFLOW_${id}' > '${markerFile}'"`,
-        "After receiving the result, say WORKFLOW_FOUNDATION_COMPLETE.",
+        "Do not send another prompt to the child after it settles.",
       ].join("\n"));
 
       await waitForFile(markerFile, PI_TIMEOUT, /WORKFLOW_/);
-      await waitForScreen(
-        surface,
-        /WORKFLOW_FOUNDATION_COMPLETE/,
-        PI_TIMEOUT,
-      );
       const safeProjectPath = `--${environment.dir.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
       const sessionDirectory = join(
         process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
@@ -93,21 +90,113 @@ for (const backend of getAvailableBackends()) {
         ownerSessionId: workflow.ownerAgentId,
         ownerSessionPath: workflow.ownerSessionPath,
       });
-      let replacement;
-      for (let attempt = 0; attempt < 30; attempt += 1) {
-        try {
-          replacement = controlPlane.acquireAgentRun(
-            controlPlane.agent(child.agentId),
-            `integration-check-${id}`,
-          );
-          break;
-        } catch (error) {
-          if ((error as { code?: string }).code !== "AgentRunAlreadyOwned") throw error;
-          await sleep(500);
-        }
+      const childReference = controlPlane.agent(child.agentId);
+      let activation = controlPlane.inspectActivation(childReference);
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        if (activation?.state.kind === "waiting") break;
+        await sleep(500);
+        activation = controlPlane.inspectActivation(childReference);
       }
-      assert.ok(replacement, "completed child Agent Run should eventually release ownership");
-      controlPlane.releaseAgentRun(replacement!);
+      assert.deepEqual(activation?.state, {
+        kind: "waiting",
+        dependencies: [{ kind: "human", dependencyId: "human" }],
+      });
+      assert.ok(
+        controlPlane.currentAgentRun(childReference),
+        "settled child must retain Agent Run ownership",
+      );
+
+      const checkpoint = controlPlane.readAgentRunCheckpoint(childReference);
+      assert.ok(checkpoint, "active Agent Run should retain its surface checkpoint");
+      const locator = JSON.parse(checkpoint.value) as { surface: string };
+      closePane(locator.surface);
+
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        if (!controlPlane.currentAgentRun(childReference)) break;
+        await sleep(500);
+      }
+      assert.equal(controlPlane.currentAgentRun(childReference), undefined);
+      const failed = controlPlane.inspectActivation(childReference);
+      assert.equal(failed?.state.kind, "ended");
+      if (failed?.state.kind !== "ended") {
+        assert.fail("closed child should end its canonical activation");
+      }
+      assert.equal(failed.state.outcome, "failed");
+      controlPlane.close();
+    });
+
+    it("commits interruption only after Pi confirms the active turn aborted", async () => {
+      const id = uniqueId();
+      const markerFile = `/tmp/pi-integ-interrupt-${id}.txt`;
+      trackTempFile(environment, markerFile);
+      const surface = createTrackedSurface(environment, `interrupt-${id}`);
+      await sleep(1_000);
+
+      startPi(surface, environment.dir, [
+        "Call the subagent tool exactly once with:",
+        `  name: "Interrupt-${id}"`,
+        "  agent: \"test-echo\"",
+        `  task: "Run: echo 'START_${id}' > '${markerFile}'; sleep 120"`,
+        "Do not send another prompt to the child.",
+      ].join("\n"));
+
+      await waitForFile(markerFile, PI_TIMEOUT, /START_/);
+      const safeProjectPath = `--${environment.dir.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+      const sessionDirectory = join(
+        process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
+        "sessions",
+        safeProjectPath,
+      );
+      const stores = readdirSync(sessionDirectory, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => join(sessionDirectory, entry.name, "coordination.sqlite"))
+        .filter(existsSync)
+        .map((databasePath) => new SQLiteWorkflowStore(databasePath));
+      const match = stores.map((store) => {
+        const workflow = store.readWorkflowIdentity();
+        const child = workflow
+          ? store.listWorkflow(workflow.ownerAgentId).find((agent) => agent.name === `Interrupt-${id}`)
+          : undefined;
+        return { workflow, child };
+      }).find((candidate) => candidate.workflow && candidate.child);
+      for (const store of stores) store.close();
+      assert.ok(match?.workflow && match.child, "interrupt target should be durable");
+
+      const controlPlane = WorkflowControlPlane.startOwner({
+        ownerSessionId: match.workflow.ownerAgentId,
+        ownerSessionPath: match.workflow.ownerSessionPath,
+      });
+      const childReference = controlPlane.agent(match.child.agentId);
+      const ownership = controlPlane.currentAgentRun(childReference);
+      assert.ok(ownership, "active child should retain ownership before interruption");
+      const checkpoint = controlPlane.readAgentRunCheckpoint(childReference);
+      assert.ok(checkpoint);
+      const locator = JSON.parse(checkpoint.value) as { surface: string };
+
+      controlPlane.requestInterruption(ownership);
+      assert.equal(controlPlane.inspectActivation(childReference)?.state.kind, "active");
+      interruptPane(locator.surface);
+      interruptPane(locator.surface);
+
+      let activation = controlPlane.inspectActivation(childReference);
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        if (activation?.state.kind === "interrupted") break;
+        await sleep(500);
+        activation = controlPlane.inspectActivation(childReference);
+      }
+      assert.equal(
+        activation?.state.kind,
+        "interrupted",
+        `Child screen after Escape:\n${readPane(locator.surface, 120)}\nTranscript tail:\n${readFileSync(match.child.sessionPath, "utf8").split("\n").slice(-8).join("\n")}`,
+      );
+      assert.equal(controlPlane.currentAgentRun(childReference)?.runId, ownership.runId);
+
+      closePane(locator.surface);
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        if (!controlPlane.currentAgentRun(childReference)) break;
+        await sleep(500);
+      }
+      assert.equal(controlPlane.currentAgentRun(childReference), undefined);
       controlPlane.close();
     });
   });

@@ -2,7 +2,12 @@ import { existsSync, realpathSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { readPiSessionUuid } from "./workflow-identity.ts";
 import type { WorkflowSessionBinding } from "./workflow-session-binding.ts";
-import { AgentRunOwnershipStore } from "./agent-run-ownership.ts";
+import {
+  ActivationLifecycleStore,
+  type ActivationRecord,
+  type FailedExit,
+  type InterruptionRequest,
+} from "./activation-lifecycle.ts";
 import {
   WorkflowControlPlane,
   WorkflowProtocolError,
@@ -17,6 +22,7 @@ export const WORKFLOW_OWNER_SESSION_PATH_ENV = "PI_WORKFLOW_OWNER_SESSION_PATH";
 export const WORKFLOW_AGENT_SESSION_ID_ENV = "PI_WORKFLOW_AGENT_SESSION_ID";
 export const WORKFLOW_RUN_ID_ENV = "PI_WORKFLOW_RUN_ID";
 export const WORKFLOW_FENCING_EPOCH_ENV = "PI_WORKFLOW_FENCING_EPOCH";
+export const WORKFLOW_ACTIVATION_ID_ENV = "PI_WORKFLOW_ACTIVATION_ID";
 const SESSION_BOOTSTRAP_RETRY_MS = 25;
 
 export interface WorkflowBootstrapContext {
@@ -116,7 +122,10 @@ export class WorkflowBootstrap {
         now: this.#now,
       });
       const ownership = ownershipFromEnvironment(environment, ownerSessionId, sessionId);
-      if (ownership) this.#controlPlane.assertCurrentAgentRun(ownership);
+      if (ownership) {
+        this.#controlPlane.assertCurrentAgentRun(ownership);
+        this.#selfOwnership = ownership;
+      }
     } else {
       this.#controlPlane = WorkflowControlPlane.openAgentFromSession({
         agentSessionId: sessionId,
@@ -124,7 +133,27 @@ export class WorkflowBootstrap {
         now: this.#now,
       });
       if (this.#controlPlane) {
-        this.#selfOwnership = this.#controlPlane.acquireCurrentAgentRun(randomUUID());
+        const ownership = this.#controlPlane.acquireCurrentAgentRun(randomUUID());
+        try {
+          this.#controlPlane.startActivation(ownership);
+          this.#selfOwnership = ownership;
+        } catch (activationError) {
+          let releaseError: unknown;
+          try {
+            this.#controlPlane.releaseAgentRun(ownership);
+          } catch (error) {
+            releaseError = error;
+          }
+          this.#controlPlane.close();
+          this.#controlPlane = undefined;
+          if (releaseError) {
+            throw new AggregateError(
+              [activationError, releaseError],
+              `Manual Agent Run activation startup failed and ownership release failed for ${sessionId}`,
+            );
+          }
+          throw activationError;
+        }
       } else {
         this.#controlPlane = WorkflowControlPlane.startOwner({
           ownerSessionId: sessionId,
@@ -146,6 +175,9 @@ export class WorkflowBootstrap {
     context: WorkflowBootstrapContext,
     environment: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
   ): Promise<void> {
+    if (!context.sessionManager?.getSessionFile()) {
+      throw new Error("Durable Workflow requires a persistent Pi session file");
+    }
     this.sessionStarted(context, environment);
     while (!this.#controlPlane) {
       await new Promise<void>((resolve) => setTimeout(resolve, SESSION_BOOTSTRAP_RETRY_MS));
@@ -154,13 +186,15 @@ export class WorkflowBootstrap {
   }
 
   close(): void {
-    let releaseError: unknown;
-    try {
-      if (this.#controlPlane && this.#selfOwnership) {
-        this.#controlPlane.releaseAgentRun(this.#selfOwnership);
+    if (this.#controlPlane && this.#selfOwnership) {
+      const activation = this.#controlPlane.inspectActivation(
+        this.#controlPlane.agent(this.#selfOwnership.agentId),
+      );
+      if (activation?.runId === this.#selfOwnership.runId && activation.state.kind !== "ended") {
+        this.#controlPlane.failAgentRun(this.#selfOwnership, {
+          error: "Agent Run runtime closed without committed completion or cancellation",
+        });
       }
-    } catch (error) {
-      releaseError = error;
     }
     if (this.#sessionBootstrapTimer) clearTimeout(this.#sessionBootstrapTimer);
     this.#sessionBootstrapTimer = undefined;
@@ -169,12 +203,44 @@ export class WorkflowBootstrap {
     this.#selfOwnership = undefined;
     this.#sessionId = undefined;
     this.#sessionPath = undefined;
-    if (releaseError) throw releaseError;
   }
 
   inspect(agentId: string): AgentRecord {
     const controlPlane = this.#requireControlPlane();
     return controlPlane.inspectAgent(controlPlane.agent(agentId));
+  }
+
+  inspectActivation(agentId: string): ActivationRecord | undefined {
+    const controlPlane = this.#requireControlPlane();
+    return controlPlane.inspectActivation(controlPlane.agent(agentId));
+  }
+
+  runStarted(ownership: AgentRunOwnership): ActivationRecord {
+    return this.#requireControlPlane().startActivation(ownership);
+  }
+
+  currentTurnStarted(): ActivationRecord | undefined {
+    const controlPlane = this.#requireControlPlane();
+    if (controlPlane.currentAgent.agentId === controlPlane.workflow.ownerAgentId) return undefined;
+    const ownership = this.#requireSelfOwnership();
+    const activation = controlPlane.inspectActivation(controlPlane.currentAgent);
+    if (!activation) return controlPlane.startActivation(ownership);
+    return controlPlane.activateTurn(ownership);
+  }
+
+  currentTurnSettled(interrupted: boolean): ActivationRecord | { kind: "owner-turn-settled" } {
+    const controlPlane = this.#requireControlPlane();
+    if (controlPlane.currentAgent.agentId === controlPlane.workflow.ownerAgentId) {
+      return controlPlane.settleOwnerTurn();
+    }
+    const ownership = this.#requireSelfOwnership();
+    return interrupted
+      ? controlPlane.confirmInterruption(ownership)
+      : controlPlane.settleActivation(ownership);
+  }
+
+  requestInterruption(ownership: AgentRunOwnership): InterruptionRequest {
+    return this.#requireControlPlane().requestInterruption(ownership);
   }
 
   prepareSpawn(input: PrepareSpawnInput): PreparedAgentRun {
@@ -258,7 +324,14 @@ export class WorkflowBootstrap {
       if (!current || !checkpoint || checkpoint.fencingEpoch !== current.epoch) throw error;
       const locator = parseRunLocator(checkpoint.value);
       if (!locator || !(await this.#confirmRunTerminated(locator))) throw error;
-      controlPlane.releaseAgentRun(current);
+      const activation = controlPlane.inspectActivation(agent);
+      if (activation?.runId === current.runId && activation.state.kind !== "ended") {
+        controlPlane.failAgentRun(current, {
+          error: "Previous Agent Run termination was confirmed during resume reconciliation",
+        });
+      } else {
+        controlPlane.releaseAgentRun(current);
+      }
       ownership = controlPlane.acquireAgentRun(agent, input.runId);
     }
     controlPlane.writeAgentRunCheckpoint(
@@ -272,21 +345,44 @@ export class WorkflowBootstrap {
     };
   }
 
-  runTerminated(ownership: AgentRunOwnership, confirmed: boolean): void {
+  runTerminated(
+    ownership: AgentRunOwnership,
+    confirmed: boolean,
+    failure: FailedExit = {
+      error: "Agent Run exited without committed completion or cancellation",
+    },
+  ): ActivationRecord | undefined {
     if (!confirmed) return;
     if (this.#controlPlane?.workflow.ownerAgentId === ownership.workflowOwnerId) {
+      const activation = this.#controlPlane.inspectActivation(
+        this.#controlPlane.agent(ownership.agentId),
+      );
+      if (activation?.runId === ownership.runId && activation.state.kind !== "ended") {
+        return this.#controlPlane.failAgentRun(ownership, failure);
+      }
+      if (activation?.runId === ownership.runId && activation.state.kind === "ended") {
+        return undefined;
+      }
       this.#controlPlane.releaseAgentRun(ownership);
-      return;
+      return undefined;
     }
     const databasePath = this.#workflowDatabases.get(ownership.workflowOwnerId);
     if (!databasePath) {
       throw new Error(`Unknown durable Workflow for Agent Run ${ownership.runId}`);
     }
-    const ownershipStore = new AgentRunOwnershipStore(databasePath);
+    const activationStore = new ActivationLifecycleStore(databasePath);
     try {
-      ownershipStore.release(ownership);
+      const activation = activationStore.inspect(ownership);
+      if (activation?.runId === ownership.runId && activation.state.kind !== "ended") {
+        return activationStore.failAndRelease(ownership, failure, this.#now());
+      }
+      if (activation?.runId === ownership.runId && activation.state.kind === "ended") {
+        return undefined;
+      }
+      activationStore.releaseWithoutActivation(ownership);
+      return undefined;
     } finally {
-      ownershipStore.close();
+      activationStore.close();
     }
   }
 
@@ -295,6 +391,13 @@ export class WorkflowBootstrap {
       throw new Error("Durable Workflow is unavailable before persistent session startup");
     }
     return this.#controlPlane;
+  }
+
+  #requireSelfOwnership(): AgentRunOwnership {
+    if (!this.#selfOwnership) {
+      throw new Error("Current Subagent Agent Run ownership is unavailable");
+    }
+    return this.#selfOwnership;
   }
 
   #scheduleSessionBootstrap(
@@ -321,6 +424,7 @@ function buildEnvironment(
     [WORKFLOW_AGENT_SESSION_ID_ENV]: ownership.agentId,
     [WORKFLOW_RUN_ID_ENV]: ownership.runId,
     [WORKFLOW_FENCING_EPOCH_ENV]: String(ownership.epoch),
+    [WORKFLOW_ACTIVATION_ID_ENV]: ownership.runId,
   };
 }
 
@@ -331,8 +435,12 @@ function ownershipFromEnvironment(
 ): AgentRunOwnership | undefined {
   const runId = environment[WORKFLOW_RUN_ID_ENV];
   const epochText = environment[WORKFLOW_FENCING_EPOCH_ENV];
-  if (!runId && !epochText) return undefined;
-  if (!runId || !epochText) throw new Error("Incomplete Agent Run ownership environment");
+  const activationId = environment[WORKFLOW_ACTIVATION_ID_ENV];
+  if (!runId && !epochText && !activationId) return undefined;
+  if (!runId || !epochText || !activationId) {
+    throw new Error("Incomplete Agent Run ownership environment");
+  }
+  if (activationId !== runId) throw new Error("Agent Run and activation identities do not match");
   const epoch = Number(epochText);
   if (!Number.isSafeInteger(epoch) || epoch <= 0) {
     throw new Error(`Invalid Agent Run fencing epoch: ${epochText}`);

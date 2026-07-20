@@ -11,6 +11,10 @@ import {
   type AgentRecord,
   type AgentReference,
   type AgentRunOwnership,
+  type ActivationRecord,
+  type DeclaredActivationDependency,
+  type FailedExit,
+  type InterruptionRequest,
   type WorkflowRecord,
 } from "../../pi-extension/subagents/protocol/workflow-control-plane.ts";
 
@@ -100,6 +104,7 @@ interface ControllableProcess {
   processId: string;
   agentId: string;
   active: boolean;
+  observable: boolean;
 }
 
 export class ControllableProcessAdapter {
@@ -111,6 +116,7 @@ export class ControllableProcessAdapter {
       processId: `runtime-${this.#next++}`,
       agentId,
       active: false,
+      observable: true,
     };
     this.processes.set(process.processId, process);
     return process;
@@ -126,6 +132,10 @@ export class ControllableProcessAdapter {
 
   confirmExit(processId: string): void {
     this.#require(processId).active = false;
+  }
+
+  loseObservation(processId: string): void {
+    this.#require(processId).observable = false;
   }
 
   isActive(processId: string): boolean {
@@ -215,14 +225,85 @@ export class ControllableRuntimeAdapter {
 
   startAgentRun(agent: AgentReference): ScenarioAgentRun {
     const process = this.processAdapter.prepare(agent.agentId);
+    let ownership: AgentRunOwnership | undefined;
     try {
-      const ownership = this.#controlPlane.acquireAgentRun(agent, process.processId);
+      ownership = this.#controlPlane.acquireAgentRun(agent, process.processId);
       this.processAdapter.activate(process.processId);
+      this.#controlPlane.startActivation(ownership);
       return { processId: process.processId, ownership };
     } catch (error) {
+      if (ownership) this.#controlPlane.releaseAgentRun(ownership);
       this.processAdapter.discard(process.processId);
       throw error;
     }
+  }
+
+  currentAgentRun(agent: AgentReference): AgentRunOwnership | undefined {
+    return this.#controlPlane.currentAgentRun(agent);
+  }
+
+  inspectActivation(agent: AgentReference): ActivationRecord | undefined {
+    return this.#controlPlane.inspectActivation(agent);
+  }
+
+  addActivationDependency(
+    run: ScenarioAgentRun,
+    dependency: DeclaredActivationDependency,
+    expectedRevision?: number,
+  ): ActivationRecord {
+    return this.#controlPlane.addActivationDependency(
+      run.ownership,
+      dependency,
+      expectedRevision,
+    );
+  }
+
+  removeActivationDependency(
+    run: ScenarioAgentRun,
+    dependency: Pick<DeclaredActivationDependency, "kind" | "dependencyId">,
+    expectedRevision?: number,
+  ): ActivationRecord {
+    return this.#controlPlane.removeActivationDependency(
+      run.ownership,
+      dependency,
+      expectedRevision,
+    );
+  }
+
+  settleActivation(run: ScenarioAgentRun, expectedRevision?: number): ActivationRecord {
+    return this.#controlPlane.settleActivation(run.ownership, expectedRevision);
+  }
+
+  settleOwnerTurn(): { kind: "owner-turn-settled" } {
+    return this.#controlPlane.settleOwnerTurn();
+  }
+
+  activateTurn(run: ScenarioAgentRun, expectedRevision?: number): ActivationRecord {
+    return this.#controlPlane.activateTurn(run.ownership, expectedRevision);
+  }
+
+  requestInterruption(
+    run: ScenarioAgentRun,
+    expectedRevision?: number,
+  ): InterruptionRequest {
+    return this.#controlPlane.requestInterruption(run.ownership, expectedRevision);
+  }
+
+  confirmInterruption(
+    run: ScenarioAgentRun,
+    request?: InterruptionRequest,
+    expectedRevision?: number,
+  ): ActivationRecord {
+    return this.#controlPlane.confirmInterruption(run.ownership, request, expectedRevision);
+  }
+
+  reportUnconfirmedAgentRunExit(_run: ScenarioAgentRun): void {
+    // Observation alone is intentionally not lifecycle authority.
+  }
+
+  confirmAgentRunExit(run: ScenarioAgentRun, failure: FailedExit): ActivationRecord {
+    this.processAdapter.confirmExit(run.processId);
+    return this.#controlPlane.failAgentRun(run.ownership, failure);
   }
 
   checkpoint(run: ScenarioAgentRun, value: string): void {
@@ -234,8 +315,9 @@ export class ControllableRuntimeAdapter {
   }
 
   exitAgentRun(run: ScenarioAgentRun): void {
-    this.processAdapter.confirmExit(run.processId);
-    this.#controlPlane.releaseAgentRun(run.ownership);
+    this.confirmAgentRunExit(run, {
+      error: "Agent Run exited without committed completion or cancellation",
+    });
   }
 }
 

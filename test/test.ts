@@ -54,6 +54,8 @@ import {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   buildCompletionSidecar,
+  getReloadSafeWorkflowBootstrap,
+  releaseReloadSafeWorkflowBootstrap,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
 import {
@@ -69,6 +71,7 @@ import {
 } from "../pi-extension/subagents/lifecycle.ts";
 import {
   createLegacyAgentRunAdapters,
+  reconcilePreparedAgentRunStartupFailure,
   superviseLegacyAgentRun,
   type LegacyAgentRunAdapters,
 } from "../pi-extension/subagents/legacy-agent-run.ts";
@@ -1411,6 +1414,16 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  it("reuses Workflow bootstrap across reload and releases it on final shutdown", () => {
+    const first = getReloadSafeWorkflowBootstrap();
+    releaseReloadSafeWorkflowBootstrap(first, "reload");
+    assert.equal(getReloadSafeWorkflowBootstrap(), first);
+
+    releaseReloadSafeWorkflowBootstrap(first, "quit");
+    assert.notEqual(getReloadSafeWorkflowBootstrap(), first);
+    releaseReloadSafeWorkflowBootstrap(getReloadSafeWorkflowBootstrap(), "quit");
+  });
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -2153,6 +2166,56 @@ describe("tool registration", () => {
 });
 
 describe("subagent parent lifecycle", () => {
+  it("reconciles acknowledged startup failure only after pane termination is confirmed", () => {
+    const events: string[] = [];
+    const ownership = { runId: "run-1" } as any;
+    const startupError = new Error("activation startup failed");
+
+    const reconciled = reconcilePreparedAgentRunStartupFailure({
+      surface: "pane-1",
+      ownership,
+      commandAcknowledged: true,
+      startupError,
+      closePane() {
+        events.push("closed");
+      },
+      abandonPreparedRun() {
+        events.push("abandoned");
+      },
+      terminatePreparedRun(_ownership, error) {
+        assert.equal(error, startupError);
+        events.push("terminated");
+      },
+    });
+
+    assert.equal(reconciled, startupError);
+    assert.deepEqual(events, ["closed", "terminated"]);
+  });
+
+  it("retains ownership when startup failure pane termination is unconfirmed", () => {
+    const events: string[] = [];
+    const ownership = { runId: "run-1" } as any;
+    const reconciled = reconcilePreparedAgentRunStartupFailure({
+      surface: "pane-1",
+      ownership,
+      commandAcknowledged: true,
+      startupError: new Error("activation startup failed"),
+      closePane() {
+        events.push("close-attempted");
+        throw new Error("pane close failed");
+      },
+      abandonPreparedRun() {
+        events.push("abandoned");
+      },
+      terminatePreparedRun() {
+        events.push("terminated");
+      },
+    });
+
+    assert.match(String(reconciled), /termination could not be confirmed/);
+    assert.deepEqual(events, ["close-attempted"]);
+  });
+
   it("resumes the same session and relays only newly appended output", async () => {
     await withFakeHerdr(async () => {
       const dir = createTestDir();
@@ -2659,10 +2722,10 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("sends Escape without aborting or mutating running state", () => {
+  it("sends Escape twice without aborting or mutating running state", () => {
     const testApi = (subagentsModule as any).__test__;
     let aborted = false;
-    let sentSurface = "";
+    const sentSurfaces: string[] = [];
     const running = makeRunning({
       abortController: {
         abort() {
@@ -2672,16 +2735,16 @@ describe("subagent interruption", () => {
     });
 
     const result = testApi.requestSubagentInterrupt(running, (surface: string) => {
-      sentSurface = surface;
+      sentSurfaces.push(surface);
     });
 
     assert.deepEqual(result, { ok: true });
-    assert.equal(sentSurface, "pane-1");
+    assert.deepEqual(sentSurfaces, ["pane-1", "pane-1"]);
     assert.equal(aborted, false);
     assert.equal("interruptRequested" in running, false);
   });
 
-  it("refreshes the latest activity snapshot before forcing local interrupt waiting", () => {
+  it("refreshes the latest activity snapshot before requesting interruption", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
@@ -2718,17 +2781,16 @@ describe("subagent interruption", () => {
         assert.equal(sentSurface, "pane-1");
         const lifecycle = runningMap.get("a1").lifecycle;
         const projection = projectLifecycle(lifecycle, 20_000);
-        assert.equal(projection.kind, "interrupted");
-        assert.equal(lifecycle.turn.kind, "interrupted");
+        assert.equal(projection.kind, "active");
+        assert.equal(lifecycle.turn.kind, "active");
         assert.equal(lifecycle.lastActivitySequence, 7);
-        assert.equal(lifecycle.turn.previousActivitySequence, 7);
       } finally {
         runningMap.clear();
       }
     });
   });
 
-  it("acknowledges Pi-backed interrupt requests and forces local status waiting", () => {
+  it("acknowledges Pi-backed interrupt requests without claiming confirmation", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
@@ -2769,7 +2831,7 @@ describe("subagent interruption", () => {
       assert.equal(result.content[0].text, 'Interrupt requested for subagent "Worker".');
       assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "interrupt_requested" });
       const projection = projectLifecycle(runningMap.get("a1").lifecycle, 20_000);
-      assert.equal(projection.kind, "interrupted");
+      assert.equal(projection.kind, "active");
       assert.equal(runningMap.has("a1"), true);
     } finally {
       runningMap.clear();
@@ -2792,7 +2854,7 @@ describe("subagent interruption", () => {
         surfaces.push(surface);
       });
 
-      assert.deepEqual(surfaces, ["pane-1", "pane-1"]);
+      assert.deepEqual(surfaces, ["pane-1", "pane-1", "pane-1", "pane-1"]);
       assert.equal(runningMap.has("a1"), true);
     } finally {
       runningMap.clear();

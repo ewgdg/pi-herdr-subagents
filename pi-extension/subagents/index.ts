@@ -75,6 +75,7 @@ import {
 } from "./lifecycle.ts";
 import {
   createLegacyAgentRunAdapters,
+  reconcilePreparedAgentRunStartupFailure,
   hasConfirmedAgentRunTermination,
   superviseLegacyAgentRun,
   type LegacyAgentRunResult,
@@ -85,6 +86,7 @@ import {
   type LegacySpawnRequest,
 } from "./legacy-agent-run.ts";
 import { WorkflowBootstrap } from "./protocol/workflow-bootstrap.ts";
+import { latestAssistantTurnWasAborted } from "./protocol/pi-activation-events.ts";
 import { bindNewWorkflowSession } from "./protocol/workflow-session-binding.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
@@ -934,6 +936,10 @@ function requestSubagentInterrupt(
   interruptPaneKey: (surface: string) => void = interruptPane,
 ): { ok: true } | { error: string } {
   try {
+    // Pi's modal editor may consume the first Escape before its active-operation
+    // abort handler sees input. A second Escape in the same request reliably
+    // reaches the turn interrupt path without closing the Agent Run.
+    interruptPaneKey(running.surface);
     interruptPaneKey(running.surface);
     return { ok: true };
   } catch (error: any) {
@@ -972,6 +978,18 @@ function handleSubagentInterrupt(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
+  if (running.workflowOwnership) {
+    try {
+      runtime.workflowBootstrap.requestInterruption(running.workflowOwnership);
+    } catch (error: any) {
+      const message = error?.message ?? String(error);
+      return {
+        content: [{ type: "text" as const, text: message }],
+        details: { error: message, id: running.id, name: running.name },
+      };
+    }
+  }
+
   const interruption = requestSubagentInterrupt(running, interruptPaneKey);
   if ("error" in interruption) {
     return {
@@ -980,7 +998,6 @@ function handleSubagentInterrupt(
     };
   }
 
-  running.lifecycle = markInterruptRequested(ensureLifecycle(running), now);
   updateWidget();
 
   return {
@@ -1388,7 +1405,7 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
   }
-  if (effectiveAutoExit) {
+  if (effectiveAutoExit && !preparedWorkflowRun) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
@@ -1451,6 +1468,7 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+  let commandAcknowledged = false;
   try {
     runScriptInPane(surface, command, {
       scriptPath: launchScriptFile,
@@ -1461,14 +1479,26 @@ async function launchSubagent(
         `# Surface: ${surface}`,
       ].join("\n"),
     });
-  } catch (error) {
-    try {
-      closePane(surface);
-    } catch {}
+    commandAcknowledged = true;
     if (preparedWorkflowRun) {
-      runtime.workflowBootstrap.abandonPreparedRun(preparedWorkflowRun);
+      runtime.workflowBootstrap.runStarted(preparedWorkflowRun.ownership);
     }
-    throw error;
+  } catch (error) {
+    throw reconcilePreparedAgentRunStartupFailure({
+      surface,
+      ownership: preparedWorkflowRun?.ownership,
+      commandAcknowledged,
+      startupError: error,
+      closePane,
+      abandonPreparedRun: preparedWorkflowRun
+        ? () => runtime.workflowBootstrap.abandonPreparedRun(preparedWorkflowRun)
+        : undefined,
+      terminatePreparedRun: preparedWorkflowRun
+        ? (ownership, startupError) => runtime.workflowBootstrap.runTerminated(ownership, true, {
+          error: `Agent Run startup failed: ${(startupError as Error).message ?? String(startupError)}`,
+        })
+        : undefined,
+    });
   }
 
   const running: RunningSubagent = {
@@ -1742,7 +1772,7 @@ function createDefaultLegacyAgentRunAdapters(pi: ExtensionAPI): ConfiguredLegacy
       cleanupSubagentsForShutdown(reason, runningSubagents);
       if (!shouldPreserveSubagentsOnShutdown(reason)) runtime.workflowBootstrap.close();
     },
-    runStarted() {
+    runStarted(_running) {
       startWidgetRefresh();
       startStatusRefresh(pi);
     },
@@ -1756,11 +1786,24 @@ function createDefaultLegacyAgentRunAdapters(pi: ExtensionAPI): ConfiguredLegacy
     abandonPreparedRun(ownership) {
       runtime.workflowBootstrap.runTerminated(ownership, true);
     },
+    activatePreparedRun(ownership) {
+      runtime.workflowBootstrap.runStarted(ownership);
+    },
+    terminatePreparedRun(ownership, error) {
+      runtime.workflowBootstrap.runTerminated(ownership, true, {
+        error: `Agent Run startup failed: ${(error as Error).message ?? String(error)}`,
+      });
+    },
     watchCompleted(running, result) {
       if (running.workflowOwnership) {
         runtime.workflowBootstrap.runTerminated(
           running.workflowOwnership,
           hasConfirmedAgentRunTermination(result),
+          {
+            error: result.errorMessage ??
+              `Agent Run exited without committed completion or cancellation (exit ${result.exitCode})`,
+            exitCode: result.exitCode,
+          },
         );
       }
     },
@@ -1780,6 +1823,28 @@ function subagentsExtensionWithOptions(
   pi.on("session_start", (_event, ctx) => {
     legacyAgentRunAdapters.ui.sessionStarted(ctx);
   });
+
+  if (!process.env.PI_SUBAGENT_SESSION) {
+    let latestAgentRunWasAborted = false;
+    pi.on("agent_start", (_event, ctx) => {
+      runtime.workflowBootstrap.sessionStarted(ctx);
+      if (runtime.workflowBootstrap.workflow) runtime.workflowBootstrap.currentTurnStarted();
+    });
+
+    pi.on("agent_end", (event) => {
+      latestAgentRunWasAborted = latestAssistantTurnWasAborted(
+        (event as { messages?: unknown[] }).messages,
+      );
+    });
+
+    pi.on("agent_settled", (_event, ctx) => {
+      runtime.workflowBootstrap.sessionStarted(ctx);
+      if (runtime.workflowBootstrap.workflow) {
+        runtime.workflowBootstrap.currentTurnSettled(latestAgentRunWasAborted);
+      }
+      latestAgentRunWasAborted = false;
+    });
+  }
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {

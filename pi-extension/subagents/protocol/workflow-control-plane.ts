@@ -1,6 +1,13 @@
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { AgentRunOwnershipStore } from "./agent-run-ownership.ts";
+import {
+  ActivationLifecycleStore,
+  type ActivationRecord,
+  type DeclaredActivationDependency,
+  type FailedExit,
+  type InterruptionRequest,
+} from "./activation-lifecycle.ts";
 import { readPiSessionUuid, assertSessionUuid } from "./workflow-identity.ts";
 import { assertDescendantTranscriptPath, createWorkflowLayout } from "./workflow-layout.ts";
 import { SQLiteWorkflowStore } from "./sqlite-workflow-store.ts";
@@ -25,6 +32,14 @@ export type {
   WorkflowRecord,
 } from "./workflow-types.ts";
 export { WorkflowProtocolError } from "./workflow-types.ts";
+export type {
+  ActivationDependency,
+  ActivationRecord,
+  ActivationState,
+  DeclaredActivationDependency,
+  FailedExit,
+  InterruptionRequest,
+} from "./activation-lifecycle.ts";
 
 const DEFAULT_CAPABILITIES: AgentCapabilityConfiguration = { spawning: true };
 
@@ -64,6 +79,7 @@ export class WorkflowControlPlane {
   readonly workflow: WorkflowRecord;
   readonly #store: SQLiteWorkflowStore;
   readonly #ownership: AgentRunOwnershipStore;
+  readonly #activations: ActivationLifecycleStore;
   readonly #now: () => number;
   readonly #currentAgentId: string;
   #closed = false;
@@ -72,12 +88,14 @@ export class WorkflowControlPlane {
     workflow: WorkflowRecord,
     store: SQLiteWorkflowStore,
     ownership: AgentRunOwnershipStore,
+    activations: ActivationLifecycleStore,
     now: () => number,
     currentAgentId: string,
   ) {
     this.workflow = workflow;
     this.#store = store;
     this.#ownership = ownership;
+    this.#activations = activations;
     this.#now = now;
     this.#currentAgentId = currentAgentId;
   }
@@ -117,6 +135,7 @@ export class WorkflowControlPlane {
       workflow,
       store,
       ownership,
+      new ActivationLifecycleStore(workflow.databasePath),
       now,
       workflow.ownerAgentId,
     );
@@ -159,6 +178,7 @@ export class WorkflowControlPlane {
       workflow,
       store,
       new AgentRunOwnershipStore(workflow.databasePath),
+      new ActivationLifecycleStore(workflow.databasePath),
       now,
       options.agentSessionId,
     );
@@ -206,6 +226,7 @@ export class WorkflowControlPlane {
         workflow,
         store,
         new AgentRunOwnershipStore(workflow.databasePath),
+        new ActivationLifecycleStore(workflow.databasePath),
         now,
         options.agentSessionId,
       );
@@ -231,6 +252,7 @@ export class WorkflowControlPlane {
   close(): void {
     if (this.#closed) return;
     this.#ownership.close();
+    this.#activations.close();
     this.#store.close();
     this.#closed = true;
   }
@@ -346,6 +368,12 @@ export class WorkflowControlPlane {
   acquireAgentRun(agent: AgentReference, runId: string): AgentRunOwnership {
     this.#assertOpen();
     const member = this.inspectAgent(agent);
+    if (member.agentId === this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError(
+        "OwnerActivationForbidden",
+        "Workflow Owner does not have a Subagent Agent Run or activation lifecycle",
+      );
+    }
     if (
       this.#currentAgentId !== this.workflow.ownerAgentId &&
       member.spawnerAgentId !== this.#currentAgentId
@@ -359,6 +387,89 @@ export class WorkflowControlPlane {
       { workflowOwnerId: member.workflowOwnerId, agentId: member.agentId },
       runId,
     );
+  }
+
+  startActivation(ownership: AgentRunOwnership): ActivationRecord {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.start(ownership, this.#now());
+  }
+
+  inspectActivation(agent: AgentReference): ActivationRecord | undefined {
+    this.#assertOpen();
+    this.#assertReference(agent);
+    return this.#activations.inspect(agent);
+  }
+
+  addActivationDependency(
+    ownership: AgentRunOwnership,
+    dependency: DeclaredActivationDependency,
+    expectedRevision?: number,
+  ): ActivationRecord {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.addDependency(ownership, dependency, this.#now(), expectedRevision);
+  }
+
+  removeActivationDependency(
+    ownership: AgentRunOwnership,
+    dependency: Pick<DeclaredActivationDependency, "kind" | "dependencyId">,
+    expectedRevision?: number,
+  ): ActivationRecord {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.removeDependency(ownership, dependency, this.#now(), expectedRevision);
+  }
+
+  settleActivation(
+    ownership: AgentRunOwnership,
+    expectedRevision?: number,
+  ): ActivationRecord {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.settle(ownership, this.#now(), expectedRevision);
+  }
+
+  settleOwnerTurn(): { kind: "owner-turn-settled" } {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError(
+        "OwnerActivationForbidden",
+        "Only the Workflow Owner can settle an Owner turn",
+      );
+    }
+    return { kind: "owner-turn-settled" };
+  }
+
+  activateTurn(
+    ownership: AgentRunOwnership,
+    expectedRevision?: number,
+  ): ActivationRecord {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.activateTurn(ownership, this.#now(), expectedRevision);
+  }
+
+  requestInterruption(
+    ownership: AgentRunOwnership,
+    expectedRevision?: number,
+  ): InterruptionRequest {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.requestInterruption(ownership, this.#now(), expectedRevision);
+  }
+
+  confirmInterruption(
+    ownership: AgentRunOwnership,
+    confirmation?: InterruptionRequest,
+    expectedRevision?: number,
+  ): ActivationRecord {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.confirmInterruption(
+      ownership,
+      confirmation,
+      this.#now(),
+      expectedRevision,
+    );
+  }
+
+  failAgentRun(ownership: AgentRunOwnership, failure: FailedExit): ActivationRecord {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.failAndRelease(ownership, failure, this.#now());
   }
 
   acquireCurrentAgentRun(runId: string): AgentRunOwnership {
@@ -382,7 +493,7 @@ export class WorkflowControlPlane {
   releaseAgentRun(ownership: AgentRunOwnership): void {
     this.#assertOwnershipReference(ownership);
     this.inspectAgent(ownership);
-    this.#ownership.release(ownership);
+    this.#activations.releaseWithoutActivation(ownership);
   }
 
   assertCurrentAgentRun(ownership: AgentRunOwnership): void {

@@ -40,7 +40,12 @@ export type WorkflowProtocolErrorCode =
   | "InvalidSpawner"
   | "TranscriptOutsideWorkflow"
   | "AgentRunAlreadyOwned"
-  | "OwnershipLost";
+  | "OwnershipLost"
+  | "OwnerActivationForbidden"
+  | "ActivationAlreadyOpen"
+  | "InvalidLifecycleTransition"
+  | "StaleLifecycleTransition"
+  | "UnknownLifecycleDependency";
 
 export class WorkflowProtocolError extends Error {
   readonly code: WorkflowProtocolErrorCode;

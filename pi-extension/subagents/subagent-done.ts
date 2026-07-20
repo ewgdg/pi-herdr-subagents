@@ -8,6 +8,30 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { WorkflowBootstrap } from "./protocol/workflow-bootstrap.ts";
+import { latestAssistantTurnWasAborted } from "./protocol/pi-activation-events.ts";
+
+const RELOAD_SAFE_WORKFLOW_BOOTSTRAP = Symbol.for(
+  "pi-herdr-subagents.child-workflow-bootstrap",
+);
+
+export function getReloadSafeWorkflowBootstrap(): WorkflowBootstrap {
+  const globalState = globalThis as any;
+  return globalState[RELOAD_SAFE_WORKFLOW_BOOTSTRAP] ??=
+    new WorkflowBootstrap();
+}
+
+export function releaseReloadSafeWorkflowBootstrap(
+  workflowBootstrap: WorkflowBootstrap,
+  reason: unknown,
+): void {
+  if (reason === "reload") return;
+  workflowBootstrap.close();
+  const globalState = globalThis as any;
+  if (globalState[RELOAD_SAFE_WORKFLOW_BOOTSTRAP] === workflowBootstrap) {
+    delete globalState[RELOAD_SAFE_WORKFLOW_BOOTSTRAP];
+  }
+}
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -150,9 +174,12 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let latestAgentRunWasAborted = false;
+  const workflowBootstrap = getReloadSafeWorkflowBootstrap();
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    workflowBootstrap.sessionStarted(ctx);
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -176,10 +203,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", () => {
     agentStarted = true;
     recorder.agentStart();
+    if (workflowBootstrap.workflow) workflowBootstrap.currentTurnStarted();
   });
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
+    latestAgentRunWasAborted = latestAssistantTurnWasAborted(messages);
     const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
@@ -212,6 +241,13 @@ export default function (pi: ExtensionAPI) {
       // the latest agent turn completed normally, not by who initiated it.
       userTookOver = false;
     }
+  });
+
+  pi.on("agent_settled", () => {
+    if (workflowBootstrap.workflow) {
+      workflowBootstrap.currentTurnSettled(latestAgentRunWasAborted);
+    }
+    latestAgentRunWasAborted = false;
   });
 
   pi.on("turn_start", (event) => {
@@ -256,6 +292,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", (event) => {
     recorder.sessionShutdown((event as any).reason);
+    releaseReloadSafeWorkflowBootstrap(workflowBootstrap, (event as any).reason);
   });
 
   // Toggle expand/collapse with Ctrl+J

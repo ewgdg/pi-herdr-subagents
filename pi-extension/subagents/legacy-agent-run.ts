@@ -46,6 +46,51 @@ export function hasConfirmedAgentRunTermination(
   return result.termination === "confirmed";
 }
 
+export interface PreparedAgentRunStartupFailure {
+  surface: string;
+  ownership?: AgentRunOwnership;
+  commandAcknowledged: boolean;
+  startupError: unknown;
+  closePane(surface: string): void;
+  abandonPreparedRun?(ownership: AgentRunOwnership): void;
+  terminatePreparedRun?(ownership: AgentRunOwnership, error: unknown): void;
+}
+
+/** Preserve fencing whenever pane termination cannot be confirmed after startup fails. */
+export function reconcilePreparedAgentRunStartupFailure(
+  failure: PreparedAgentRunStartupFailure,
+): unknown {
+  let closeError: unknown;
+  try {
+    failure.closePane(failure.surface);
+  } catch (error) {
+    closeError = error;
+  }
+
+  let reconciliationError: unknown;
+  if (!closeError && failure.ownership) {
+    try {
+      if (failure.commandAcknowledged) {
+        failure.terminatePreparedRun?.(failure.ownership, failure.startupError);
+      } else {
+        failure.abandonPreparedRun?.(failure.ownership);
+      }
+    } catch (error) {
+      reconciliationError = error;
+    }
+  }
+
+  if (closeError || reconciliationError) {
+    return new AggregateError(
+      [failure.startupError, closeError, reconciliationError].filter(Boolean),
+      closeError
+        ? `Agent Run startup failed and pane termination could not be confirmed for ${failure.surface}; ownership was retained`
+        : `Agent Run startup failed and durable reconciliation failed for ${failure.surface}`,
+    );
+  }
+  return failure.startupError;
+}
+
 export interface LegacyRunningSubagent extends LegacyRunningAgentRun {
   id: string;
   name: string;
@@ -173,7 +218,7 @@ export interface LegacyAgentRunAdapterOptions<SpawnParams> {
   updateWidget(): void;
   sessionStarted(context: ExtensionContext): void;
   sessionShutdown(reason: unknown): void;
-  runStarted(): void;
+  runStarted(run: LegacyRunningSubagent): void;
   watchCompleted?(run: LegacyRunningSubagent, result: LegacyAgentRunResult): void | Promise<void>;
   prepareResume?(
     params: LegacyResumeParams,
@@ -182,6 +227,8 @@ export interface LegacyAgentRunAdapterOptions<SpawnParams> {
     surface: string,
   ): LegacyPreparedAgentRun | Promise<LegacyPreparedAgentRun>;
   abandonPreparedRun?(ownership: AgentRunOwnership): void;
+  activatePreparedRun?(ownership: AgentRunOwnership): void;
+  terminatePreparedRun?(ownership: AgentRunOwnership, error: unknown): void;
 }
 
 /**
@@ -276,7 +323,7 @@ async function resumeLegacyAgentRun<SpawnParams>(
   environment.push(`PI_SUBAGENT_SESSION=${shellQuote(sessionPath)}`);
   environment.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
   environment.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
-  if (autoExit) environment.push("PI_SUBAGENT_AUTO_EXIT=1");
+  if (autoExit && !prepared) environment.push("PI_SUBAGENT_AUTO_EXIT=1");
   for (const [key, value] of Object.entries(prepared?.environment ?? {})) {
     environment.push(`${key}=${shellQuote(value)}`);
   }
@@ -292,6 +339,7 @@ async function resumeLegacyAgentRun<SpawnParams>(
       .replace(/-+/g, "-")
       .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
   );
+  let commandAcknowledged = false;
   try {
     runScriptInPane(surface, command, {
       scriptPath: launchScriptFile,
@@ -303,14 +351,18 @@ async function resumeLegacyAgentRun<SpawnParams>(
         ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
       ].join("\n"),
     });
+    commandAcknowledged = true;
+    if (prepared) options.activatePreparedRun?.(prepared.ownership);
   } catch (error) {
-    try {
-      closePane(surface);
-    } catch {
-      throw error;
-    }
-    if (prepared) options.abandonPreparedRun?.(prepared.ownership);
-    throw error;
+    throw reconcilePreparedAgentRunStartupFailure({
+      surface,
+      ownership: prepared?.ownership,
+      commandAcknowledged,
+      startupError: error,
+      closePane,
+      abandonPreparedRun: options.abandonPreparedRun,
+      terminatePreparedRun: options.terminatePreparedRun,
+    });
   }
 
   const running: LegacyRunningSubagent = {
@@ -471,7 +523,7 @@ export function createLegacyAgentRunAdapters<SpawnParams>(
     ui: {
       sessionStarted: options.sessionStarted,
       sessionShutdown: options.sessionShutdown,
-      runStarted: () => options.runStarted(),
+      runStarted: (run) => options.runStarted(run),
     },
   };
 }
