@@ -19,6 +19,7 @@ import {
   findLastAssistantMessage,
   findObservedSessionRuntime,
   appendBranchSummary,
+  cloneSessionFile,
   copySessionFile,
   mergeNewEntries,
   seedSubagentSessionFile,
@@ -487,6 +488,22 @@ describe("session.ts", () => {
       assert.notEqual(copy, file);
       assert.ok(copy.endsWith(".jsonl"));
       assert.equal(readFileSync(copy, "utf8"), readFileSync(file, "utf8"));
+    });
+  });
+
+  describe("cloneSessionFile", () => {
+    it("creates a new Agent identity while preserving transcript entries", () => {
+      const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG]);
+      const clone = join(dir, "clone.jsonl");
+      cloneSessionFile(file, clone);
+
+      const sourceLines = readFileSync(file, "utf8").trim().split("\n");
+      const cloneLines = readFileSync(clone, "utf8").trim().split("\n");
+      const sourceHeader = JSON.parse(sourceLines[0]);
+      const cloneHeader = JSON.parse(cloneLines[0]);
+      assert.notEqual(cloneHeader.id, sourceHeader.id);
+      assert.equal(cloneHeader.parentSession, file);
+      assert.deepEqual(cloneLines.slice(1), sourceLines.slice(1));
     });
   });
 

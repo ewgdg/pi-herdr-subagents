@@ -4,6 +4,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import {
   readdirSync,
   readFileSync,
@@ -40,7 +41,9 @@ import {
   findLastAssistantMessage,
   findObservedSessionRuntime,
   getNewEntries,
+  initializeSubagentSessionFile,
   seedSubagentSessionFile,
+  type SubagentSessionMode,
 } from "./session.ts";
 import {
   capStatusLines,
@@ -72,6 +75,7 @@ import {
 } from "./lifecycle.ts";
 import {
   createLegacyAgentRunAdapters,
+  hasConfirmedAgentRunTermination,
   superviseLegacyAgentRun,
   type LegacyAgentRunResult,
   type LegacyAgentRunRuntimeAdapters,
@@ -80,6 +84,8 @@ import {
   type LegacyRunningSubagent,
   type LegacySpawnRequest,
 } from "./legacy-agent-run.ts";
+import { WorkflowBootstrap } from "./protocol/workflow-bootstrap.ts";
+import { bindNewWorkflowSession } from "./protocol/workflow-session-binding.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -191,8 +197,6 @@ const SubagentResumeParams = Type.Object({
     }),
   ),
 });
-
-type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
   model?: string;
@@ -531,6 +535,7 @@ interface SubagentRuntime {
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
+  workflowBootstrap: WorkflowBootstrap;
 }
 
 type ConfiguredLegacyAgentRunAdapters = LegacyAgentRunRuntimeAdapters<
@@ -545,14 +550,33 @@ export interface SubagentsExtensionOptions {
   legacyAgentRunAdapters?: (pi: ExtensionAPI) => ConfiguredLegacyAgentRunAdapters;
 }
 
+function createWorkflowBootstrap(): WorkflowBootstrap {
+  return new WorkflowBootstrap({
+    async confirmRunTerminated(locator) {
+      const inspection = await inspectPane(locator.surface);
+      if (inspection.kind === "missing") return true;
+      if (inspection.kind === "unavailable") return false;
+      try {
+        return /__SUBAGENT_DONE_\d+__/.test(await readPaneAsync(locator.surface, 10));
+      } catch {
+        return false;
+      }
+    },
+  });
+}
+
 function createSubagentRuntime(): SubagentRuntime {
-  return { runningSubagents: new Map<string, RunningSubagent>() };
+  return {
+    runningSubagents: new Map<string, RunningSubagent>(),
+    workflowBootstrap: createWorkflowBootstrap(),
+  };
 }
 
 /** Runtime state preserved across /reload. */
 const runtime: SubagentRuntime =
   (globalThis as any)[RUNTIME_KEY] ??
   ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
+runtime.workflowBootstrap ??= createWorkflowBootstrap();
 const runningSubagents = runtime.runningSubagents;
 
 export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
@@ -1080,6 +1104,7 @@ async function launchSubagent(
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
+  await runtime.workflowBootstrap.waitUntilReady(ctx);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   if (!ctx.model) throw new Error("Subagent launch requires a resolved parent model");
@@ -1098,6 +1123,7 @@ async function launchSubagent(
   const effectiveThinking = runtimePlan.thinking;
   const effectiveAutoExit = resolveEffectiveAutoExit(params, agentDefs);
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -1106,22 +1132,19 @@ async function launchSubagent(
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
-  const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
+  const workflowSessionsDirectory = agentDefs?.cli === "claude"
+    ? undefined
+    : runtime.workflowBootstrap.workflow?.sessionsDirectory;
+  const sessionDir = workflowSessionsDirectory ??
+    getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
   // Generate a deterministic session file path for this subagent.
   // This eliminates race conditions when multiple agents launch simultaneously —
   // each agent knows exactly which file is theirs.
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23) + "Z";
-  const uuid = [
-    id,
-    Math.random().toString(16).slice(2, 10),
-    Math.random().toString(16).slice(2, 10),
-    Math.random().toString(16).slice(2, 6),
-  ].join("-");
-  const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+  const agentSessionId = randomUUID();
+  const subagentSessionFile = join(sessionDir, `${timestamp}_${agentSessionId}.jsonl`);
 
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
   if (
     agentDefs?.cli === "claude" &&
     (runtimePlan.thinkingSource !== "parent" || runtimePlan.thinking !== parentThinking)
@@ -1131,25 +1154,87 @@ async function launchSubagent(
     );
   }
 
+  let workflowSessionBinding: ReturnType<typeof bindNewWorkflowSession> | undefined;
+  try {
+    if (workflowSessionsDirectory) {
+      initializeSubagentSessionFile({
+        mode: launchBehavior.sessionMode,
+        ...(launchBehavior.sessionMode === "standalone"
+          ? {}
+          : { parentSessionFile: sessionFile }),
+        childSessionFile: subagentSessionFile,
+        childCwd: targetCwdForSession,
+        childSessionId: agentSessionId,
+      });
+      workflowSessionBinding = bindNewWorkflowSession({
+        workflowOwnerId: runtime.workflowBootstrap.workflow!.ownerAgentId,
+        agentId: agentSessionId,
+        sessionPath: subagentSessionFile,
+      });
+    } else if (launchBehavior.seededSessionMode) {
+      seedSubagentSessionFile({
+        mode: launchBehavior.seededSessionMode,
+        parentSessionFile: sessionFile,
+        childSessionFile: subagentSessionFile,
+        childCwd: targetCwdForSession,
+      });
+    }
+  } catch (error) {
+    if (workflowSessionsDirectory) runtime.workflowBootstrap.abandonUnpreparedSpawn(subagentSessionFile);
+    throw error;
+  }
+
+  // Use pre-created surface (parallel mode) or create a new one.
+  // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSubagentPane(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+  let surface: string;
+  try {
+    surface = options?.surface ?? createSubagentPane(params.name);
+    if (!surfacePreCreated) {
+      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    }
+  } catch (error) {
+    if (workflowSessionsDirectory) runtime.workflowBootstrap.abandonUnpreparedSpawn(subagentSessionFile);
+    throw error;
   }
 
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
-
-  if (launchBehavior.seededSessionMode) {
-    seedSubagentSessionFile({
-      mode: launchBehavior.seededSessionMode,
-      parentSessionFile: sessionFile,
-      childSessionFile: subagentSessionFile,
-      childCwd: targetCwdForSession,
-    });
+  let preparedWorkflowRun: ReturnType<WorkflowBootstrap["prepareSpawn"]> | undefined;
+  if (workflowSessionsDirectory) {
+    try {
+      preparedWorkflowRun = runtime.workflowBootstrap.prepareSpawn({
+        agentId: agentSessionId,
+        sessionPath: subagentSessionFile,
+        runId: id,
+        name: params.name,
+        agentDefinition: params.agent,
+        capabilities: { spawning: agentDefs?.spawning !== false },
+        sessionBinding: workflowSessionBinding!,
+        surface,
+      });
+    } catch (error) {
+      try {
+        closePane(surface);
+      } catch {}
+      runtime.workflowBootstrap.abandonUnpreparedSpawn(subagentSessionFile);
+      throw error;
+    }
   }
+
+  const abandonPreparedWorkflowRun = () => {
+    if (!preparedWorkflowRun) return;
+    try {
+      closePane(surface);
+    } catch {}
+    runtime.workflowBootstrap.abandonPreparedRun(preparedWorkflowRun);
+  };
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
-  mkdirSync(dirname(activityFile), { recursive: true });
+  try {
+    mkdirSync(dirname(activityFile), { recursive: true });
+  } catch (error) {
+    abandonPreparedWorkflowRun();
+    throw error;
+  }
   const { inheritsConversationContext } = launchBehavior;
 
   // Build the task message
@@ -1270,8 +1355,13 @@ async function launchSubagent(
       .replace(/-+/g, "-")
       .replace(/^-|-$/g, "");
     const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
-    mkdirSync(dirname(syspromptPath), { recursive: true });
-    writeFileSync(syspromptPath, identity, "utf8");
+    try {
+      mkdirSync(dirname(syspromptPath), { recursive: true });
+      writeFileSync(syspromptPath, identity, "utf8");
+    } catch (error) {
+      abandonPreparedWorkflowRun();
+      throw error;
+    }
     parts.push(flag, shellQuote(syspromptPath));
   }
 
@@ -1305,7 +1395,6 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
-  const envPrefix = envParts.join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
   // Only full-context fork mode gets a direct task argument because it already
@@ -1324,8 +1413,13 @@ async function launchSubagent(
       .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
     const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
     const artifactPath = join(artifactDir, artifactName);
-    mkdirSync(dirname(artifactPath), { recursive: true });
-    writeFileSync(artifactPath, fullTask, "utf8");
+    try {
+      mkdirSync(dirname(artifactPath), { recursive: true });
+      writeFileSync(artifactPath, fullTask, "utf8");
+    } catch (error) {
+      abandonPreparedWorkflowRun();
+      throw error;
+    }
     taskArg = `@${artifactPath}`;
   }
 
@@ -1336,6 +1430,13 @@ async function launchSubagent(
   })) {
     parts.push(shellQuote(promptArg));
   }
+
+  if (preparedWorkflowRun) {
+    for (const [key, value] of Object.entries(preparedWorkflowRun.environment)) {
+      envParts.push(`${key}=${shellQuote(value)}`);
+    }
+  }
+  const envPrefix = envParts.join(" ") + " ";
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
@@ -1350,15 +1451,25 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  runScriptInPane(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
-    ].join("\n"),
-  });
+  try {
+    runScriptInPane(surface, command, {
+      scriptPath: launchScriptFile,
+      scriptPreamble: [
+        `# Subagent launch script for ${params.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Session: ${subagentSessionFile}`,
+        `# Surface: ${surface}`,
+      ].join("\n"),
+    });
+  } catch (error) {
+    try {
+      closePane(surface);
+    } catch {}
+    if (preparedWorkflowRun) {
+      runtime.workflowBootstrap.abandonPreparedRun(preparedWorkflowRun);
+    }
+    throw error;
+  }
 
   const running: RunningSubagent = {
     id,
@@ -1373,6 +1484,7 @@ async function launchSubagent(
     interactive: effectiveInteractive,
     runtimePlan,
     launchKind: "spawn",
+    workflowOwnership: preparedWorkflowRun?.ownership,
     lifecycle: createLifecycle(startTime),
   };
 
@@ -1411,6 +1523,7 @@ async function watchSubagent(
   signal: AbortSignal,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  let termination: SubagentResult["termination"] = "uncertain";
 
   try {
     const result = await waitForCompletion(signal, {
@@ -1428,6 +1541,13 @@ async function watchSubagent(
         observeRunningSubagent(running);
       },
     });
+
+    if (
+      result.reason === "error" &&
+      result.errorMessage === "Subagent pane disappeared before completion evidence was recorded."
+    ) {
+      termination = "confirmed";
+    }
 
     const detectedAt = Date.now();
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
@@ -1465,11 +1585,20 @@ async function watchSubagent(
       }
 
       closePane(surface);
+      termination = "confirmed";
       running.lifecycle = result.exitCode === 0
         ? markCompleted(running.lifecycle, Date.now())
         : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return {
+        name,
+        task,
+        summary,
+        exitCode: result.exitCode,
+        elapsed,
+        termination,
+        ...(sessionId ? { claudeSessionId: sessionId } : {}),
+      };
     }
 
     // Pi subagent result extraction
@@ -1518,6 +1647,7 @@ async function watchSubagent(
     }
 
     closePane(surface);
+    termination = "confirmed";
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
@@ -1529,12 +1659,14 @@ async function watchSubagent(
       sessionFile,
       exitCode: result.exitCode,
       elapsed,
+      termination,
       ping: result.ping,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
     try {
       closePane(surface);
+      termination = "confirmed";
     } catch {}
     running.lifecycle = markFailed(
       running.lifecycle,
@@ -1553,6 +1685,7 @@ async function watchSubagent(
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
         sessionFile,
+        termination,
       };
     }
     return {
@@ -1562,6 +1695,7 @@ async function watchSubagent(
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
+      termination,
     };
   }
 }
@@ -1583,6 +1717,7 @@ function createDefaultLegacyAgentRunAdapters(pi: ExtensionAPI): ConfiguredLegacy
     formatElapsed,
     updateWidget,
     sessionStarted(ctx) {
+      runtime.workflowBootstrap.sessionStarted(ctx);
       runtime.latestCtx = ctx;
       runtime.modelCatalog = buildAuthenticatedModelCatalog(wrapPiModelRegistry(ctx.modelRegistry));
       const refreshedGuidelines = buildSubagentRoutingGuidelines(runtime.modelCatalog);
@@ -1605,10 +1740,29 @@ function createDefaultLegacyAgentRunAdapters(pi: ExtensionAPI): ConfiguredLegacy
         (globalThis as any)[STATUS_INTERVAL_KEY] = null;
       }
       cleanupSubagentsForShutdown(reason, runningSubagents);
+      if (!shouldPreserveSubagentsOnShutdown(reason)) runtime.workflowBootstrap.close();
     },
     runStarted() {
       startWidgetRefresh();
       startStatusRefresh(pi);
+    },
+    prepareResume(params, _context, runId, surface) {
+      return runtime.workflowBootstrap.prepareResume({
+        sessionPath: params.sessionPath,
+        runId,
+        surface,
+      });
+    },
+    abandonPreparedRun(ownership) {
+      runtime.workflowBootstrap.runTerminated(ownership, true);
+    },
+    watchCompleted(running, result) {
+      if (running.workflowOwnership) {
+        runtime.workflowBootstrap.runTerminated(
+          running.workflowOwnership,
+          hasConfirmedAgentRunTermination(result),
+        );
+      }
     },
   });
 }
@@ -1975,6 +2129,7 @@ function subagentsExtensionWithOptions(
             details: { error: "session not found" },
           };
         }
+        runtime.workflowBootstrap.sessionStarted(ctx);
         const running = await legacyAgentRunAdapters.launcher.resume({ params, context: ctx });
         void superviseLegacyAgentRun(running, legacyAgentRunAdapters);
 

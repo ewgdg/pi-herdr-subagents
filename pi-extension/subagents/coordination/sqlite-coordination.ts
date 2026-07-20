@@ -152,6 +152,15 @@ export class SQLiteCoordinationStore {
     return this.#releaseExactOwner(token);
   }
 
+  owns(token: OwnershipToken): boolean {
+    const currentOwner = this.#readOwner(token.resourceId);
+    return currentOwner ? sameOwnership(currentOwner, token) : false;
+  }
+
+  readOwnership(resourceId: string): OwnershipToken | undefined {
+    return this.#readOwner(resourceId);
+  }
+
   writeFencedState(token: OwnershipToken, stateKey: string, value: string): boolean {
     return this.#withImmediateTransaction(() => {
       const currentOwner = this.#readOwner(token.resourceId);

@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { dirname, join } from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
 import {
+  closePane,
   createSubagentPane,
   runScriptInPane,
   shellQuote,
@@ -19,6 +20,7 @@ import {
 } from "./lifecycle.ts";
 import type { ResolvedRuntimePlan, ThinkingLevel } from "./runtime-routing.ts";
 import type { SubagentStatusState } from "./status.ts";
+import type { AgentRunOwnership } from "./protocol/workflow-types.ts";
 
 export interface LegacyRunningAgentRun {
   abortController?: AbortController;
@@ -35,6 +37,13 @@ export interface LegacyAgentRunResult {
   error?: string;
   errorMessage?: string;
   ping?: { name: string; message: string };
+  termination: "confirmed" | "uncertain";
+}
+
+export function hasConfirmedAgentRunTermination(
+  result: Pick<LegacyAgentRunResult, "termination">,
+): boolean {
+  return result.termination === "confirmed";
 }
 
 export interface LegacyRunningSubagent extends LegacyRunningAgentRun {
@@ -62,6 +71,7 @@ export interface LegacyRunningSubagent extends LegacyRunningAgentRun {
   runtimePlan: ResolvedRuntimePlan | undefined;
   launchKind: "spawn" | "resume";
   resultStartEntryCount?: number;
+  workflowOwnership?: AgentRunOwnership;
 }
 
 export interface LegacyLaunchContext {
@@ -98,6 +108,12 @@ export interface LegacyResumeRequest {
   context: LegacyResumeContext;
 }
 
+export interface LegacyPreparedAgentRun {
+  ownership: AgentRunOwnership;
+  environment: Record<string, string>;
+  sessionPath: string;
+}
+
 export interface LegacyAgentRunLauncher<SpawnRequest, ResumeRequest, Run> {
   launch(request: SpawnRequest): Promise<Run>;
   resume(request: ResumeRequest): Promise<Run>;
@@ -112,6 +128,10 @@ export interface LegacyAgentRunResultRelay<Run, Result> {
   failed(run: Run, error: unknown): void | Promise<void>;
 }
 
+export interface LegacyAgentRunOwnership<Run, Result> {
+  watchCompleted(run: Run, result: Result): void | Promise<void>;
+}
+
 export interface LegacyAgentRunUi<Run, SessionContext = unknown> {
   sessionStarted(context: SessionContext): void;
   sessionShutdown(reason: unknown): void;
@@ -120,6 +140,7 @@ export interface LegacyAgentRunUi<Run, SessionContext = unknown> {
 
 export interface LegacyAgentRunAdapters<Run extends LegacyRunningAgentRun, Result> {
   supervisor: LegacyAgentRunSupervisor<Run, Result>;
+  ownership?: LegacyAgentRunOwnership<Run, Result>;
   resultRelay: LegacyAgentRunResultRelay<Run, Result>;
   ui: Pick<LegacyAgentRunUi<Run>, "runStarted">;
 }
@@ -153,6 +174,14 @@ export interface LegacyAgentRunAdapterOptions<SpawnParams> {
   sessionStarted(context: ExtensionContext): void;
   sessionShutdown(reason: unknown): void;
   runStarted(): void;
+  watchCompleted?(run: LegacyRunningSubagent, result: LegacyAgentRunResult): void | Promise<void>;
+  prepareResume?(
+    params: LegacyResumeParams,
+    context: LegacyResumeContext,
+    runId: string,
+    surface: string,
+  ): LegacyPreparedAgentRun | Promise<LegacyPreparedAgentRun>;
+  abandonPreparedRun?(ownership: AgentRunOwnership): void;
 }
 
 /**
@@ -176,6 +205,7 @@ export async function superviseLegacyAgentRun<Run extends LegacyRunningAgentRun,
     return;
   }
 
+  await adapters.ownership?.watchCompleted(run, result);
   await adapters.resultRelay.completed(run, result);
 }
 
@@ -188,13 +218,9 @@ async function resumeLegacyAgentRun<SpawnParams>(
   const { autoExit, interactive } = options.resolveResumeLaunchBehavior(params);
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
-  const resultStartEntryCount = getNewEntries(params.sessionPath, 0).length;
 
   const surface = createSubagentPane(name);
   await new Promise<void>((resolve) => setTimeout(resolve, options.getShellReadyDelayMs()));
-
-  const parts = ["pi", "--session", shellQuote(params.sessionPath)];
-  parts.push("-e", shellQuote(join(options.subagentsDir, "subagent-done.ts")));
 
   const sessionId = context.sessionManager.getSessionId();
   const artifactDir = options.getArtifactDir(context.sessionManager.getSessionDir(), sessionId);
@@ -216,18 +242,44 @@ async function resumeLegacyAgentRun<SpawnParams>(
     );
     mkdirSync(dirname(resumeMsgFile), { recursive: true });
     writeFileSync(resumeMsgFile, params.message, "utf8");
-    parts.push(shellQuote(`@${resumeMsgFile}`));
   }
+
+  let prepared: LegacyPreparedAgentRun | undefined;
+  try {
+    prepared = await options.prepareResume?.(params, context, id, surface);
+  } catch (error) {
+    closePane(surface);
+    throw error;
+  }
+  const sessionPath = prepared?.sessionPath ?? params.sessionPath;
+  let resultStartEntryCount: number;
+  try {
+    resultStartEntryCount = getNewEntries(sessionPath, 0).length;
+  } catch (error) {
+    try {
+      closePane(surface);
+    } catch {
+      throw error;
+    }
+    if (prepared) options.abandonPreparedRun?.(prepared.ownership);
+    throw error;
+  }
+  const parts = ["pi", "--session", shellQuote(sessionPath)];
+  parts.push("-e", shellQuote(join(options.subagentsDir, "subagent-done.ts")));
+  if (resumeMsgFile) parts.push(shellQuote(`@${resumeMsgFile}`));
 
   const environment: string[] = [];
   if (process.env.PI_CODING_AGENT_DIR) {
     environment.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
   }
   environment.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
-  environment.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
+  environment.push(`PI_SUBAGENT_SESSION=${shellQuote(sessionPath)}`);
   environment.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
   environment.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
   if (autoExit) environment.push("PI_SUBAGENT_AUTO_EXIT=1");
+  for (const [key, value] of Object.entries(prepared?.environment ?? {})) {
+    environment.push(`${key}=${shellQuote(value)}`);
+  }
 
   const command = `${environment.join(" ")} ${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
   const launchScriptFile = join(
@@ -240,16 +292,26 @@ async function resumeLegacyAgentRun<SpawnParams>(
       .replace(/-+/g, "-")
       .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
   );
-  runScriptInPane(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent resume script for ${name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${params.sessionPath}`,
-      `# Surface: ${surface}`,
-      ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-    ].join("\n"),
-  });
+  try {
+    runScriptInPane(surface, command, {
+      scriptPath: launchScriptFile,
+      scriptPreamble: [
+        `# Subagent resume script for ${name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Session: ${sessionPath}`,
+        `# Surface: ${surface}`,
+        ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+      ].join("\n"),
+    });
+  } catch (error) {
+    try {
+      closePane(surface);
+    } catch {
+      throw error;
+    }
+    if (prepared) options.abandonPreparedRun?.(prepared.ownership);
+    throw error;
+  }
 
   const running: LegacyRunningSubagent = {
     id,
@@ -257,13 +319,14 @@ async function resumeLegacyAgentRun<SpawnParams>(
     task: params.message ?? "resumed session",
     surface,
     startTime,
-    sessionFile: params.sessionPath,
+    sessionFile: sessionPath,
     launchScriptFile,
     activityFile,
     interactive,
     runtimePlan: undefined,
     launchKind: "resume",
     resultStartEntryCount,
+    workflowOwnership: prepared?.ownership,
     lifecycle: createLifecycle(startTime),
   };
   options.runningSubagents.set(id, running);
@@ -398,6 +461,9 @@ export function createLegacyAgentRunAdapters<SpawnParams>(
       resume: ({ params, context }) => resumeLegacyAgentRun(params, context, options),
     },
     supervisor: { watch: options.watch },
+    ...(options.watchCompleted
+      ? { ownership: { watchCompleted: options.watchCompleted } }
+      : {}),
     resultRelay: {
       completed: (running, result) => relayLegacyAgentRunCompletion(running, result, options),
       failed: (running, error) => relayLegacyAgentRunFailure(running, error, options),
