@@ -12,8 +12,12 @@ _Avoid_: Agent type, subtype
 A logical workflow participant represented by exactly one Pi session and identified by that session's UUID. Resuming preserves the Agent; creating, forking, or cloning a session creates a different Agent.
 _Avoid_: Process, pane, Agent Definition
 
+**Subagent**:
+Any non-Owner Agent governed by the protocol's activation lifecycle, including ordinary delegated Agents and incident Moderators. The Workflow Owner participates in collaboration but remains a normal user-driven Pi session rather than a Subagent.
+_Avoid_: Workflow Owner, Agent Definition
+
 **Agent Run**:
-One process and terminal surface currently executing an Agent's Pi session. An Agent may have successive Agent Runs as it is resumed.
+One process and terminal surface currently executing a Subagent's Pi session. A Subagent may have successive Agent Runs as it is resumed.
 _Avoid_: Agent, session
 
 **Workflow**:
@@ -21,15 +25,19 @@ The ownership and audit scope rooted in a main Agent. Every descendant Agent bel
 _Avoid_: Spawn tree, communication group
 
 **Workflow Owner**:
-The main Agent whose Pi session identifies the Workflow. Ownership remains with this Agent regardless of which other Agents receive orchestration capabilities.
+The normal user-driven Pi session whose identity roots the Workflow. It hosts the Workflow Control Plane while running but has no Subagent activation lifecycle, completion action, typed waiting state, or automatic recovery. Ownership remains with it regardless of which other Agents receive orchestration capabilities.
 _Avoid_: Spawner, parent
+
+**Workflow Control Plane**:
+The extension-owned coordination module hosted by the live Workflow Owner process. It owns Workflow membership, authority, ownership fences, Request and incident state, pending-input metadata, recovery, deadlock detection, and workflow-wide attention without relaying actionable payloads or writing recipient transcripts. Durable state survives Owner shutdown, while workflow-wide automation pauses until the user resumes the Owner session.
+_Avoid_: Message broker, Workflow Owner model context
 
 **Moderator**:
 A fresh runtime-created administrative Agent for one Operational Incident, with no Spawner or Child Control relationship. It receives a fixed Moderator Agent Definition plus Incident Visibility and Incident Control, cannot spawn children, and uses one durable session identity across its single permitted recovery activation. The Workflow Owner retains workflow-wide control without receiving automatic model context. The Moderator resolves operational matters independently, hands domain judgment to the Owner, and is never reused across incidents.
 _Avoid_: Workflow Owner, permanent supervisor, workflow-wide administrator
 
 **Addressability**:
-The ability to resolve an Agent's minimal identity and status and exchange messages with it. Within one Workflow, knowing the Agent's Pi session ID grants Addressability, which may be delegated by sharing that ID but grants no lifecycle control or ownership.
+The ability to resolve an Agent's identity and status, exchange messages with it, and obtain the read-only path to its complete durable transcript. Within one Workflow, knowing an Agent's Pi session ID grants Addressability, which may be delegated by sharing that ID but grants no enumeration, lifecycle control, transcript mutation, or ownership.
 _Avoid_: Discovery, control authority
 
 **Spawner**:
@@ -64,12 +72,16 @@ _Avoid_: Signal, passive status update
 An actionable message targeting one Request, sent only by the Agent that received it. Acceptance terminally closes that Request, while delivery resolves the requester's dependency. Its plain message content may report completion, inability, or any other terminal response; adding a Response Requirement makes the same message a new Request.
 _Avoid_: Progress update, uncorrelated reply
 
+**Protocol Notice**:
+A runtime-authored actionable input whose canonical payload lives in a Request or Operational Incident record rather than a sender transcript. It has a Workflow-unique identity and uses ordinary recipient ordering, Inbox Batch, deduplication, wake, and transcript-commit rules. Cancellation notices, orphan notices, and Incident Escalations are Protocol Notices; passive lifecycle and delivery facts are not.
+_Avoid_: Signal, passive runtime event, fabricated Answer
+
 **Spawned Initial Request**:
 The first Request carried by creation of a direct child Agent. Agent creation, Spawner relationship, Child Control, dependency creation, initial-context delivery, and first activation form one operation; an empty spawn followed by a separate task message is not exposed.
 _Avoid_: Empty Agent, post-spawn kickoff
 
 **Post-Acceptance Disposition**:
-The sender's declared action after durable message acceptance: `continue` permits another model turn, `settle` ends the current run and derives typed waiting, and `complete` ends the activation. Acceptance failure applies no disposition. Completion is invalid when the same message creates a Response Requirement.
+The sender's declared action after durable message acceptance: `continue` permits another model turn, `settle` suppresses the automatic follow-up model turn and derives typed waiting without ending the Agent Run, and `complete` ends a Subagent activation. For the Workflow Owner, `settle` ends only the current Pi turn and `complete` is invalid. Acceptance failure applies no disposition. Completion is invalid when the same message creates a Response Requirement.
 _Avoid_: Wait operation, delivery status, implicit auto-exit
 
 **Terminal Message Completion**:
@@ -77,11 +89,11 @@ Completion of a subagent activation atomically combined with durable acceptance 
 _Avoid_: Duplicate completion-result message
 
 **Standalone Completion**:
-A trust-based, no-argument `agent_complete()` lifecycle action for an Agent that has already communicated everything useful through any number of messages. The runtime enforces the common Completion Gate but does not identify, rank, or semantically validate a result message and does not prompt for confirmation.
+A trust-based, no-argument `agent_complete()` lifecycle action for a Subagent that has already communicated everything useful through any number of messages. The runtime enforces the common Completion Gate but does not identify, rank, or semantically validate a result message and does not prompt for confirmation. The Workflow Owner has no completion action.
 _Avoid_: Result-message selection, semantic output validation, human confirmation
 
 **Completion Gate**:
-The mechanical safety conditions shared by fused and standalone completion. After the completion commit, the Agent must have no unresolved incoming, outgoing, or recovery-pending Request obligations; no accepted but undelivered actionable inbox messages; and no unresolved operation, message acceptance, cancellation, ownership, or side-effect uncertainty. Unneeded work must be explicitly cancelled or abandoned first. Concurrent inbound acceptance and completion are serialized, and the first durable commit determines whether completion succeeds or is blocked.
+The mechanical safety conditions shared by fused and standalone Subagent completion. After the completion commit, the Subagent must have no unresolved incoming, outgoing, or recovery-pending Request obligations; no accepted but undelivered actionable inbox inputs; and no unresolved operation, message acceptance, cancellation, ownership, or side-effect uncertainty. Unneeded work must be explicitly cancelled or abandoned first. Concurrent inbound acceptance and completion are serialized, and the first durable commit determines whether completion succeeds or is blocked.
 _Avoid_: Semantic result validation, silent obligation abandonment
 
 **Activation Cancellation**:
@@ -137,8 +149,8 @@ The durable authority boundary of one Operational Incident. Its seed is the conf
 _Avoid_: Workflow-wide access, mutable allowlist, message-history reachability
 
 **Incident Visibility**:
-Temporary read access granted to a Moderator over any runtime record, configuration, or transcript portion belonging to non-Owner Agents within its Incident Scope. The Moderator initially receives only incident-facing Requests, relevant state, and a compact diagnostic summary, then pulls broader scoped material on demand. The Workflow Owner is the exception: only its incident-facing records are visible, never its general transcript. Inspection does not inject diagnostics into Owner context and grants no authority outside the Incident Scope.
-_Avoid_: Eager transcript injection, Workflow Owner transcript access, workflow-wide visibility
+Temporary read access granted to a Moderator over runtime records and configuration belonging to Agents within its Incident Scope. Transcript access follows ordinary Addressability, including explicit read-only access to the Workflow Owner transcript when the Moderator knows its ID. The Moderator initially receives only incident-facing Requests, relevant state, and a compact diagnostic summary, then pulls broader material on demand; nothing is injected automatically into either Moderator or Owner model context.
+_Avoid_: Eager transcript injection, automatic context sharing, workflow-wide control
 
 **Incident Control**:
 Temporary operational authority granted to a Moderator over non-Owner Agents within its Incident Scope. It may message them, interrupt active work, restart interrupted work, create recovery activations for failed Agents, cancel activations, and declare Recovery Abandonment. Every mutation is durably attributed to the incident with the Moderator's rationale. It cannot answer or cancel a Request for its owner, declare another Agent complete, alter identity, transcripts, Agent Definitions, tools, or capabilities, spawn unrelated Agents, reparent Agents, transfer authority, widen Incident Scope, or control the Workflow Owner.
@@ -157,7 +169,7 @@ Transfer of an unresolved Operational Incident from its Moderator to the Workflo
 _Avoid_: Incident resolution, passive notification, cleared human attention
 
 **Incident Escalation**:
-The runtime-owned actionable input that performs Owner Handoff. Its canonical compact packet lives in the incident record and is delivered exactly once to the Workflow Owner without creating an Answer obligation; it may wake or reactivate the permanent Owner. A voluntary Moderator remains active until durable acceptance, while failure fallback remains pending without a Moderator. Acceptance transfers Incident Control and ends the Moderator engagement; the Owner acts through incident operations rather than replying to the former Moderator.
+The exactly-once Protocol Notice that performs Owner Handoff. Its canonical compact packet lives in the incident record and reaches the Workflow Owner without creating an Answer obligation; it wakes a live idle Owner or remains durably pending until the user resumes a stopped Owner session. A voluntary Moderator remains active until durable acceptance, while failure fallback remains pending without a Moderator. Acceptance transfers Incident Control and ends the Moderator engagement; the Owner acts through incident operations rather than replying to the former Moderator.
 _Avoid_: Signal, Request, Answer, passive runtime event
 
 **Moderator Failure Fallback**:
@@ -177,11 +189,11 @@ Distinct Operational Incidents whose Incident Scopes share one or more Agents. S
 _Avoid_: Scope-based incident merging, unfenced concurrent control, implicit incident closure
 
 **Deadlock Escalation**:
-One deduplicated runtime-generated operational incident for each confirmed Dependency Deadlock episode. A fresh incident-scoped Moderator handles it without waking the Workflow Owner when available; otherwise a compact decision packet wakes or reactivates the Owner. Full diagnostics remain outside Owner model context for on-demand inspection. If neither route is available, the incident remains durably pending and surfaces through human attention until delivered exactly once. Detection and bookkeeping are runtime-owned but their module placement is implementation-defined.
+One deduplicated runtime-generated operational incident for each confirmed Dependency Deadlock episode. A fresh incident-scoped Moderator handles it without waking the Workflow Owner when available; otherwise a compact decision packet wakes a live idle Owner or remains pending until the user resumes the Owner session. Full diagnostics remain outside Owner model context unless explicitly inspected. If neither route is available, the incident remains durably pending and surfaces through human attention until delivered exactly once.
 _Avoid_: Repeated alerts, permanent supervisor, full Owner transcript injection
 
 **Message Identity**:
-One immutable, Workflow-unique ID assigned to every actionable message. A Request's message ID is also its Request ID. An Answer has its own ID and references the Request it closes; if that Answer also has a Response Requirement, its own ID is simultaneously the new Request ID.
+One immutable, Workflow-unique ID assigned to every actionable message and Protocol Notice. A Request's message ID is also its Request ID. An Answer has its own ID and references the Request it closes; if that Answer also has a Response Requirement, its own ID is simultaneously the new Request ID.
 _Avoid_: Separate correlation ID, thread ID
 
 **Answer Authority**:
@@ -205,7 +217,7 @@ An unresolved incoming or outgoing Request preserved after an Agent activation e
 _Avoid_: Orphaned Request, automatic Answer, activation-local Request
 
 **Automatic Recovery**:
-Runtime-driven creation of a replacement activation after failure when the Agent retains open obligations or accepted pending messages. One replacement activation is allowed by default per recovery episode, configurable at Workflow level. The episode ends when the replacement reaches durable settlement or completion; another failure exhausts the automatic budget and creates an operational incident for Moderator review. Exhaustion does not abandon recovery, terminate Request obligations, or prune descendants.
+Runtime-driven creation of exactly one replacement activation after failure when the Subagent retains open obligations or accepted pending inputs. The episode ends when the replacement reaches durable settlement or completion; another failure exhausts automatic recovery and creates an Operational Incident for Moderator review. The retry count is not configurable by this protocol. Exhaustion does not abandon recovery, terminate Request obligations, or prune descendants.
 _Avoid_: Unbounded restart, automatic abandonment, recovery without pending work
 
 **Recovery Abandonment**:
@@ -213,7 +225,7 @@ An explicit incident verdict that the current failed work will no longer be reco
 _Avoid_: Retry exhaustion, Agent deletion, implicit timeout
 
 **Transcript Projection**:
-The sender records its messaging tool call and immediate result, while the recipient records an Inbox Batch only when delivery commits it for model consumption. Queueing, acknowledgement, retry, and delivery-status changes remain runtime observability and are not copied into Agent or Workflow Owner model context.
+An Agent-originated message is canonical in the sender's messaging tool call, while a Protocol Notice is canonical in its Request or incident record. The recipient records either input in an Inbox Batch only when delivery commits it for model consumption. Queueing, acknowledgement, retry, and delivery-status changes remain runtime observability and are not copied into Agent or Workflow Owner model context.
 _Avoid_: Audit-log duplication, status notification message
 
 **Atomic Messaging Acceptance**:
@@ -221,13 +233,13 @@ A messaging operation succeeds only when its durable effects commit together: a 
 _Avoid_: Partial send, delivery acknowledgement
 
 **Recipient Unavailability**:
-The pre-acceptance condition where no authorized Recipient Inbox Router can durably accept an actionable message. The send fails fast with no message, dependency, queue, retry, or lifecycle effects. An authorized Request may first create or recover an activation, but succeeds only after its Router becomes ready. Only an ambiguous acknowledgement after possible acceptance uses same-identity probe or retry.
+The pre-acceptance condition where no authorized Recipient Inbox Router can durably accept an Agent-originated actionable message. The send fails fast with no message, dependency, queue, retry, or lifecycle effects. An authorized Request may first create or recover an activation, but succeeds only after its Router becomes ready. Only an ambiguous acknowledgement after possible acceptance uses runtime-owned same-identity reconciliation; while unresolved, it is an operational dependency and no Post-Acceptance Disposition applies.
 _Avoid_: Hidden retry queue, partial Request, elapsed-time acceptance
 
 **Pending Message Pointer**:
-A temporary durable recipient-inbox record that references the canonical outbound messaging tool call in the sender transcript. It stores only routing, ordering, and delivery metadata—not message payload—and is removed after delivery commits to the recipient transcript. The live queue is rebuilt from these pointers.
+A temporary durable recipient-inbox record that references either the canonical outbound messaging tool call in a sender transcript or a canonical Protocol Notice record. It stores only routing, ordering, and delivery metadata—not message payload—and is removed after delivery commits to the recipient transcript. The live queue is rebuilt from these pointers.
 _Avoid_: Duplicate message store, permanent workflow audit log
 
 **Recipient Inbox Router**:
-The extension-owned routing module in an Agent Run that validates inbound messages, owns that Agent's Pending Message Pointers and acceptance ordering, rebuilds its in-memory queue, selects delivery points, commits Inbox Batches to its session, and deduplicates delivery. The sender and Workflow Owner do not write the recipient transcript or relay its messages.
+The extension-owned routing module in a recipient Subagent Run or live Workflow Owner process. It validates inbound actionable inputs, finalizes ordinary message acceptance, owns recipient ordering, rebuilds the in-memory queue from Pending Message Pointers, selects delivery points, commits Inbox Batches to its session, and deduplicates delivery. Neither senders nor the Workflow Control Plane write recipient transcripts or relay Agent-originated payloads.
 _Avoid_: Central workflow broker, sender-owned inbox
