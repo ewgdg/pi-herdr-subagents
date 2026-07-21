@@ -20,7 +20,7 @@
     "test:protocol": "node --test test/protocol/workflow-foundation.test.ts test/protocol/workflow-bootstrap.test.ts test/protocol/activation-lifecycle.test.ts test/protocol/direct-signal.test.ts test/protocol/direct-signal-extension.test.ts",
     "test:signal": "node --test test/protocol/direct-signal.test.ts test/protocol/direct-signal-extension.test.ts",
     "test:scenario": "node --test test/protocol/workflow-foundation.test.ts test/protocol/activation-lifecycle.test.ts test/protocol/direct-signal.test.ts test/protocol/direct-signal-extension.test.ts",
-    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
+    "test:smoke": "node --test test/smoke/smoke.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

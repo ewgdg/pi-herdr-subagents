@@ -23,6 +23,7 @@ import {
   closePane,
   interruptPane,
   shellQuote,
+  getInheritedPiEnvironment,
   readPane,
   readPaneAsync,
   inspectPane,
@@ -1402,6 +1403,8 @@ async function launchSubagent(
   } else if (process.env.PI_CODING_AGENT_DIR) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
   }
+
+  envParts.push(...getInheritedPiEnvironment());
 
   if (denySet.size > 0) {
     envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);

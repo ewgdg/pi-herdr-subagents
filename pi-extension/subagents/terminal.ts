@@ -36,6 +36,16 @@ export function shellQuote(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
 }
 
+/** Preserve process-wide Pi startup constraints in separately created panes. */
+export function getInheritedPiEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+): string[] {
+  return ["PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY"].flatMap((name) => {
+    const value = environment[name];
+    return value ? [`${name}=${shellQuote(value)}`] : [];
+  });
+}
+
 /** Create a new herdr tab and return its root pane ID. */
 export function createSubagentPane(name: string): PaneId {
   assertTerminalAvailable();

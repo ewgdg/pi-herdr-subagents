@@ -30,15 +30,13 @@ npm test
 npm run lint
 ```
 
-Run the real end-to-end suite from inside herdr with an explicit test model:
+Run the deterministic process smoke test from any shell:
 
 ```bash
-PI_TEST_MODEL="deepseek/deepseek-v4-flash" PI_TEST_TIMEOUT=180000 npm run test:integration
+npm run test:smoke
 ```
 
-The full suite launches real Pi sessions and can take several minutes. `PI_TEST_TIMEOUT` is the per-test timeout in milliseconds; use at least `180000` for the lifecycle suite.
-
-`PI_TEST_MODEL` is applied to both the parent Pi sessions and the project-local test subagents created by the harness.
+The smoke test starts an isolated named headless herdr server, then launches one real Owner Pi session and one real child Pi session inside it. Both use a scripted test-only Faux Provider, so the test requires no model credentials, network access, paid inference, or existing herdr TUI session. It requires the `herdr` executable, cleans up the temporary named session, cannot change the user's active workspace or pane focus, and has a 30-second hard timeout.
 
 ## Install
 

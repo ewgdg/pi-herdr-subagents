@@ -26,6 +26,7 @@ import {
 } from "../pi-extension/subagents/session.ts";
 
 import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
+import { getInheritedPiEnvironment } from "../pi-extension/subagents/terminal.ts";
 import {
   loadModelConfig,
   parseModelConfig,
@@ -92,6 +93,20 @@ after(() => {
 });
 
 // --- Helpers ---
+
+describe("Pi child environment", () => {
+  it("preserves process-wide startup constraints for fresh and resumed panes", () => {
+    assert.deepEqual(
+      getInheritedPiEnvironment({
+        PI_OFFLINE: "1",
+        PI_SKIP_VERSION_CHECK: "1",
+        PI_TELEMETRY: "0",
+        UNRELATED: "ignored",
+      }),
+      ["PI_OFFLINE='1'", "PI_SKIP_VERSION_CHECK='1'", "PI_TELEMETRY='0'"],
+    );
+  });
+});
 
 function createTestDir(): string {
   return mkdtempSync(join(tmpdir(), "subagents-test-"));

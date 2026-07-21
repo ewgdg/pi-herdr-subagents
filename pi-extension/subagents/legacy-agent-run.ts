@@ -4,6 +4,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import {
   closePane,
   createSubagentPane,
+  getInheritedPiEnvironment,
   runScriptInPane,
   shellQuote,
 } from "./terminal.ts";
@@ -319,6 +320,7 @@ async function resumeLegacyAgentRun<SpawnParams>(
   if (process.env.PI_CODING_AGENT_DIR) {
     environment.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
   }
+  environment.push(...getInheritedPiEnvironment());
   environment.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
   environment.push(`PI_SUBAGENT_SESSION=${shellQuote(sessionPath)}`);
   environment.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
