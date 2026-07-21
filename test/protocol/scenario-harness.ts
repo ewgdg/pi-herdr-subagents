@@ -19,6 +19,7 @@ import {
 } from "../../pi-extension/subagents/protocol/workflow-control-plane.ts";
 import type { InboxBatch } from "../../pi-extension/subagents/protocol/direct-signal.ts";
 import { projectInboxBatch } from "../../pi-extension/subagents/protocol/direct-signal-extension.ts";
+import { DirectSignalStore } from "../../pi-extension/subagents/protocol/sqlite-message-store.ts";
 
 export class ManualClock {
   #now: number;
@@ -103,14 +104,16 @@ export class ControllableTranscriptAdapter {
   appendAgentSend(
     session: ScenarioSession,
     input: {
+      sourceEntryId?: string;
       targetAgentId?: string;
       targetRequestId?: string;
+      targetSpawn?: { agent: string; name?: string };
       message: string;
       timing?: "steer" | "deferred";
       responseRequired?: boolean;
     },
   ): string {
-    const sourceEntryId = `tool-${this.#identityFactory.next()}`;
+    const sourceEntryId = input.sourceEntryId ?? `tool-${this.#identityFactory.next()}`;
     this.#append(session.sessionPath, {
       type: "message",
       id: `entry-${this.#identityFactory.next()}`,
@@ -122,12 +125,16 @@ export class ControllableTranscriptAdapter {
           id: sourceEntryId,
           name: "agent_send",
           arguments: {
-            target: input.targetRequestId
-              ? { request: input.targetRequestId }
-              : { agent: input.targetAgentId },
+            target: input.targetSpawn
+              ? { spawn: input.targetSpawn }
+              : input.targetRequestId
+                ? { request: input.targetRequestId }
+                : { agent: input.targetAgentId },
             message: input.message,
             ...(input.timing === undefined ? {} : { timing: input.timing }),
-            ...(input.responseRequired === undefined ? {} : { responseRequired: input.responseRequired }),
+            ...(input.responseRequired === undefined
+              ? input.targetSpawn ? { responseRequired: true } : {}
+              : { responseRequired: input.responseRequired }),
           },
         }],
       },
@@ -251,6 +258,43 @@ export class ControllableRuntimeAdapter {
 
   directChildren(spawner: AgentReference): AgentRecord[] {
     return this.#controlPlane.listDirectChildren(spawner);
+  }
+
+  spawnInitialRequest(input: {
+    child: ScenarioSession;
+    runId: string;
+    messageId: string;
+    sourceEntryId: string;
+    message: string;
+    name: string;
+    agentDefinition: string;
+    launchPolicy?: import("../../pi-extension/subagents/protocol/workflow-types.ts").AgentLaunchPolicy;
+    routerEndpoint?: string;
+  }) {
+    if (!input.child.workflowBinding) throw new Error(`Scenario session is not bound to a Workflow: ${input.child.sessionPath}`);
+    return this.#controlPlane.spawnInitialRequest({
+      agentId: input.child.agentId,
+      sessionPath: input.child.sessionPath,
+      runId: input.runId,
+      messageId: input.messageId,
+      sourceEntryId: input.sourceEntryId,
+      message: input.message,
+      name: input.name,
+      agentDefinition: input.agentDefinition,
+      launchPolicy: input.launchPolicy,
+      sessionBinding: input.child.workflowBinding,
+      routerEndpoint: input.routerEndpoint,
+    });
+  }
+
+  listRequests(requester: AgentReference) {
+    const store = new DirectSignalStore(this.workflow.databasePath);
+    try { return store.listRequests(requester); } finally { store.close(); }
+  }
+
+  listPending(recipient: AgentReference) {
+    const store = new DirectSignalStore(this.workflow.databasePath);
+    try { return store.listPending(recipient); } finally { store.close(); }
   }
 
   addAgent(input: {

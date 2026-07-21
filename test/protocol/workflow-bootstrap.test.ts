@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, symlinkSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, symlinkSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,8 +11,12 @@ import {
 } from "../../pi-extension/subagents/legacy-agent-run.ts";
 import {
   WorkflowBootstrap,
+  WORKFLOW_AGENT_SESSION_ID_ENV,
+  WORKFLOW_OWNER_SESSION_ID_ENV,
+  WORKFLOW_OWNER_SESSION_PATH_ENV,
   type WorkflowBootstrapContext,
 } from "../../pi-extension/subagents/protocol/workflow-bootstrap.ts";
+import { PROVISIONAL_AGENT_RUN_KIND_ENV, PROVISIONAL_SPAWN_ENDPOINT_ENV, ProvisionalSpawnGate } from "../../pi-extension/subagents/protocol/provisional-spawn.ts";
 import { initializeSubagentSessionFile } from "../../pi-extension/subagents/session.ts";
 import { bindNewWorkflowSession } from "../../pi-extension/subagents/protocol/workflow-session-binding.ts";
 import { DeterministicIdentityFactory, ManualClock } from "./scenario-harness.ts";
@@ -42,6 +46,117 @@ function context(sessionId: string, sessionPath: string): WorkflowBootstrapConte
 }
 
 describe("production Workflow bootstrap", () => {
+  it("cleans up an uncommitted provisional Router after a startup disconnect", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: ownerPath, childCwd: root, childSessionId: ownerId });
+    const owner = new WorkflowBootstrap();
+    owner.sessionStarted(context(ownerId, ownerPath));
+    const childId = identities.next();
+    const childPath = join(owner.workflow!.sessionsDirectory, "child.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: childPath, childCwd: root, childSessionId: childId });
+    const gate = await ProvisionalSpawnGate.create();
+    const child = new WorkflowBootstrap();
+    try {
+      child.sessionStarted(context(childId, childPath), {
+        [WORKFLOW_OWNER_SESSION_ID_ENV]: ownerId, [WORKFLOW_OWNER_SESSION_PATH_ENV]: ownerPath,
+        [WORKFLOW_AGENT_SESSION_ID_ENV]: childId, [PROVISIONAL_SPAWN_ENDPOINT_ENV]: gate.endpoint,
+        [PROVISIONAL_AGENT_RUN_KIND_ENV]: "resume",
+      });
+      await gate.waitUntilReady();
+      await gate.close();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(child.workflow, undefined);
+    } finally {
+      child.close();
+      owner.close();
+      await gate.close();
+    }
+  });
+
+  it("adopts an exact committed provisional Router after RELEASE disconnect", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: ownerPath, childCwd: root, childSessionId: ownerId });
+    const owner = new WorkflowBootstrap();
+    owner.sessionStarted(context(ownerId, ownerPath));
+    const childId = identities.next();
+    const childPath = join(owner.workflow!.sessionsDirectory, "child.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: childPath, childCwd: root, childSessionId: childId });
+    const gate = await ProvisionalSpawnGate.create();
+    const child = new WorkflowBootstrap();
+    try {
+      child.sessionStarted(context(childId, childPath), {
+        [WORKFLOW_OWNER_SESSION_ID_ENV]: ownerId, [WORKFLOW_OWNER_SESSION_PATH_ENV]: ownerPath,
+        [WORKFLOW_AGENT_SESSION_ID_ENV]: childId, [PROVISIONAL_SPAWN_ENDPOINT_ENV]: gate.endpoint,
+        [PROVISIONAL_AGENT_RUN_KIND_ENV]: "resume",
+      });
+      const routerStarted = child.startDirectSignalRouter({ projectInboxBatch() {} });
+      const ready = await gate.waitUntilReady();
+      appendFileSync(ownerPath, `${JSON.stringify({ message: { content: [{ type: "toolCall", id: "tool-call", name: "agent_send", arguments: { target: { spawn: { agent: "worker", name: "Child" } }, message: "Recover after disconnect.", responseRequired: true } }] } })}\n`);
+      const receipt = owner.spawnInitialRequest({
+        agentId: childId, sessionPath: childPath, runId: "committed-run", messageId: "committed-message",
+        sourceEntryId: "tool-call", message: "Recover after disconnect.", name: "Child", agentDefinition: "worker",
+        sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: childId, sessionPath: childPath }),
+        routerEndpoint: ready.routerEndpoint,
+      });
+      await gate.close();
+      await routerStarted;
+      assert.equal(child.workflow?.ownerAgentId, ownerId);
+      assert.equal(child.currentTurnStarted()?.state.kind, "active");
+      assert.equal(owner.inspect(childId).agentId, receipt.childAgentId);
+    } finally {
+      child.close();
+      owner.close();
+      await gate.close();
+    }
+  });
+
+  it("projects a canonical Spawned Initial Request through PROJECT before COMMIT and RELEASE", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner-project.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: ownerPath, childCwd: root, childSessionId: ownerId });
+    const owner = new WorkflowBootstrap();
+    owner.sessionStarted(context(ownerId, ownerPath));
+    const childId = identities.next();
+    const childPath = join(owner.workflow!.sessionsDirectory, "project-child.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: childPath, childCwd: root, childSessionId: childId });
+    const gate = await ProvisionalSpawnGate.create();
+    const child = new WorkflowBootstrap();
+    const projected: unknown[] = [];
+    try {
+      child.sessionStarted(context(childId, childPath), {
+        [WORKFLOW_OWNER_SESSION_ID_ENV]: ownerId, [WORKFLOW_OWNER_SESSION_PATH_ENV]: ownerPath,
+        [WORKFLOW_AGENT_SESSION_ID_ENV]: childId, [PROVISIONAL_SPAWN_ENDPOINT_ENV]: gate.endpoint,
+      });
+      const routerStarted = child.startDirectSignalRouter({ projectInboxBatch() {}, async projectInitialInboxBatch(batch) { projected.push(batch); } });
+      const ready = await gate.waitUntilReady();
+      const message = "Canonical spawn work.";
+      appendFileSync(ownerPath, `${JSON.stringify({ message: { content: [{ type: "toolCall", id: "spawn-source", name: "agent_send", arguments: { target: { spawn: { agent: "worker", name: "Child" } }, message, responseRequired: true } }] } })}\n`);
+      const messageId = "spawn-message";
+      const { digestPayload } = await import("../../pi-extension/subagents/protocol/direct-signal-transcript.ts");
+      await gate.project({ senderSessionPath: ownerPath, messageId, sourceEntryId: "spawn-source", senderAgentId: ownerId, recipientAgentId: childId, payloadDigest: digestPayload(message), agentDefinition: "worker", agentName: "Child" });
+      const receipt = owner.spawnInitialRequest({
+        agentId: childId, sessionPath: childPath, runId: "spawn-run", messageId, sourceEntryId: "spawn-source", message,
+        name: "Child", agentDefinition: "worker", sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: childId, sessionPath: childPath }), routerEndpoint: ready.routerEndpoint,
+      });
+      await gate.release({ runId: receipt.runId, fencingEpoch: receipt.fencingEpoch });
+      await routerStarted;
+      assert.equal(receipt.status, "delivered");
+      assert.equal((projected[0] as { messages: Array<{ message: string }> }).messages[0]?.message, message);
+    } finally {
+      child.close();
+      owner.close();
+      await gate.close();
+    }
+  });
+
   it("leaves ephemeral Pi sessions unbound without retrying forever", async () => {
     const bootstrap = new WorkflowBootstrap();
     const ephemeralContext = {

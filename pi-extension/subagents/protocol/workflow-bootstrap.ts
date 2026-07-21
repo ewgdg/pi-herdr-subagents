@@ -1,6 +1,8 @@
 import { existsSync, realpathSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { readPiSessionUuid } from "./workflow-identity.ts";
+import { createWorkflowLayout } from "./workflow-layout.ts";
+import { RecipientInboxRouter } from "./recipient-inbox-router.ts";
 import type { WorkflowSessionBinding } from "./workflow-session-binding.ts";
 import {
   ActivationLifecycleStore,
@@ -21,6 +23,14 @@ import {
   type InboxBatch,
   type QueuedSignalReceipt,
 } from "./direct-signal.ts";
+import {
+  awaitProvisionalSpawnCommit,
+  PROVISIONAL_AGENT_RUN_KIND_ENV,
+  PROVISIONAL_SPAWN_ENDPOINT_ENV,
+  type ProvisionalSpawnProjection,
+} from "./provisional-spawn.ts";
+import { resolveCanonicalSpawnedInitialMessage } from "./direct-signal-transcript.ts";
+import { DirectSignalStore } from "./sqlite-message-store.ts";
 
 export const WORKFLOW_OWNER_SESSION_ID_ENV = "PI_WORKFLOW_OWNER_SESSION_ID";
 export const WORKFLOW_OWNER_SESSION_PATH_ENV = "PI_WORKFLOW_OWNER_SESSION_PATH";
@@ -50,6 +60,7 @@ export interface PrepareSpawnInput {
   name: string;
   agentDefinition?: string;
   capabilities?: AgentCapabilityConfiguration;
+  launchPolicy?: import("./workflow-types.ts").AgentLaunchPolicy;
   sessionBinding: WorkflowSessionBinding;
   surface: string;
 }
@@ -73,6 +84,17 @@ export class WorkflowBootstrap {
   #selfOwnership: AgentRunOwnership | undefined;
   #sessionBootstrapTimer: ReturnType<typeof setTimeout> | undefined;
   #directSignals: DirectSignalRuntime | undefined;
+  #provisionalBootstrap: Promise<void> | undefined;
+  #preparedRecipientRouter: RecipientInboxRouter | undefined;
+  #preparedRouterCommitted = false;
+  #provisionalInboxProjector: ((batch: InboxBatch) => Promise<void>) | undefined;
+  #provisionalInboxRelease: (() => void) | undefined;
+  #provisionalRouterStartup: {
+    projectInboxBatch(batch: InboxBatch): void;
+    hasProjectedMessage?(messageId: string): boolean;
+    wakeRecipient?: () => void;
+  } | undefined;
+  #provisionalAgentId: string | undefined;
   readonly #workflowDatabases = new Map<string, string>();
 
   constructor(options: {
@@ -98,6 +120,11 @@ export class WorkflowBootstrap {
     if (!context.sessionManager) return;
     const sessionPath = context.sessionManager.getSessionFile();
     if (!sessionPath) return;
+    const provisionalEndpoint = environment[PROVISIONAL_SPAWN_ENDPOINT_ENV];
+    if (provisionalEndpoint) {
+      this.#awaitProvisionalSpawn(context, environment, provisionalEndpoint);
+      return;
+    }
     if (!existsSync(sessionPath)) {
       this.#scheduleSessionBootstrap(context, environment);
       return;
@@ -107,10 +134,13 @@ export class WorkflowBootstrap {
       return;
     }
 
-    this.close();
     const ownerSessionId = environment[WORKFLOW_OWNER_SESSION_ID_ENV];
     const ownerSessionPath = environment[WORKFLOW_OWNER_SESSION_PATH_ENV];
     const expectedAgentId = environment[WORKFLOW_AGENT_SESSION_ID_ENV];
+    // RELEASE adopts the listener prepared before COMMIT; ordinary bootstrap
+    // teardown would close it before the transaction-owned Router can fence it.
+    const adoptsPreparedRouter = Boolean(this.#preparedRecipientRouter && ownerSessionId && expectedAgentId);
+    if (!adoptsPreparedRouter) this.close();
     if (ownerSessionId || ownerSessionPath || expectedAgentId) {
       if (!ownerSessionId || !ownerSessionPath || !expectedAgentId) {
         throw new Error("Incomplete durable Workflow bootstrap environment");
@@ -185,6 +215,7 @@ export class WorkflowBootstrap {
       throw new Error("Durable Workflow requires a persistent Pi session file");
     }
     this.sessionStarted(context, environment);
+    if (this.#provisionalBootstrap) return;
     while (!this.#controlPlane) {
       await new Promise<void>((resolve) => setTimeout(resolve, SESSION_BOOTSTRAP_RETRY_MS));
       this.sessionStarted(context, environment);
@@ -198,6 +229,17 @@ export class WorkflowBootstrap {
       });
     }
     this.#directSignals = undefined;
+    this.#provisionalBootstrap = undefined;
+    if (this.#preparedRecipientRouter) {
+      void this.#preparedRecipientRouter.close().catch((error) => {
+        process.emitWarning(`Prepared Inbox Router cleanup failed: ${(error as Error).message}`);
+      });
+    }
+    this.#preparedRecipientRouter = undefined;
+    this.#preparedRouterCommitted = false;
+    this.#provisionalInboxProjector = undefined;
+    this.#provisionalRouterStartup = undefined;
+    this.#provisionalAgentId = undefined;
     if (this.#controlPlane && this.#selfOwnership) {
       const activation = this.#controlPlane.inspectActivation(
         this.#controlPlane.agent(this.#selfOwnership.agentId),
@@ -231,7 +273,16 @@ export class WorkflowBootstrap {
     projectInboxBatch(batch: InboxBatch): void;
     hasProjectedMessage?(messageId: string): boolean;
     wakeRecipient?: () => void;
+    projectInitialInboxBatch?(batch: InboxBatch): Promise<void>;
+    releaseInitialInboxBatch?(): void;
   }): Promise<void> {
+    if (this.#provisionalBootstrap) {
+      if (input.projectInitialInboxBatch) this.#provisionalInboxProjector = input.projectInitialInboxBatch;
+      this.#provisionalInboxRelease = input.releaseInitialInboxBatch;
+      this.#provisionalRouterStartup = input;
+      await this.#provisionalBootstrap;
+      return this.startDirectSignalRouter(input);
+    }
     const runtime = this.#directSignalRuntime();
     runtime.configureInboxDelivery(input);
     await runtime.start();
@@ -258,8 +309,25 @@ export class WorkflowBootstrap {
     sourceEntryId: string;
     deliveryTiming?: "steer" | "deferred";
     responseRequired?: boolean;
+    prepareEndedRecipient?: Parameters<DirectSignalRuntime["sendMessage"]>[0]["prepareEndedRecipient"];
   }): Promise<QueuedSignalReceipt> {
     return this.#directSignalRuntime().sendMessage(input);
+  }
+
+  spawnInitialRequest(input: Omit<import("./workflow-control-plane.ts").SpawnedInitialRequestInput, "capabilities"> & {
+    capabilities?: AgentCapabilityConfiguration;
+  }) {
+    return this.#requireControlPlane().spawnInitialRequest(input);
+  }
+
+  reconcileSpawnedInitialRequest(input: {
+    sourceEntryId: string;
+    agentDefinition: string;
+    name: string;
+    message: string;
+    capabilities?: AgentCapabilityConfiguration;
+  }) {
+    return this.#requireControlPlane().reconcileSpawnedInitialRequest(input);
   }
 
   confirmDirectSignalDelivery(messageId: string): boolean {
@@ -315,6 +383,7 @@ export class WorkflowBootstrap {
         name: input.name,
         agentDefinition: input.agentDefinition,
         capabilities: input.capabilities,
+        launchPolicy: input.launchPolicy,
         sessionBinding: input.sessionBinding,
       });
     } catch (error) {
@@ -468,8 +537,136 @@ export class WorkflowBootstrap {
       controlPlane,
       ownership: this.#selfOwnership,
       now: this.#now,
+      preparedRouter: this.#preparedRecipientRouter,
+      preparedRouterCommitted: this.#preparedRouterCommitted,
     });
+    this.#preparedRecipientRouter = undefined;
+    this.#preparedRouterCommitted = false;
     return this.#directSignals;
+  }
+
+  #awaitProvisionalSpawn(
+    context: WorkflowBootstrapContext,
+    environment: NodeJS.ProcessEnv | Record<string, string | undefined>,
+    endpoint: string,
+  ): void {
+    if (this.#provisionalBootstrap) return;
+    const ownerAgentId = environment[WORKFLOW_OWNER_SESSION_ID_ENV]!;
+    const ownerSessionPath = environment[WORKFLOW_OWNER_SESSION_PATH_ENV]!;
+    const agentId = environment[WORKFLOW_AGENT_SESSION_ID_ENV]!;
+    const workflow = createWorkflowLayout({ ownerSessionId: ownerAgentId, ownerSessionPath, createdAtMs: this.#now() });
+    this.#provisionalBootstrap = (async () => {
+      const router = new RecipientInboxRouter({
+        workflowOwnerId: ownerAgentId,
+        recipient: { workflowOwnerId: ownerAgentId, agentId },
+        databasePath: workflow.databasePath,
+        projectInboxBatch() {},
+        now: this.#now,
+      });
+      await router.prepare();
+      this.#preparedRecipientRouter = router;
+      this.#provisionalAgentId = agentId;
+      const isPreparedResume = environment[PROVISIONAL_AGENT_RUN_KIND_ENV] === "resume";
+      if (!isPreparedResume) await this.#waitForProvisionalInboxProjector();
+      await awaitProvisionalSpawnCommit(endpoint, { routerEndpoint: router.endpoint }, {
+        ...(isPreparedResume ? {} : { project: async (plan: ProvisionalSpawnProjection) => this.#projectSpawnedInitialInboxBatch(plan) }),
+        release: async (released) => this.#adoptProvisionalRouter(context, environment, released),
+      });
+    })().catch(async (error) => {
+      let ownership: AgentRunOwnership | undefined;
+      try {
+        ownership = this.#reconcilePreparedRouterAfterProvisionalFailure(ownerAgentId, workflow.databasePath, agentId);
+      } catch (reconciliationError) {
+        // A partial/conflicting footprint is durable evidence. Keep the
+        // prepared Router fenced rather than falsely treating it as rollback.
+        process.emitWarning(`Provisional Spawn reconciliation failed closed: ${(reconciliationError as Error).message}`);
+        return;
+      }
+      if (ownership) {
+        try {
+          await this.#adoptProvisionalRouter(context, environment, { runId: ownership.runId, fencingEpoch: ownership.epoch });
+        } catch (adoptionError) {
+          process.emitWarning(`Committed Provisional Spawn adoption failed closed: ${(adoptionError as Error).message}`);
+        }
+        return;
+      }
+      void this.#preparedRecipientRouter?.close().catch(() => undefined);
+      this.#preparedRecipientRouter = undefined;
+      process.emitWarning(`Provisional Spawn startup failed: ${(error as Error).message}`);
+    }).finally(() => { this.#provisionalBootstrap = undefined; });
+  }
+
+  #reconcilePreparedRouterAfterProvisionalFailure(
+    workflowOwnerId: string,
+    databasePath: string,
+    agentId: string,
+  ): AgentRunOwnership | undefined {
+    const router = this.#preparedRecipientRouter;
+    if (!router) return undefined;
+    const store = new DirectSignalStore(databasePath);
+    try {
+      return store.reconcilePreparedRecipientRouter({
+        recipient: { workflowOwnerId, agentId }, endpoint: router.endpoint,
+      });
+    } finally {
+      store.close();
+    }
+  }
+
+  async #projectSpawnedInitialInboxBatch(plan: ProvisionalSpawnProjection): Promise<void> {
+    if (!this.#provisionalInboxProjector) {
+      throw new Error("Provisional Spawn received its Inbox Batch before Pi installed a projector");
+    }
+    if (plan.recipientAgentId !== this.#provisionalAgentId) {
+      throw new WorkflowProtocolError("InvalidMessageSource", "Provisional Spawn projection is addressed to another Agent");
+    }
+    const message = resolveCanonicalSpawnedInitialMessage({
+      sessionPath: plan.senderSessionPath,
+      sourceEntryId: plan.sourceEntryId,
+      agentDefinition: plan.agentDefinition,
+      name: plan.agentName,
+      payloadDigest: plan.payloadDigest,
+    });
+    await this.#provisionalInboxProjector({
+      deliveryTiming: "steer",
+      messages: [{
+        kind: "request",
+        messageId: plan.messageId,
+        senderAgentId: plan.senderAgentId,
+        recipientAgentId: plan.recipientAgentId,
+        deliveryTiming: "steer",
+        message,
+        responseRequired: true,
+      }],
+    });
+  }
+
+  async #waitForProvisionalInboxProjector(): Promise<void> {
+    while (!this.#provisionalInboxProjector) {
+      await new Promise<void>((resolve) => setTimeout(resolve, SESSION_BOOTSTRAP_RETRY_MS));
+    }
+  }
+
+  async #adoptProvisionalRouter(
+    context: WorkflowBootstrapContext,
+    environment: NodeJS.ProcessEnv | Record<string, string | undefined>,
+    commit: { runId: string; fencingEpoch: number },
+  ): Promise<void> {
+    this.#preparedRouterCommitted = true;
+    this.sessionStarted(context, {
+      ...environment,
+      [PROVISIONAL_SPAWN_ENDPOINT_ENV]: undefined,
+      [WORKFLOW_RUN_ID_ENV]: commit.runId,
+      [WORKFLOW_FENCING_EPOCH_ENV]: String(commit.fencingEpoch),
+      [WORKFLOW_ACTIVATION_ID_ENV]: commit.runId,
+    });
+    const startup = this.#provisionalRouterStartup;
+    if (!startup) throw new Error("Provisional Spawn has no Router adoption configuration");
+    const runtime = this.#directSignalRuntime();
+    runtime.configureInboxDelivery(startup);
+    await runtime.start();
+    this.#provisionalInboxRelease?.();
+    this.#provisionalInboxRelease = undefined;
   }
 
   #scheduleSessionBootstrap(

@@ -47,6 +47,8 @@ export interface DirectSignalRuntimeOptions {
   hasProjectedMessage?: (messageId: string) => boolean;
   wakeRecipient?: () => void;
   now?: () => number;
+  preparedRouter?: RecipientInboxRouter;
+  preparedRouterCommitted?: boolean;
 }
 
 type MessageTarget = { agentId: string; workflowOwnerId?: string } | { requestId: string };
@@ -61,6 +63,8 @@ export class DirectSignalRuntime {
   readonly #now: () => number;
   readonly #store: DirectSignalStore;
   #router: RecipientInboxRouter | undefined;
+  readonly #preparedRouter: RecipientInboxRouter | undefined;
+  readonly #preparedRouterCommitted: boolean;
   #routerStartup: Promise<void> | undefined;
   #closePromise: Promise<void> | undefined;
   #closed = false;
@@ -73,6 +77,8 @@ export class DirectSignalRuntime {
     this.#hasProjectedMessage = options.hasProjectedMessage;
     this.#wakeRecipient = options.wakeRecipient;
     this.#now = options.now ?? Date.now;
+    this.#preparedRouter = options.preparedRouter;
+    this.#preparedRouterCommitted = options.preparedRouterCommitted === true;
     this.#store = new DirectSignalStore(options.controlPlane.workflow.databasePath);
   }
 
@@ -82,6 +88,17 @@ export class DirectSignalRuntime {
     if (this.#routerStartup) return this.#routerStartup;
     if (!this.#projectInboxBatch) throw new Error("Recipient Inbox Router requires an Inbox Batch projector");
     this.#routerStartup = (async () => {
+      if (this.#preparedRouter) {
+        this.#preparedRouter.configureDelivery({
+          projectInboxBatch: this.#projectInboxBatch!,
+          hasProjectedMessage: this.#hasProjectedMessage,
+          wakeRecipient: this.#wakeRecipient,
+        });
+        if (!this.#ownership) throw new Error("Prepared Recipient Inbox Router requires Agent Run ownership");
+        this.#preparedRouter.activatePrepared(this.#ownership, !this.#preparedRouterCommitted);
+        this.#router = this.#preparedRouter;
+        return;
+      }
       const router = new RecipientInboxRouter({
         workflowOwnerId: this.#controlPlane.workflow.ownerAgentId,
         recipient: this.#controlPlane.currentAgent,
@@ -125,6 +142,7 @@ export class DirectSignalRuntime {
     sourceEntryId: string;
     deliveryTiming?: SignalDeliveryTiming;
     responseRequired?: boolean;
+    prepareEndedRecipient?: (request: SignalAcceptRequest) => Promise<QueuedSignalReceipt>;
   }): Promise<QueuedSignalReceipt> {
     this.#assertOpen();
     assertNonEmpty(input.message, "Message");
@@ -148,6 +166,27 @@ export class DirectSignalRuntime {
     }
 
     const route = this.#store.readRouter(target.recipient);
+    if (this.#store.recipientLifecycle(target.recipient) === "ended") {
+      if (!responseRequired) {
+        throw recipientUnreachable(target.recipient.agentId);
+      }
+      this.#store.assertEndedRecipientRequestAuthorized(sender, target.recipient);
+      if (!input.prepareEndedRecipient) throw recipientUnreachable(target.recipient.agentId);
+      const request: SignalAcceptRequest = {
+        workflowOwnerId: sender.workflowOwnerId,
+        messageId: existing?.messageId ?? this.#allocateMessageId(),
+        senderAgentId: sender.agentId,
+        recipientAgentId: target.recipient.agentId,
+        sourceEntryId: input.sourceEntryId,
+        payloadDigest,
+        deliveryTiming: target.deliveryTiming,
+        responseRequired: true,
+        ...(target.inReplyToRequestId ? { inReplyToRequestId: target.inReplyToRequestId } : {}),
+        message: input.message,
+      };
+      return input.prepareEndedRecipient(request);
+    }
+
     if (!route) throw recipientUnreachable(target.recipient.agentId);
     const bound = existing ?? this.#store.bindMessage({
       messageId: this.#allocateMessageId(),
@@ -368,6 +407,7 @@ function replyError(error: SignalReceiptReply["error"]): Error {
 function isWorkflowProtocolErrorCode(code: string | undefined): code is ConstructorParameters<typeof WorkflowProtocolError>[0] {
   return code === "WorkflowMismatch" || code === "UnknownAgent" || code === "OwnershipLost"
     || code === "RecipientUnreachable" || code === "RecipientEnded" || code === "MessageIdentityConflict"
+    || code === "RecipientReactivationUnauthorized"
     || code === "InvalidMessageSource" || code === "AnswerUnauthorized" || code === "AnswerAlreadyClosed" || code === "UnknownRequest";
 }
 

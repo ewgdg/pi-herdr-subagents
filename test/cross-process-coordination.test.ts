@@ -399,6 +399,36 @@ describe("SQLite cross-process coordination", () => {
     }
   });
 
+  it("upgrades launch policy schema once under concurrent pre-upgrade Workflow startup", async () => {
+    const directory = await temporaryDirectory();
+    const databasePath = join(directory, "workflow-upgrade.sqlite");
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      PRAGMA journal_mode = DELETE;
+      CREATE TABLE workflow_metadata (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1), owner_agent_id TEXT NOT NULL,
+        owner_session_path TEXT NOT NULL, created_at_ms INTEGER NOT NULL
+      ) STRICT;
+      CREATE TABLE workflow_agents (
+        agent_id TEXT PRIMARY KEY, session_path TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+        agent_definition TEXT, spawner_agent_id TEXT REFERENCES workflow_agents(agent_id),
+        capabilities_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL
+      ) STRICT;
+    `);
+    legacy.close();
+
+    const workers = Array.from({ length: 4 }, () => spawnWorker("workflow-initialize", databasePath));
+    assert.deepEqual(
+      await Promise.all(workers.map((worker) => worker.nextResult())),
+      Array.from({ length: 4 }, () => ({ initialized: true })),
+    );
+    await Promise.all(workers.map((worker) => worker.completed));
+    const upgraded = new DatabaseSync(databasePath);
+    const columns = upgraded.prepare("PRAGMA table_info(workflow_agents)").all() as Array<{ name: string }>;
+    assert.equal(columns.filter((column) => column.name === "launch_policy_json").length, 1);
+    upgraded.close();
+  });
+
   it("allows independent processes to atomically update shared state", async () => {
     const directory = await temporaryDirectory();
     const databasePath = join(directory, "coordination.sqlite");

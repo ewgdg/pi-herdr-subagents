@@ -7,6 +7,8 @@ import {
 } from "./workflow-types.ts";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
+const SCHEMA_INITIALIZATION_MAX_ATTEMPTS = 5;
+const SCHEMA_INITIALIZATION_RETRY_DELAY_MS = 10;
 
 interface WorkflowRow {
   owner_agent_id: string;
@@ -27,6 +29,7 @@ interface AgentRow {
   agent_definition: string | null;
   spawner_agent_id: string | null;
   capabilities_json: string;
+  launch_policy_json: string | null;
   created_at_ms: number;
 }
 
@@ -44,6 +47,7 @@ export interface AddAgentInput {
   agentDefinition?: string;
   spawnerAgentId: string;
   capabilities: AgentCapabilityConfiguration;
+  launchPolicy?: import("./workflow-types.ts").AgentLaunchPolicy;
   createdAtMs: number;
 }
 
@@ -53,11 +57,17 @@ export class SQLiteWorkflowStore {
 
   constructor(databasePath: string, busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS) {
     this.#database = new DatabaseSync(databasePath, { timeout: busyTimeoutMs });
-    this.#database.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA synchronous = NORMAL;
-      PRAGMA foreign_keys = ON;
+    try {
+      this.#initializeSchemaWithRetry();
+    } catch (error) {
+      this.#database.close();
+      this.#closed = true;
+      throw error;
+    }
+  }
 
+  #initializeSchema(): void {
+    this.#database.exec(`
       CREATE TABLE IF NOT EXISTS workflow_metadata (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         owner_agent_id TEXT NOT NULL,
@@ -72,6 +82,7 @@ export class SQLiteWorkflowStore {
         agent_definition TEXT,
         spawner_agent_id TEXT REFERENCES workflow_agents(agent_id),
         capabilities_json TEXT NOT NULL,
+        launch_policy_json TEXT,
         created_at_ms INTEGER NOT NULL
       ) STRICT;
 
@@ -94,6 +105,33 @@ export class SQLiteWorkflowStore {
       CREATE INDEX IF NOT EXISTS workflow_requests_requester_open
       ON workflow_requests (requester_agent_id, status);
     `);
+    const columns = this.#database.prepare("PRAGMA table_info(workflow_agents)").all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === "launch_policy_json")) {
+      this.#database.exec("ALTER TABLE workflow_agents ADD COLUMN launch_policy_json TEXT");
+    }
+  }
+
+  #initializeSchemaWithRetry(): void {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < SCHEMA_INITIALIZATION_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        this.#database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+        this.#database.exec("BEGIN IMMEDIATE");
+        try {
+          this.#initializeSchema();
+          this.#database.exec("COMMIT");
+          return;
+        } catch (error) {
+          if (this.#database.isTransaction) this.#database.exec("ROLLBACK");
+          throw error;
+        }
+      } catch (error) {
+        lastError = error;
+        if (!isTransientSqliteLock(error) || attempt + 1 === SCHEMA_INITIALIZATION_MAX_ATTEMPTS) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)), 0, 0, SCHEMA_INITIALIZATION_RETRY_DELAY_MS);
+      }
+    }
+    throw lastError;
   }
 
   close(): void {
@@ -208,8 +246,8 @@ export class SQLiteWorkflowStore {
       this.#database.prepare(`
         INSERT INTO workflow_agents (
           agent_id, session_path, name, agent_definition,
-          spawner_agent_id, capabilities_json, created_at_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          spawner_agent_id, capabilities_json, launch_policy_json, created_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         input.agentId,
         input.sessionPath,
@@ -217,6 +255,7 @@ export class SQLiteWorkflowStore {
         input.agentDefinition ?? null,
         input.spawnerAgentId,
         serializeCapabilities(input.capabilities),
+        input.launchPolicy ? JSON.stringify(input.launchPolicy) : null,
         input.createdAtMs,
       );
       return this.#requireAgent(workflow.owner_agent_id, input.agentId);
@@ -244,7 +283,7 @@ export class SQLiteWorkflowStore {
     this.inspectAgent(workflowOwnerId, spawnerAgentId);
     return (this.#database.prepare(`
       SELECT agent_id, session_path, name, agent_definition,
-             spawner_agent_id, capabilities_json, created_at_ms
+             spawner_agent_id, capabilities_json, launch_policy_json, created_at_ms
       FROM workflow_agents
       WHERE spawner_agent_id = ?
       ORDER BY created_at_ms, agent_id
@@ -255,7 +294,7 @@ export class SQLiteWorkflowStore {
     this.#requireWorkflow(workflowOwnerId);
     return (this.#database.prepare(`
       SELECT agent_id, session_path, name, agent_definition,
-             spawner_agent_id, capabilities_json, created_at_ms
+             spawner_agent_id, capabilities_json, launch_policy_json, created_at_ms
       FROM workflow_agents
       ORDER BY created_at_ms, agent_id
     `).all() as unknown as AgentRow[]).map((row) => mapAgentRow(row, workflowOwnerId));
@@ -292,7 +331,7 @@ export class SQLiteWorkflowStore {
     if (!workflowOwnerId) return undefined;
     const row = this.#database.prepare(`
       SELECT agent_id, session_path, name, agent_definition,
-             spawner_agent_id, capabilities_json, created_at_ms
+             spawner_agent_id, capabilities_json, launch_policy_json, created_at_ms
       FROM workflow_agents
       WHERE agent_id = ?
     `).get(agentId) as AgentRow | undefined;
@@ -312,6 +351,12 @@ export class SQLiteWorkflowStore {
   }
 }
 
+function isTransientSqliteLock(error: unknown): boolean {
+  const candidate = error as { code?: unknown; message?: unknown };
+  return candidate.code === "SQLITE_BUSY" || candidate.code === "SQLITE_LOCKED"
+    || (typeof candidate.message === "string" && /database is (busy|locked)/i.test(candidate.message));
+}
+
 function serializeCapabilities(capabilities: AgentCapabilityConfiguration): string {
   return JSON.stringify({ spawning: capabilities.spawning });
 }
@@ -326,6 +371,7 @@ function mapAgentRow(row: AgentRow, workflowOwnerId: string): AgentRecord {
     ...(row.agent_definition ? { agentDefinition: row.agent_definition } : {}),
     ...(row.spawner_agent_id ? { spawnerAgentId: row.spawner_agent_id } : {}),
     capabilities: { spawning: capabilities.spawning === true },
+    ...(row.launch_policy_json ? { launchPolicy: JSON.parse(row.launch_policy_json) } : {}),
     createdAtMs: Number(row.created_at_ms),
   };
 }

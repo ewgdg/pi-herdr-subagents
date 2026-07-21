@@ -45,6 +45,7 @@ export class RecipientInboxRouter {
   readonly #endpoint: string;
   #server: FramedIpcServer | undefined;
   #closed = false;
+  #prepared = false;
   #scheduling = false;
   readonly #projectedMessageIds = new Set<string>();
 
@@ -54,7 +55,31 @@ export class RecipientInboxRouter {
     this.#endpoint = createRouterEndpoint(options.workflowOwnerId, options.recipient.agentId);
   }
 
+  get endpoint(): string { return this.#endpoint; }
+
+  /** Start the recipient-owned listener before durable membership exists. */
+  async prepare(): Promise<void> {
+    this.#prepared = true;
+    await this.#startListener(false);
+  }
+
+  /** Fence and register a listener prepared before the atomic spawn commit. */
+  activatePrepared(ownership: AgentRunOwnership, register = true): void {
+    if (!this.#prepared || !this.#server) throw new Error("Recipient Inbox Router was not prepared");
+    this.#options = { ...this.#options, ownership };
+    if (register) {
+      this.#store.registerRouter({ recipient: this.#options.recipient, ownership, endpoint: this.#endpoint, registeredAtMs: this.#options.now() });
+    }
+    this.#prepared = false;
+    this.#schedule();
+  }
+
   async start(): Promise<void> {
+    if (this.#server) return;
+    await this.#startListener(true);
+  }
+
+  async #startListener(register: boolean): Promise<void> {
     if (this.#server) return;
     let server: FramedIpcServer | undefined;
     try {
@@ -63,14 +88,14 @@ export class RecipientInboxRouter {
           void this.#handle(connection, message).catch(() => connection.end());
         });
       });
-      this.#store.registerRouter({
+      if (register) this.#store.registerRouter({
         recipient: this.#options.recipient,
         ownership: this.#options.ownership,
         endpoint: this.#endpoint,
         registeredAtMs: this.#options.now(),
       });
       this.#server = server;
-      this.#schedule();
+      if (register) this.#schedule();
     } catch (error) {
       await this.#cleanupFailedStart(server, error);
     }
@@ -146,6 +171,9 @@ export class RecipientInboxRouter {
 
     let accepted: AcceptedSignal;
     try {
+      if (this.#prepared) {
+        throw new WorkflowProtocolError("RecipientUnreachable", "Recipient Inbox Router is not activated");
+      }
       const request = parseSignalRequest(frame.payload);
       if (request.workflowOwnerId !== this.#options.workflowOwnerId) {
         throw new WorkflowProtocolError(
@@ -211,7 +239,7 @@ export class RecipientInboxRouter {
     if (lifecycle === "ended" || lifecycle === "interrupted") return;
     const queued = this.#store.listPending(this.#options.recipient);
     const eligible = (lifecycle === "active"
-      ? queued.filter((pointer) => pointer.deliveryTiming === "steer")
+      ? queued.filter((pointer) => pointer.deliveryTiming === "steer" || pointer.reactivatesRecipient)
       : queued).filter((pointer) => !this.#projectedMessageIds.has(pointer.messageId));
     if (eligible.length === 0) return;
 

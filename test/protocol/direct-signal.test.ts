@@ -15,6 +15,7 @@ import {
   type InboxBatch,
 } from "../../pi-extension/subagents/protocol/direct-signal.ts";
 import { RecipientInboxRouter } from "../../pi-extension/subagents/protocol/recipient-inbox-router.ts";
+import { digestPayload } from "../../pi-extension/subagents/protocol/direct-signal-transcript.ts";
 import {
   DeterministicIdentityFactory,
   WorkflowScenario,
@@ -654,6 +655,190 @@ describe("direct Signal protocol scenarios", () => {
     assert.equal(runtime.inspectActivation(runtime.agent(recipient.agentId)), undefined);
     await senderSignals.close();
     runtime.close();
+  });
+
+  it("uses the ended-recipient preparation seam once before atomically accepting an authorized Request", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { session: owner, runtime } = scenario.createOwner();
+    const recipientSession = scenario.childSession(runtime, "ended-recipient");
+    const recipient = runtime.addAgent({
+      session: recipientSession,
+      spawner: runtime.agent(runtime.workflow.ownerAgentId),
+      name: "Ended Recipient",
+    });
+    const endedRun = runtime.controlPlane.acquireAgentRun(runtime.agent(recipient.agentId), scenario.identities.next());
+    runtime.controlPlane.startActivation(endedRun);
+    runtime.controlPlane.failAgentRun(endedRun, { error: "ended before Request" });
+    const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
+      targetAgentId: recipient.agentId, message: "Resume with this Request.", responseRequired: true,
+    });
+    let preparations = 0;
+    const senderSignals = directSignalRuntime(test, {
+      controlPlane: runtime.controlPlane,
+      allocateMessageId: () => scenario.identities.next(),
+    });
+    const receipt = await senderSignals.sendMessage({
+      target: { agentId: recipient.agentId }, message: "Resume with this Request.", sourceEntryId, responseRequired: true,
+      async prepareEndedRecipient(request) {
+        preparations += 1;
+        const store = new DirectSignalStore(runtime.workflow.databasePath);
+        try {
+          return store.acceptEndedRecipientRequest({
+            request,
+            recipient: runtime.agent(recipient.agentId),
+            endpoint: "prepared://ended-recipient",
+            runId: scenario.identities.next(),
+            checkpoint: JSON.stringify({ surface: "ended-recipient" }),
+            acceptedAtMs: scenario.clock.now(),
+          });
+        } finally {
+          store.close();
+        }
+      },
+    });
+
+    assert.equal(preparations, 1);
+    assert.equal(receipt.status, "queued");
+    assert.equal(runtime.inspectActivation(runtime.agent(recipient.agentId))?.sequence, 2);
+    assert.equal(runtime.inspectActivation(runtime.agent(recipient.agentId))?.state.kind, "active");
+    assert.equal(senderSignals.listPending(runtime.agent(recipient.agentId)).length, 1);
+
+    const retry = await senderSignals.sendMessage({
+      target: { agentId: recipient.agentId }, message: "Resume with this Request.", sourceEntryId, responseRequired: true,
+      async prepareEndedRecipient() { throw new Error("same-source retry must not prepare again"); },
+    });
+    assert.deepEqual(retry, {
+      status: receipt.status,
+      messageId: receipt.messageId,
+      recipientAgentId: receipt.recipientAgentId,
+      acceptanceSequence: receipt.acceptanceSequence,
+    });
+    assert.equal(preparations, 1);
+    await senderSignals.close();
+    runtime.close();
+  });
+
+  it("reconciles a concurrent ended-Request preparation without letting the loser own the resumed run", async () => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { session: ownerSession, runtime } = scenario.createOwner();
+    const owner = runtime.agent(runtime.workflow.ownerAgentId);
+    const childSession = scenario.childSession(runtime, "concurrent-ended-recipient");
+    const child = runtime.addAgent({ session: childSession, spawner: owner, name: "Concurrent Recipient" });
+    const oldRun = runtime.controlPlane.acquireAgentRun(runtime.agent(child.agentId), scenario.identities.next());
+    runtime.controlPlane.startActivation(oldRun);
+    runtime.controlPlane.failAgentRun(oldRun, { error: "ended before concurrent Request" });
+    const sourceEntryId = scenario.transcripts.appendAgentSend(ownerSession, {
+      targetAgentId: child.agentId, message: "Resume once.", responseRequired: true,
+    });
+    const request = {
+      workflowOwnerId: runtime.workflow.ownerAgentId, messageId: scenario.identities.next(), senderAgentId: owner.agentId,
+      recipientAgentId: child.agentId, sourceEntryId, payloadDigest: digestPayload("Resume once."),
+      deliveryTiming: "steer" as const, responseRequired: true, message: "Resume once.",
+    };
+    const store = new DirectSignalStore(runtime.workflow.databasePath);
+    try {
+      const winner = store.acceptEndedRecipientRequest({
+        request, recipient: runtime.agent(child.agentId), endpoint: "prepared://winner", runId: scenario.identities.next(),
+        checkpoint: JSON.stringify({ surface: "winner" }), acceptedAtMs: scenario.clock.now(),
+      });
+      const loser = store.acceptEndedRecipientRequest({
+        request, recipient: runtime.agent(child.agentId), endpoint: "prepared://loser", runId: scenario.identities.next(),
+        checkpoint: JSON.stringify({ surface: "loser" }), acceptedAtMs: scenario.clock.now(),
+      });
+      assert.equal(winner.committedByThisPreparation, true);
+      assert.equal(loser.committedByThisPreparation, false);
+      assert.deepEqual(
+        { status: loser.status, messageId: loser.messageId, recipientAgentId: loser.recipientAgentId, acceptanceSequence: loser.acceptanceSequence },
+        { status: winner.status, messageId: winner.messageId, recipientAgentId: winner.recipientAgentId, acceptanceSequence: winner.acceptanceSequence },
+      );
+      assert.equal(loser.ownership.runId, winner.ownership.runId);
+      assert.equal(store.reconcilePreparedRecipientRouter({ recipient: runtime.agent(child.agentId), endpoint: "prepared://winner" })?.runId, winner.ownership.runId);
+      assert.equal(runtime.inspectActivation(runtime.agent(child.agentId))?.state.kind, "active");
+      assert.equal(store.listPending(runtime.agent(child.agentId)).length, 1);
+    } finally { store.close(); }
+    runtime.close();
+  });
+
+  it("atomically reactivates an ended recipient for an Answer-plus-Request and preserves its reply slot", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { session: ownerSession, runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const recipientSession = scenario.childSession(ownerRuntime, "ended-answer-recipient");
+    const recipient = ownerRuntime.addAgent({ session: recipientSession, spawner: owner, name: "Ended Recipient" });
+    const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
+    const run = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
+    const ownerMessages = directSignalRuntime(test, {
+      controlPlane: ownerRuntime.controlPlane, allocateMessageId: () => scenario.identities.next(), projectInboxBatch() {},
+    });
+    const recipientMessages = directSignalRuntime(test, {
+      controlPlane: recipientRuntime.controlPlane, ownership: run.ownership,
+      allocateMessageId: () => scenario.identities.next(), projectInboxBatch() {},
+    });
+    await ownerMessages.start();
+    await recipientMessages.start();
+    const originalSource = scenario.transcripts.appendAgentSend(recipientSession, {
+      targetAgentId: owner.agentId, message: "Please decide.", responseRequired: true,
+    });
+    const original = await recipientMessages.sendMessage({
+      target: { agentId: owner.agentId }, message: "Please decide.", sourceEntryId: originalSource, responseRequired: true,
+    });
+    ownerRuntime.confirmAgentRunExit(run, { error: "recipient ended" });
+    const answerSource = scenario.transcripts.appendAgentSend(ownerSession, {
+      targetRequestId: original.messageId, message: "Decision and follow-up.", responseRequired: true,
+    });
+    const boundMessageId = scenario.identities.next();
+    const boundStore = new DirectSignalStore(ownerRuntime.workflow.databasePath);
+    try {
+      boundStore.bindMessage({
+        messageId: boundMessageId, sender: owner, recipient: ownerRuntime.agent(recipient.agentId),
+        sourceEntryId: answerSource, payloadDigest: digestPayload("Decision and follow-up."),
+        deliveryTiming: "steer", responseRequired: true, inReplyToRequestId: original.messageId, createdAtMs: scenario.clock.now(),
+      });
+    } finally { boundStore.close(); }
+    let preparations = 0;
+    const answer = await ownerMessages.sendMessage({
+      target: { requestId: original.messageId }, message: "Decision and follow-up.", sourceEntryId: answerSource, responseRequired: true,
+      async prepareEndedRecipient(request) {
+        preparations += 1;
+        const store = new DirectSignalStore(ownerRuntime.workflow.databasePath);
+        try {
+          return store.acceptEndedRecipientRequest({
+            request, recipient: ownerRuntime.agent(recipient.agentId), endpoint: "prepared://ended-answer",
+            runId: scenario.identities.next(), checkpoint: JSON.stringify({ surface: "ended-answer" }), acceptedAtMs: scenario.clock.now(),
+          });
+        } finally { store.close(); }
+      },
+    });
+    const retry = await ownerMessages.sendMessage({
+      target: { requestId: original.messageId }, message: "Decision and follow-up.", sourceEntryId: answerSource, responseRequired: true,
+      async prepareEndedRecipient() { throw new Error("retry must reconcile durable acceptance"); },
+    });
+
+    assert.deepEqual(retry, {
+      status: answer.status, messageId: answer.messageId, recipientAgentId: answer.recipientAgentId,
+      acceptanceSequence: answer.acceptanceSequence,
+    });
+    assert.equal(preparations, 1);
+    assert.equal(answer.messageId, boundMessageId);
+    assert.equal(ownerMessages.inspectRequest(original.messageId)?.answerMessageId, answer.messageId);
+    assert.equal(ownerMessages.inspectRequest(original.messageId)?.status, "answered");
+    assert.deepEqual(ownerMessages.inspectRequest(answer.messageId), {
+      requestId: answer.messageId, requesterAgentId: owner.agentId, responderAgentId: recipient.agentId,
+      answerDeliveryTiming: "steer", status: "open",
+    });
+    assert.equal(ownerMessages.listPending(ownerRuntime.agent(recipient.agentId))[0]?.inReplyToRequestId, original.messageId);
+
+    const staleSource = scenario.transcripts.appendAgentSend(ownerSession, {
+      targetRequestId: original.messageId, message: "Late collision.", responseRequired: true,
+    });
+    await assert.rejects(ownerMessages.sendMessage({
+      target: { requestId: original.messageId }, message: "Late collision.", sourceEntryId: staleSource, responseRequired: true,
+    }), (error: unknown) => (error as { code?: string }).code === "AnswerAlreadyClosed");
+    assert.equal(ownerMessages.listMessages().length, 2);
+    await recipientMessages.close();
+    await ownerMessages.close();
+    recipientRuntime.close();
+    ownerRuntime.close();
   });
 
   it("cleans up a listener and store when Router startup cannot acquire ownership", async (test) => {

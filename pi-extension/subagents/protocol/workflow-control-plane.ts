@@ -12,6 +12,14 @@ import { readPiSessionUuid, assertSessionUuid } from "./workflow-identity.ts";
 import { assertDescendantTranscriptPath, createWorkflowLayout } from "./workflow-layout.ts";
 import { SQLiteWorkflowStore } from "./sqlite-workflow-store.ts";
 import {
+  DirectSignalStore,
+  type SpawnedInitialRequestReceipt,
+} from "./sqlite-message-store.ts";
+import {
+  digestPayload,
+  resolveCanonicalSpawnedInitialRequest,
+} from "./direct-signal-transcript.ts";
+import {
   assertWorkflowSessionBinding,
   type WorkflowSessionBinding,
 } from "./workflow-session-binding.ts";
@@ -72,7 +80,24 @@ export interface AddWorkflowAgentInput {
   name: string;
   agentDefinition?: string;
   capabilities?: AgentCapabilityConfiguration;
+  launchPolicy?: import("./workflow-types.ts").AgentLaunchPolicy;
   sessionBinding: WorkflowSessionBinding;
+}
+
+export interface SpawnedInitialRequestInput {
+  agentId: string;
+  sessionPath: string;
+  runId: string;
+  messageId: string;
+  sourceEntryId: string;
+  message: string;
+  name: string;
+  agentDefinition: string;
+  capabilities?: AgentCapabilityConfiguration;
+  launchPolicy?: import("./workflow-types.ts").AgentLaunchPolicy;
+  sessionBinding: WorkflowSessionBinding;
+  /** Presence proves the external child Router completed its prepare phase. */
+  routerEndpoint?: string;
 }
 
 export class WorkflowControlPlane {
@@ -289,8 +314,76 @@ export class WorkflowControlPlane {
       agentDefinition: input.agentDefinition,
       spawnerAgentId: input.spawner.agentId,
       capabilities: input.capabilities ?? DEFAULT_CAPABILITIES,
+      launchPolicy: input.launchPolicy,
       createdAtMs: this.#now(),
     });
+  }
+
+  spawnInitialRequest(input: SpawnedInitialRequestInput): SpawnedInitialRequestReceipt {
+    this.#assertOpen();
+    assertSessionUuid(input.agentId);
+    const sessionPath = assertDescendantTranscriptPath(this.workflow, input.sessionPath);
+    assertWorkflowSessionBinding(input.sessionBinding, {
+      workflowOwnerId: this.workflow.ownerAgentId,
+      agentId: input.agentId,
+      sessionPath,
+    });
+    if (readPiSessionUuid(sessionPath) !== input.agentId) {
+      throw new WorkflowProtocolError("InvalidSessionIdentity", `Agent session UUID ${input.agentId} does not match transcript ${sessionPath}`);
+    }
+    resolveCanonicalSpawnedInitialRequest({
+      sessionPath: this.currentAgent.agentId === this.workflow.ownerAgentId
+        ? this.workflow.ownerSessionPath
+        : this.#store.inspectAgent(this.workflow.ownerAgentId, this.currentAgent.agentId).sessionPath,
+      sourceEntryId: input.sourceEntryId,
+      agentDefinition: input.agentDefinition,
+      name: input.name,
+      message: input.message,
+    });
+    const messages = new DirectSignalStore(this.workflow.databasePath);
+    try {
+      return messages.acceptSpawnedInitialRequest({
+        spawner: this.currentAgent,
+        child: {
+          agentId: input.agentId,
+          sessionPath,
+          name: input.name,
+          agentDefinition: input.agentDefinition,
+          capabilities: input.capabilities ?? DEFAULT_CAPABILITIES,
+          launchPolicy: input.launchPolicy,
+        },
+        runId: input.runId,
+        messageId: input.messageId,
+        sourceEntryId: input.sourceEntryId,
+        payloadDigest: digestPayload(input.message),
+        routerEndpoint: input.routerEndpoint,
+        createdAtMs: this.#now(),
+      });
+    } finally {
+      messages.close();
+    }
+  }
+
+  reconcileSpawnedInitialRequest(input: {
+    sourceEntryId: string;
+    agentDefinition: string;
+    name: string;
+    message: string;
+    capabilities?: AgentCapabilityConfiguration;
+  }) {
+    const messages = new DirectSignalStore(this.workflow.databasePath);
+    try {
+      return messages.reconcileSpawnedInitialRequest({
+        spawner: this.currentAgent,
+        sourceEntryId: input.sourceEntryId,
+        payloadDigest: digestPayload(input.message),
+        agentDefinition: input.agentDefinition,
+        name: input.name,
+        capabilities: input.capabilities ?? DEFAULT_CAPABILITIES,
+      });
+    } finally {
+      messages.close();
+    }
   }
 
   removeAgent(reference: AgentReference): void {

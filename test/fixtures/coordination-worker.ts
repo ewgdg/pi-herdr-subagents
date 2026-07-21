@@ -9,6 +9,7 @@ import {
   listenForFramedIpc,
 } from "../../pi-extension/subagents/coordination/framed-ipc.ts";
 import { DirectSignalStore } from "../../pi-extension/subagents/protocol/sqlite-message-store.ts";
+import { SQLiteWorkflowStore } from "../../pi-extension/subagents/protocol/sqlite-workflow-store.ts";
 
 function writeResult(result: unknown): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -166,6 +167,12 @@ async function initializeSignalStore(databasePath: string): Promise<void> {
   await writeResult({ initialized: true });
 }
 
+async function initializeWorkflowStore(databasePath: string): Promise<void> {
+  const store = new SQLiteWorkflowStore(databasePath);
+  store.close();
+  await writeResult({ initialized: true });
+}
+
 const [command, ...args] = process.argv.slice(2);
 
 switch (command) {
@@ -195,6 +202,9 @@ switch (command) {
     break;
   case "signal-initialize":
     await initializeSignalStore(args[0]);
+    break;
+  case "workflow-initialize":
+    await initializeWorkflowStore(args[0]);
     break;
   default:
     throw new Error(`Unknown coordination worker command: ${command}`);

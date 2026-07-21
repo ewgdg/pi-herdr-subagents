@@ -2,6 +2,13 @@ export interface AgentCapabilityConfiguration {
   spawning: boolean;
 }
 
+/** Immutable least-privilege policy captured when a Pi-backed Agent is created. */
+export interface AgentLaunchPolicy {
+  toolAllowlist?: string;
+  denyTools: string[];
+  codingAgentDir?: string;
+}
+
 export interface WorkflowRecord {
   ownerAgentId: string;
   ownerSessionPath: string;
@@ -22,6 +29,7 @@ export interface AgentRecord extends AgentReference {
   agentDefinition?: string;
   spawnerAgentId?: string;
   capabilities: AgentCapabilityConfiguration;
+  launchPolicy?: AgentLaunchPolicy;
   createdAtMs: number;
 }
 
@@ -48,6 +56,7 @@ export type WorkflowProtocolErrorCode =
   | "UnknownLifecycleDependency"
   | "RecipientUnreachable"
   | "RecipientEnded"
+  | "RecipientReactivationUnauthorized"
   | "MessageIdentityConflict"
   | "InvalidMessageSource"
   | "AnswerUnauthorized"

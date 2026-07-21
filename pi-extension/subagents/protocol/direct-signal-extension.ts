@@ -3,8 +3,11 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { randomUUID } from "node:crypto";
 import type { InboxBatch } from "./direct-signal.ts";
 import { WorkflowBootstrap } from "./workflow-bootstrap.ts";
+import { WorkflowProtocolError } from "./workflow-types.ts";
+import { findAgentSendToolCall } from "./direct-signal-transcript.ts";
 
 const INBOX_BATCH_CUSTOM_TYPE = "agent_inbox_batch";
 
@@ -14,6 +17,11 @@ const AgentTarget = Type.Object({
 const RequestTarget = Type.Object({
   request: Type.String({ description: "Request ID to Answer; routing is derived from that Request" }),
 }, { additionalProperties: false });
+const SpawnSpec = Type.Object({
+  agent: Type.String({ minLength: 1, description: "Agent Definition name for the direct child" }),
+  name: Type.Optional(Type.String({ minLength: 1, description: "Optional display name for the direct child" })),
+}, { additionalProperties: false });
+const SpawnTarget = Type.Object({ spawn: SpawnSpec }, { additionalProperties: false });
 const Message = Type.String({ minLength: 1, description: "Plain actionable message content" });
 const Timing = Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("deferred")]));
 
@@ -23,6 +31,7 @@ export const AgentSendParams = Type.Union([
   Type.Object({ target: AgentTarget, message: Message, timing: Timing, responseRequired: Type.Literal(true) }, { additionalProperties: false }),
   Type.Object({ target: RequestTarget, message: Message, responseRequired: Type.Optional(Type.Literal(false)) }, { additionalProperties: false }),
   Type.Object({ target: RequestTarget, message: Message, responseRequired: Type.Literal(true) }, { additionalProperties: false }),
+  Type.Object({ target: SpawnTarget, message: Message, responseRequired: Type.Literal(true) }, { additionalProperties: false }),
 ]);
 
 export async function startDirectSignalRouter(
@@ -43,7 +52,39 @@ export async function startDirectSignalRouter(
     hasProjectedMessage(messageId) {
       return sessionContainsInboxMessage(context.sessionManager.getEntries(), messageId);
     },
+    async projectInitialInboxBatch(batch) {
+      pi.sendMessage(projectInboxBatch(batch), {
+        // The PREPARE/PROJECT child must append durable JSONL before the
+        // Spawner transaction, but cannot invoke a provider before RELEASE.
+        triggerTurn: false,
+        deliverAs: "steer",
+      });
+      const messageId = batch.messages[0]?.messageId;
+      if (!messageId) throw new Error("Initial Inbox Batch has no Message Identity");
+      await waitForProjectedInboxMessage(context, messageId);
+    },
+    releaseInitialInboxBatch() {
+      // Pi only starts a turn through a message delivery. This marker carries
+      // no actionable payload; the already-persisted Inbox Batch is the sole
+      // request context and remains blocked until RELEASE.
+      pi.sendMessage({
+        customType: "agent_inbox_release",
+        content: "",
+        display: false,
+        details: {},
+      }, { triggerTurn: true, deliverAs: "steer" });
+    },
   });
+}
+
+async function waitForProjectedInboxMessage(context: ExtensionContext, messageId: string): Promise<void> {
+  const timeoutAt = Date.now() + 5_000;
+  while (!sessionContainsInboxMessage(context.sessionManager.getEntries(), messageId)) {
+    if (Date.now() >= timeoutAt) {
+      throw new Error(`Timed out waiting for durable Inbox Batch ${messageId}`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 export function confirmProjectedInboxBatches(
@@ -61,6 +102,27 @@ export function registerAgentSendTool(
   pi: ExtensionAPI,
   workflowBootstrap: WorkflowBootstrap,
   enabled = true,
+  options: {
+    spawnInitialRequest?(input: {
+      agent: string;
+      name?: string;
+      message: string;
+      messageId: string;
+      sourceEntryId: string;
+      context: ExtensionContext;
+    }): Promise<{ status: "queued" | "delivered"; messageId: string; recipientAgentId: string; acceptanceSequence: number }>;
+    reconcileSpawnedInitialRequest?(input: {
+      agent: string;
+      name?: string;
+      message: string;
+      sourceEntryId: string;
+      context: ExtensionContext;
+    }): Promise<{ status: "queued" | "delivered"; messageId: string; recipientAgentId: string; acceptanceSequence: number } | undefined>;
+    prepareEndedRecipient?(input: {
+      request: import("./direct-signal-types.ts").SignalAcceptRequest;
+      context: ExtensionContext;
+    }): Promise<import("./direct-signal-types.ts").QueuedSignalReceipt>;
+  } = {},
 ): void {
   if (!enabled) return;
   const ownerHint = process.env.PI_WORKFLOW_OWNER_SESSION_ID
@@ -80,6 +142,50 @@ export function registerAgentSendTool(
     parameters: AgentSendParams,
     async execute(toolCallId, params, _signal, _onUpdate, context) {
       await workflowBootstrap.waitUntilReady(context);
+      if ("spawn" in params.target) {
+        assertCanonicalAgentSendSource(
+          context.sessionManager.getEntries(),
+          toolCallId,
+          params.target,
+          params.message,
+          undefined,
+          true,
+        );
+        if (!options.spawnInitialRequest) {
+          throw new WorkflowProtocolError("RecipientUnreachable", "Spawned Initial Request launcher is unavailable");
+        }
+        const reconciled = await options.reconcileSpawnedInitialRequest?.({
+          agent: params.target.spawn.agent,
+          name: params.target.spawn.name,
+          message: params.message,
+          sourceEntryId: toolCallId,
+          context,
+        });
+        if (reconciled) {
+          return {
+            content: [{
+              type: "text",
+              text: `Request ${reconciled.messageId} ${reconciled.status} for spawned Agent ${reconciled.recipientAgentId} (acceptance sequence ${reconciled.acceptanceSequence}).`,
+            }],
+            details: reconciled,
+          };
+        }
+        const receipt = await options.spawnInitialRequest({
+          agent: params.target.spawn.agent,
+          name: params.target.spawn.name,
+          message: params.message,
+          messageId: randomUUID(),
+          sourceEntryId: toolCallId,
+          context,
+        });
+        return {
+          content: [{
+            type: "text",
+            text: `Request ${receipt.messageId} ${receipt.status} for spawned Agent ${receipt.recipientAgentId} (acceptance sequence ${receipt.acceptanceSequence}).`,
+          }],
+          details: receipt,
+        };
+      }
       await startDirectSignalRouter(pi, workflowBootstrap, context);
       assertCanonicalAgentSendSource(
         context.sessionManager.getEntries(),
@@ -97,6 +203,9 @@ export function registerAgentSendTool(
         sourceEntryId: toolCallId,
         deliveryTiming: "agent" in params.target ? params.timing : undefined,
         responseRequired: params.responseRequired,
+        ...(options.prepareEndedRecipient && "agent" in params.target
+          ? { prepareEndedRecipient: (request) => options.prepareEndedRecipient!({ request, context }) }
+          : {}),
       });
       return {
         content: [{
@@ -199,35 +308,19 @@ function inboxMessageIds(entries: unknown[]): string[] {
 function assertCanonicalAgentSendSource(
   entries: unknown[],
   toolCallId: string,
-  target: { agent?: string; request?: string },
+  target: { agent?: string; request?: string; spawn?: { agent: string; name?: string } },
   message: string,
   deliveryTiming: "steer" | "deferred" | undefined,
   responseRequired: boolean,
 ): void {
-  const found = entries.some((entry) => {
-    if (!entry || typeof entry !== "object") return false;
-    const transcriptMessage = (entry as { message?: unknown }).message;
-    if (!transcriptMessage || typeof transcriptMessage !== "object") return false;
-    const content = (transcriptMessage as { content?: unknown }).content;
-    if (!Array.isArray(content)) return false;
-    return content.some((block) => {
-      if (!block || typeof block !== "object") return false;
-      const candidate = block as {
-        type?: unknown;
-        id?: unknown;
-        name?: unknown;
-        arguments?: { target?: { agent?: unknown; request?: unknown }; message?: unknown; timing?: unknown; responseRequired?: unknown };
-      };
-      return candidate.type === "toolCall"
-        && candidate.id === toolCallId
-        && candidate.name === "agent_send"
-        && candidate.arguments?.target?.agent === target.agent
-        && candidate.arguments?.target?.request === target.request
-        && candidate.arguments?.message === message
-        && candidate.arguments?.timing === deliveryTiming
-        && (candidate.arguments?.responseRequired === true) === responseRequired;
-    });
-  });
+  const toolCall = findAgentSendToolCall(entries, toolCallId);
+  const found = toolCall?.arguments.target?.agent === target.agent
+    && toolCall.arguments.target?.request === target.request
+    && toolCall.arguments.target?.spawn?.agent === target.spawn?.agent
+    && toolCall.arguments.target?.spawn?.name === target.spawn?.name
+    && toolCall.arguments.message === message
+    && toolCall.arguments.timing === deliveryTiming
+    && (toolCall.arguments.responseRequired === true) === responseRequired;
   if (!found) {
     throw new Error(`agent_send tool call ${toolCallId} is not durable in the sender transcript`);
   }

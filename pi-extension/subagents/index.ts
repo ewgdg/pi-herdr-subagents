@@ -86,9 +86,20 @@ import {
   type LegacyRunningSubagent,
   type LegacySpawnRequest,
 } from "./legacy-agent-run.ts";
-import { WorkflowBootstrap } from "./protocol/workflow-bootstrap.ts";
+import {
+  WorkflowBootstrap,
+  WORKFLOW_AGENT_SESSION_ID_ENV,
+  WORKFLOW_OWNER_SESSION_ID_ENV,
+  WORKFLOW_OWNER_SESSION_PATH_ENV,
+} from "./protocol/workflow-bootstrap.ts";
+import {
+  ProvisionalSpawnGate,
+  PROVISIONAL_SPAWN_ENDPOINT_ENV,
+} from "./protocol/provisional-spawn.ts";
 import { latestAssistantTurnWasAborted } from "./protocol/pi-activation-events.ts";
 import { bindNewWorkflowSession } from "./protocol/workflow-session-binding.ts";
+import { digestPayload } from "./protocol/direct-signal-transcript.ts";
+import { DirectSignalStore } from "./protocol/sqlite-message-store.ts";
 import {
   confirmProjectedInboxBatches,
   registerAgentSendTool,
@@ -540,6 +551,7 @@ type RunningSubagent = LegacyRunningSubagent;
 
 interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
+  pendingRequestReactivations: Map<string, Promise<import("./protocol/direct-signal-types.ts").QueuedSignalReceipt>>;
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
@@ -576,6 +588,7 @@ function createWorkflowBootstrap(): WorkflowBootstrap {
 function createSubagentRuntime(): SubagentRuntime {
   return {
     runningSubagents: new Map<string, RunningSubagent>(),
+    pendingRequestReactivations: new Map(),
     workflowBootstrap: createWorkflowBootstrap(),
   };
 }
@@ -823,6 +836,41 @@ function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   }
 
   return [...allow].join(",");
+}
+
+type LaunchPolicy = import("./protocol/workflow-types.ts").AgentLaunchPolicy;
+
+/** Capture the exact least-privilege boundary with the durable child membership. */
+function buildLaunchPolicy(input: {
+  effectiveTools?: string;
+  denyTools: ReadonlySet<string>;
+  localAgentDir: string | null;
+}): LaunchPolicy {
+  const toolAllowlist = buildSubagentToolAllowlist(input.effectiveTools);
+  const codingAgentDir = input.localAgentDir && existsSync(input.localAgentDir)
+    ? input.localAgentDir
+    : process.env.PI_CODING_AGENT_DIR;
+  return {
+    ...(toolAllowlist ? { toolAllowlist } : {}),
+    denyTools: [...input.denyTools],
+    ...(codingAgentDir ? { codingAgentDir } : {}),
+  };
+}
+
+function appendLaunchPolicyEnvironment(parts: string[], policy: LaunchPolicy): void {
+  if (policy.codingAgentDir) parts.push(`PI_CODING_AGENT_DIR=${shellQuote(policy.codingAgentDir)}`);
+  if (policy.denyTools.length > 0) parts.push(`PI_DENY_TOOLS=${shellQuote(policy.denyTools.join(","))}`);
+}
+
+function buildRequestReactivationCommand(input: {
+  environment: string[];
+  policy: LaunchPolicy;
+  sessionPath: string;
+}): string {
+  const policyEnvironment: string[] = [];
+  appendLaunchPolicyEnvironment(policyEnvironment, input.policy);
+  const toolArgs = input.policy.toolAllowlist ? ` --tools ${shellQuote(input.policy.toolAllowlist)}` : "";
+  return `${[...input.environment, ...policyEnvironment].join(" ")} pi --session ${shellQuote(input.sessionPath)} -e ${shellQuote(join(SUBAGENTS_DIR, "subagent-done.ts"))}${toolArgs}; echo '__SUBAGENT_DONE_'$?'__'`;
 }
 
 function buildPiPromptArgs(params: {
@@ -1092,6 +1140,7 @@ export const __test__ = {
   resolveEffectiveAutoExit,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
+  buildRequestReactivationCommand,
   buildPiPromptArgs,
   observeRunningSubagent,
   resolveDenyTools,
@@ -1102,6 +1151,7 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
+  finalizeCommittedRequestReactivation,
 };
 
 function startWidgetRefresh() {
@@ -1123,10 +1173,14 @@ async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: LegacyLaunchContext,
   parentThinking: ThinkingLevel,
-  options?: { surface?: string },
+  options?: {
+    surface?: string;
+    spawnedInitialRequest?: { messageId: string; sourceEntryId: string; message: string };
+  },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
+  const spawnedInitialRequest = options?.spawnedInitialRequest;
   await runtime.workflowBootstrap.waitUntilReady(ctx);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
@@ -1154,12 +1208,18 @@ async function launchSubagent(
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const denySet = resolveDenyTools(agentDefs);
+  const launchPolicy = buildLaunchPolicy({ effectiveTools, denyTools: denySet, localAgentDir });
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const workflowSessionsDirectory = agentDefs?.cli === "claude"
     ? undefined
     : runtime.workflowBootstrap.workflow?.sessionsDirectory;
   const sessionDir = workflowSessionsDirectory ??
     getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
+
+  if (spawnedInitialRequest && agentDefs?.cli === "claude") {
+    throw new Error("Spawned Initial Request requires a Pi-backed Agent Definition");
+  }
 
   // Generate a deterministic session file path for this subagent.
   // This eliminates race conditions when multiple agents launch simultaneously —
@@ -1221,8 +1281,19 @@ async function launchSubagent(
     throw error;
   }
 
+  let provisionalSpawn: ProvisionalSpawnGate | undefined;
+  if (spawnedInitialRequest) {
+    try {
+      provisionalSpawn = await ProvisionalSpawnGate.create();
+    } catch (error) {
+      try { closePane(surface); } catch {}
+      runtime.workflowBootstrap.abandonUnpreparedSpawn(subagentSessionFile);
+      throw error;
+    }
+  }
+
   let preparedWorkflowRun: ReturnType<WorkflowBootstrap["prepareSpawn"]> | undefined;
-  if (workflowSessionsDirectory) {
+  if (workflowSessionsDirectory && !spawnedInitialRequest) {
     try {
       preparedWorkflowRun = runtime.workflowBootstrap.prepareSpawn({
         agentId: agentSessionId,
@@ -1231,6 +1302,7 @@ async function launchSubagent(
         name: params.name,
         agentDefinition: params.agent,
         capabilities: { spawning: agentDefs?.spawning !== false },
+        launchPolicy,
         sessionBinding: workflowSessionBinding!,
         surface,
       });
@@ -1244,7 +1316,12 @@ async function launchSubagent(
   }
 
   const abandonPreparedWorkflowRun = () => {
-    if (!preparedWorkflowRun) return;
+    void provisionalSpawn?.abort();
+    void provisionalSpawn?.close();
+    if (!preparedWorkflowRun) {
+      if (spawnedInitialRequest) runtime.workflowBootstrap.abandonUnpreparedSpawn(subagentSessionFile);
+      return;
+    }
     try {
       closePane(surface);
     } catch {}
@@ -1269,7 +1346,6 @@ async function launchSubagent(
   const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-  const denySet = resolveDenyTools(agentDefs);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -1388,45 +1464,43 @@ async function launchSubagent(
     parts.push(flag, shellQuote(syspromptPath));
   }
 
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
-  if (toolAllowlist) {
-    parts.push("--tools", shellQuote(toolAllowlist));
+  if (launchPolicy.toolAllowlist) {
+    parts.push("--tools", shellQuote(launchPolicy.toolAllowlist));
   }
 
   // Build env prefix: denied tools + subagent identity + config dir propagation
   const envParts: string[] = [];
 
-  // If the target cwd has its own .pi/agent/, use that as the config root.
-  // Otherwise propagate the current/global agent dir.
-  if (localAgentDir && existsSync(localAgentDir)) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(localAgentDir)}`);
-  } else if (process.env.PI_CODING_AGENT_DIR) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
-  }
-
+  appendLaunchPolicyEnvironment(envParts, launchPolicy);
   envParts.push(...getInheritedPiEnvironment());
-
-  if (denySet.size > 0) {
-    envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
-  }
   envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
   }
-  if (effectiveAutoExit && !preparedWorkflowRun) {
+  if (effectiveAutoExit && !preparedWorkflowRun && !spawnedInitialRequest) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
+  if (provisionalSpawn) {
+    const workflow = runtime.workflowBootstrap.workflow!;
+    envParts.push(`${WORKFLOW_OWNER_SESSION_ID_ENV}=${shellQuote(workflow.ownerAgentId)}`);
+    envParts.push(`${WORKFLOW_OWNER_SESSION_PATH_ENV}=${shellQuote(workflow.ownerSessionPath)}`);
+    envParts.push(`${WORKFLOW_AGENT_SESSION_ID_ENV}=${shellQuote(agentSessionId)}`);
+    envParts.push(`${PROVISIONAL_SPAWN_ENDPOINT_ENV}=${shellQuote(provisionalSpawn.endpoint)}`);
+  }
 
   // Pass task and skill prompts to the sub-agent.
   // Only full-context fork mode gets a direct task argument because it already
   // inherits the parent conversation. Blank-session modes use artifact-backed
   // handoff so the wrapper instructions arrive as the initial user message.
-  let taskArg: string;
-  if (launchBehavior.taskDelivery === "direct") {
+  let taskArg: string | undefined;
+  if (spawnedInitialRequest) {
+    // The accepted Inbox Batch is the child's sole initial task context.
+    taskArg = undefined;
+  } else if (launchBehavior.taskDelivery === "direct") {
     taskArg = fullTask;
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
@@ -1448,12 +1522,14 @@ async function launchSubagent(
     taskArg = `@${artifactPath}`;
   }
 
-  for (const promptArg of buildPiPromptArgs({
-    effectiveSkills,
-    taskDelivery: launchBehavior.taskDelivery,
-    taskArg,
-  })) {
-    parts.push(shellQuote(promptArg));
+  if (taskArg !== undefined) {
+    for (const promptArg of buildPiPromptArgs({
+      effectiveSkills,
+      taskDelivery: launchBehavior.taskDelivery,
+      taskArg,
+    })) {
+      parts.push(shellQuote(promptArg));
+    }
   }
 
   if (preparedWorkflowRun) {
@@ -1477,6 +1553,8 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   let commandAcknowledged = false;
+  let spawnedOwnership: import("./protocol/workflow-types.ts").AgentRunOwnership | undefined;
+  let provisionalPhase: "precommit" | "committed" = "precommit";
   try {
     runScriptInPane(surface, command, {
       scriptPath: launchScriptFile,
@@ -1491,7 +1569,61 @@ async function launchSubagent(
     if (preparedWorkflowRun) {
       runtime.workflowBootstrap.runStarted(preparedWorkflowRun.ownership);
     }
+    if (provisionalSpawn && spawnedInitialRequest && workflowSessionBinding) {
+      const ready = await provisionalSpawn.waitUntilReady();
+      await provisionalSpawn.project({
+        senderSessionPath: sessionFile,
+        messageId: spawnedInitialRequest.messageId,
+        sourceEntryId: spawnedInitialRequest.sourceEntryId,
+        senderAgentId: runtime.workflowBootstrap.currentAgentId!,
+        recipientAgentId: agentSessionId,
+        payloadDigest: digestPayload(spawnedInitialRequest.message),
+        agentDefinition: params.agent!,
+        agentName: params.name,
+      });
+      const receipt = runtime.workflowBootstrap.spawnInitialRequest({
+        agentId: agentSessionId,
+        sessionPath: subagentSessionFile,
+        runId: id,
+        messageId: spawnedInitialRequest.messageId,
+        sourceEntryId: spawnedInitialRequest.sourceEntryId,
+        message: spawnedInitialRequest.message,
+        name: params.name,
+        agentDefinition: params.agent!,
+        capabilities: { spawning: agentDefs?.spawning !== false },
+        launchPolicy,
+        sessionBinding: workflowSessionBinding,
+        routerEndpoint: ready.routerEndpoint,
+      });
+      spawnedOwnership = {
+        workflowOwnerId: runtime.workflowBootstrap.workflow!.ownerAgentId,
+        agentId: receipt.childAgentId,
+        runId: receipt.runId,
+        epoch: receipt.fencingEpoch,
+        resourceId: `agent-run:${runtime.workflowBootstrap.workflow!.ownerAgentId}:${receipt.childAgentId}`,
+      };
+      provisionalPhase = "committed";
+      try {
+        await provisionalSpawn.release({ runId: receipt.runId, fencingEpoch: receipt.fencingEpoch });
+      } catch (releaseError) {
+        // The transaction is authoritative. Keep the exact session/pane so a
+        // retry can reconcile it instead of creating another child.
+        process.emitWarning(`Committed Spawn release acknowledgement lost: ${(releaseError as Error).message}`);
+      }
+      await provisionalSpawn.close();
+    }
   } catch (error) {
+    if (provisionalSpawn) {
+      if (provisionalPhase === "committed") {
+        await provisionalSpawn.close();
+        throw error;
+      }
+      await provisionalSpawn.abort();
+      await provisionalSpawn.close();
+      try { closePane(surface); } catch {}
+      runtime.workflowBootstrap.abandonUnpreparedSpawn(subagentSessionFile);
+      throw error;
+    }
     throw reconcilePreparedAgentRunStartupFailure({
       surface,
       ownership: preparedWorkflowRun?.ownership,
@@ -1522,7 +1654,7 @@ async function launchSubagent(
     interactive: effectiveInteractive,
     runtimePlan,
     launchKind: "spawn",
-    workflowOwnership: preparedWorkflowRun?.ownership,
+    workflowOwnership: spawnedOwnership ?? preparedWorkflowRun?.ownership,
     lifecycle: createLifecycle(startTime),
   };
 
@@ -1738,13 +1870,141 @@ async function watchSubagent(
   }
 }
 
+async function finalizeCommittedRequestReactivation(input: {
+  gate: Pick<ProvisionalSpawnGate, "release" | "close">;
+  ownership: import("./protocol/workflow-types.ts").AgentRunOwnership;
+  registerRunning(): void;
+}): Promise<void> {
+  try {
+    await input.gate.release({ runId: input.ownership.runId, fencingEpoch: input.ownership.epoch });
+  } catch (error) {
+    process.emitWarning(`Committed Request reactivation release acknowledgement lost: ${(error as Error).message}`);
+  }
+  await input.gate.close().catch((error) => {
+    process.emitWarning(`Committed Request reactivation gate cleanup failed: ${(error as Error).message}`);
+  });
+  input.registerRunning();
+}
+
+async function reactivateEndedRecipientForRequest(
+  request: import("./protocol/direct-signal-types.ts").SignalAcceptRequest,
+  context: ExtensionContext,
+): Promise<import("./protocol/direct-signal-types.ts").QueuedSignalReceipt> {
+  const key = `${request.senderAgentId}:${request.sourceEntryId}`;
+  const existing = runtime.pendingRequestReactivations.get(key);
+  if (existing) return existing;
+  const preparation = (async () => {
+    if (!isTerminalAvailable()) throw new Error(terminalSetupHint());
+    const member = runtime.workflowBootstrap.inspect(request.recipientAgentId);
+    const workflow = runtime.workflowBootstrap.workflow;
+    if (!workflow) throw new Error("Workflow is unavailable for Request reactivation");
+    const id = Math.random().toString(16).slice(2, 10);
+    if (!member.launchPolicy) {
+      throw new Error(`Ended Agent ${member.agentId} has no durable launch policy; refusing to resume with expanded privileges`);
+    }
+    const surface = createSubagentPane(member.name);
+    const gate = await ProvisionalSpawnGate.create();
+    const artifactDir = getArtifactDir(context.sessionManager.getSessionDir(), context.sessionManager.getSessionId());
+    const activityFile = getSubagentActivityFile(artifactDir, id);
+    mkdirSync(dirname(activityFile), { recursive: true });
+    const env = [
+      ...getInheritedPiEnvironment(),
+      `PI_SUBAGENT_NAME=${shellQuote(member.name)}`,
+      `PI_SUBAGENT_SESSION=${shellQuote(member.sessionPath)}`,
+      `PI_SUBAGENT_ID=${shellQuote(id)}`,
+      `PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`,
+      `PI_SUBAGENT_SURFACE=${shellQuote(surface)}`,
+      `${WORKFLOW_OWNER_SESSION_ID_ENV}=${shellQuote(workflow.ownerAgentId)}`,
+      `${WORKFLOW_OWNER_SESSION_PATH_ENV}=${shellQuote(workflow.ownerSessionPath)}`,
+      `${WORKFLOW_AGENT_SESSION_ID_ENV}=${shellQuote(member.agentId)}`,
+      `${PROVISIONAL_SPAWN_ENDPOINT_ENV}=${shellQuote(gate.endpoint)}`,
+      `PI_WORKFLOW_PROVISIONAL_RUN_KIND=resume`,
+    ];
+    const command = buildRequestReactivationCommand({
+      environment: env,
+      policy: member.launchPolicy,
+      sessionPath: member.sessionPath,
+    });
+    let ownership: import("./protocol/workflow-types.ts").AgentRunOwnership | undefined;
+    try {
+      runScriptInPane(surface, command, {
+        scriptPath: join(artifactDir, "subagent-scripts", `${member.name}-request-${id}.sh`),
+        scriptPreamble: `# Internal no-prompt Request reactivation for ${member.agentId}`,
+      });
+      const ready = await gate.waitUntilReady();
+      const store = new DirectSignalStore(workflow.databasePath);
+      let accepted: import("./protocol/sqlite-message-store.ts").EndedRecipientRequestReceipt;
+      try {
+        accepted = store.acceptEndedRecipientRequest({
+          request,
+          recipient: { workflowOwnerId: workflow.ownerAgentId, agentId: member.agentId },
+          endpoint: ready.routerEndpoint,
+          runId: id,
+          checkpoint: JSON.stringify({ surface }),
+          acceptedAtMs: Date.now(),
+        });
+      } finally {
+        store.close();
+      }
+      if (!accepted.committedByThisPreparation) {
+        // Another concurrent provisional resume owns the durable Router/run.
+        // This pane never committed and must not RELEASE, watch, or terminate it.
+        await gate.abort();
+        await gate.close();
+        try { closePane(surface); } catch {}
+        return accepted;
+      }
+      ownership = accepted.ownership;
+      const running: RunningSubagent = {
+        id, name: member.name, task: "Request-driven reactivation", agent: member.agentDefinition,
+        surface, startTime: Date.now(), sessionFile: member.sessionPath, activityFile,
+        interactive: false, runtimePlan: undefined, launchKind: "resume", workflowOwnership: ownership,
+        lifecycle: createLifecycle(Date.now()),
+      };
+      await finalizeCommittedRequestReactivation({
+        gate, ownership,
+        registerRunning() {
+          runningSubagents.set(id, running);
+          // This is an internal transport run: preserve lifecycle fencing without
+          // relaying an unrelated legacy subagent result to the requester.
+          void watchSubagent(running, new AbortController().signal).then((result) => {
+            runningSubagents.delete(id);
+            runtime.workflowBootstrap.runTerminated(ownership!, hasConfirmedAgentRunTermination(result), {
+              error: result.errorMessage ?? `Request-driven Agent Run exited (exit ${result.exitCode})`,
+              exitCode: result.exitCode,
+            });
+          });
+        },
+      });
+      return accepted;
+    } catch (error) {
+      if (ownership) {
+        // Durable commit won. Never ABORT or destroy the session/pane; another
+        // source retry must reconcile this exact accepted Request.
+        throw error;
+      }
+      await gate.abort();
+      await gate.close();
+      try { closePane(surface); } catch {}
+      throw error;
+    }
+  })().finally(() => runtime.pendingRequestReactivations.delete(key));
+  runtime.pendingRequestReactivations.set(key, preparation);
+  return preparation;
+}
+
 function createDefaultLegacyAgentRunAdapters(pi: ExtensionAPI): ConfiguredLegacyAgentRunAdapters {
   return createLegacyAgentRunAdapters({
     pi,
     subagentsDir: SUBAGENTS_DIR,
     runningSubagents,
     currentExtensionApi: () => runtime.pi,
-    launch: ({ params, context, parentThinking }) => launchSubagent(params, context, parentThinking),
+    launch: ({ params, context, parentThinking, spawnedInitialRequest }) => launchSubagent(
+      params,
+      context,
+      parentThinking,
+      spawnedInitialRequest ? { spawnedInitialRequest } : undefined,
+    ),
     watch: watchSubagent,
     getArtifactDir,
     getShellReadyDelayMs,
@@ -1903,7 +2163,51 @@ function subagentsExtensionWithOptions(
 
   const shouldRegister = (name: string) => !deniedTools.has(name);
 
-  registerAgentSendTool(pi, runtime.workflowBootstrap, shouldRegister("agent_send"));
+  registerAgentSendTool(pi, runtime.workflowBootstrap, shouldRegister("agent_send"), {
+    async reconcileSpawnedInitialRequest(input) {
+      const agentDefinition = loadAgentDefaults(input.agent);
+      return runtime.workflowBootstrap.reconcileSpawnedInitialRequest({
+        sourceEntryId: input.sourceEntryId,
+        agentDefinition: input.agent,
+        name: input.name ?? input.agent,
+        message: input.message,
+        capabilities: { spawning: agentDefinition?.spawning !== false },
+      });
+    },
+    async spawnInitialRequest(input) {
+      if (!isTerminalAvailable()) throw new Error(terminalSetupHint());
+      const parentThinking = pi.getThinkingLevel();
+      if (!THINKING_LEVELS.includes(parentThinking as ThinkingLevel)) {
+        throw new Error(`Unsupported parent thinking level: ${parentThinking}`);
+      }
+      const running = await legacyAgentRunAdapters.launcher.launch({
+        params: {
+          name: input.name ?? input.agent,
+          task: input.message,
+          agent: input.agent,
+        },
+        context: input.context,
+        parentThinking: parentThinking as ThinkingLevel,
+        spawnedInitialRequest: {
+          messageId: input.messageId,
+          sourceEntryId: input.sourceEntryId,
+          message: input.message,
+        },
+      });
+      void superviseLegacyAgentRun(running, legacyAgentRunAdapters);
+      const ownership = running.workflowOwnership;
+      if (!ownership) throw new Error("Spawned Initial Request did not produce durable Agent Run ownership");
+      return {
+        status: "delivered" as const,
+        messageId: input.messageId,
+        recipientAgentId: ownership.agentId,
+        acceptanceSequence: 1,
+      };
+    },
+    prepareEndedRecipient(input) {
+      return reactivateEndedRecipientForRequest(input.request, input.context);
+    },
+  });
 
   // ── subagent tool ──
   if (shouldRegister("subagent"))

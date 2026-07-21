@@ -6,6 +6,7 @@ import {
   AgentSendParams,
   confirmProjectedInboxBatches,
   projectInboxBatch,
+  registerAgentSendTool,
   sessionContainsInboxMessage,
   startDirectSignalRouter,
 } from "../../pi-extension/subagents/protocol/direct-signal-extension.ts";
@@ -119,11 +120,89 @@ describe("direct Signal Pi transcript projection", () => {
       { target: { request: "request" }, message: "answer" },
       { target: { request: "request" }, message: "answer", responseRequired: false },
       { target: { request: "request" }, message: "answer and request", responseRequired: true },
+      { target: { spawn: { agent: "worker" } }, message: "initial request", responseRequired: true },
+      { target: { spawn: { agent: "worker", name: "Research helper" } }, message: "initial request", responseRequired: true },
     ]) assert.equal(Value.Check(AgentSendParams, params), true, JSON.stringify(params));
 
     assert.equal(Value.Check(AgentSendParams, {
       target: { request: "request" }, message: "illegal caller timing", timing: "steer",
     }), false, "Request-target timing must be rejected by the registered schema");
+    assert.equal(Value.Check(AgentSendParams, {
+      target: { spawn: { agent: "worker" } }, message: "empty child", responseRequired: false,
+    }), false, "Spawn must always create its initial Request");
+    assert.equal(Value.Check(AgentSendParams, {
+      target: { spawn: { agent: "worker" } }, message: "illegal spawn timing", timing: "steer", responseRequired: true,
+    }), false, "Spawn-target timing must be rejected by the registered schema");
+  });
+
+  it("routes a legal spawn form through the prepared Spawned Initial Request launcher", async () => {
+    let registered: any;
+    const pi = { registerTool(tool: unknown) { registered = tool; } };
+    const calls: Array<Record<string, unknown>> = [];
+    registerAgentSendTool(pi as never, { async waitUntilReady() {} } as never, true, {
+      async spawnInitialRequest(input) {
+        calls.push(input);
+        return { status: "delivered", messageId: "request-1", recipientAgentId: "child-1", acceptanceSequence: 1 };
+      },
+    });
+
+    const spawnParams = {
+      target: { spawn: { agent: "worker", name: "Worker" } },
+      message: "Initial work.",
+      responseRequired: true,
+    };
+    const result = await registered.execute("tool-1", spawnParams, undefined, undefined, {
+      sessionManager: {
+        getEntries: () => [{ message: { content: [{
+          type: "toolCall", id: "tool-1", name: "agent_send", arguments: spawnParams,
+        }] } }],
+      },
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].agent, "worker");
+    assert.equal(calls[0].name, "Worker");
+    assert.equal(calls[0].message, "Initial work.");
+    assert.match(calls[0].messageId as string, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    assert.notEqual(calls[0].messageId, calls[0].sourceEntryId);
+    assert.equal(calls[0].sourceEntryId, "tool-1");
+    assert.match(result.content[0].text, /Request request-1 delivered/);
+  });
+
+  it("returns a durable spawned-request reconciliation without invoking the launcher", async () => {
+    let registered: any;
+    let launchAttempts = 0;
+    const reconciliationInputs: Array<Record<string, unknown>> = [];
+    const pi = { registerTool(tool: unknown) { registered = tool; } };
+    registerAgentSendTool(pi as never, { async waitUntilReady() {} } as never, true, {
+      async reconcileSpawnedInitialRequest(input) {
+        reconciliationInputs.push(input);
+        return { status: "delivered", messageId: "original-request", recipientAgentId: "original-child", acceptanceSequence: 1 };
+      },
+      async spawnInitialRequest() {
+        launchAttempts += 1;
+        throw new Error("A reconciled Spawned Initial Request must not launch a child");
+      },
+    });
+
+    const spawnParams = {
+      target: { spawn: { agent: "worker", name: "Worker" } },
+      message: "Initial work.",
+      responseRequired: true,
+    };
+    const result = await registered.execute("tool-1", spawnParams, undefined, undefined, {
+      sessionManager: {
+        getEntries: () => [{ message: { content: [{
+          type: "toolCall", id: "tool-1", name: "agent_send", arguments: spawnParams,
+        }] } }],
+      },
+    });
+
+    assert.equal(launchAttempts, 0);
+    assert.deepEqual(reconciliationInputs.map(({ context: _context, ...input }) => input), [{
+      agent: "worker", name: "Worker", message: "Initial work.", sourceEntryId: "tool-1",
+    }]);
+    assert.equal(result.details.messageId, "original-request");
   });
 
   it("recognizes durable Inbox Batch evidence by Message Identity", () => {

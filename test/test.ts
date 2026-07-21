@@ -2169,6 +2169,23 @@ describe("tool registration", () => {
     assert.equal(denied.has("subagent_resume"), true);
   });
 
+  it("retains the durable restricted policy in no-prompt Request reactivation", () => {
+    const command = (subagentsModule as any).__test__.buildRequestReactivationCommand({
+      environment: ["PI_SUBAGENT_ID='resume'"],
+      policy: {
+        toolAllowlist: "read,caller_ping,subagent_done",
+        denyTools: ["subagent", "subagent_interrupt", "subagent_resume"],
+        codingAgentDir: "/restricted/.pi/agent",
+      },
+      sessionPath: "/sessions/child.jsonl",
+    });
+
+    assert.match(command, /--tools 'read,caller_ping,subagent_done'/);
+    assert.match(command, /PI_DENY_TOOLS='subagent,subagent_interrupt,subagent_resume'/);
+    assert.match(command, /PI_CODING_AGENT_DIR='\/restricted\/.pi\/agent'/);
+    assert.match(command, /PI_SUBAGENT_ID='resume'/);
+  });
+
   it("renders partial subagent tool-call args without throwing", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
@@ -2204,6 +2221,20 @@ describe("tool registration", () => {
 });
 
 describe("subagent parent lifecycle", () => {
+  it("keeps a committed request reactivation running when RELEASE acknowledgement is lost", async () => {
+    const events: string[] = [];
+    const testApi = (subagentsModule as any).__test__;
+    await testApi.finalizeCommittedRequestReactivation({
+      ownership: { runId: "resumed-run", epoch: 3 },
+      gate: {
+        async release() { events.push("release"); throw new Error("ack lost"); },
+        async close() { events.push("gate-closed"); },
+      },
+      registerRunning() { events.push("running-and-watcher-installed"); },
+    });
+    assert.deepEqual(events, ["release", "gate-closed", "running-and-watcher-installed"]);
+  });
+
   it("reconciles acknowledged startup failure only after pane termination is confirmed", () => {
     const events: string[] = [];
     const ownership = { runId: "run-1" } as any;

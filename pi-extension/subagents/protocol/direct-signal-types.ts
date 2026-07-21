@@ -18,7 +18,8 @@ export interface InboxBatch {
 }
 
 export interface QueuedSignalReceipt {
-  status: "queued";
+  /** Initial spawned Requests are already represented in the child JSONL. */
+  status: "queued" | "delivered";
   messageId: string;
   recipientAgentId: string;
   acceptanceSequence: number;
@@ -58,6 +59,8 @@ export interface PendingMessagePointer {
   payloadDigest: string;
   deliveryTiming: SignalDeliveryTiming;
   responseRequired: boolean;
+  /** An authorized Request that reopened an interrupted or ended recipient. */
+  reactivatesRecipient: boolean;
   inReplyToRequestId?: string;
   acceptanceSequence: number;
   acceptedAtMs: number;
