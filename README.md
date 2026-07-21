@@ -110,7 +110,7 @@ Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global**
 1. Agent calls subagent()          → returns immediately ("started")
 2. Sub-agent runs in herdr pane    → widget shows live status
 3. User keeps chatting             → main session fully interactive
-4. Sub-agent finishes              → result steered back as a normal completion/failure
+4. Sub-agent explicitly exits      → result steered back; ordinary settlement stays open
 5. Main agent processes result     → continues with new context
 ```
 
@@ -239,7 +239,7 @@ subagent_interrupt({ id: "abcd1234" });
 subagent_interrupt({ name: "Scout" });
 ```
 
-This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately labels the child as `interrupted` (counted as **open**, not active processing). Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt. The process elapsed timer keeps running because the pane is still open; only the interrupted-state duration freezes relative to the interrupt request. If the child starts work later, newer observations return it to `active`; completion, failure, and `caller_ping` still flow through normally.
+This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. The request itself does not claim success: canonical state becomes `interrupted` only after Pi confirms the active turn aborted and fully settled. Until then, status remains active or waiting according to confirmed evidence. If the child starts work later, the durable activation returns to `active`; explicit exit and `caller_ping` still flow through the legacy result path.
 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 

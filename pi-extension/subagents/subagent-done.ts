@@ -8,6 +8,35 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { WorkflowBootstrap } from "./protocol/workflow-bootstrap.ts";
+import { latestAssistantTurnWasAborted } from "./protocol/pi-activation-events.ts";
+import {
+  confirmProjectedInboxBatches,
+  registerAgentSendTool,
+  startDirectSignalRouter,
+} from "./protocol/direct-signal-extension.ts";
+
+const RELOAD_SAFE_WORKFLOW_BOOTSTRAP = Symbol.for(
+  "pi-herdr-subagents.child-workflow-bootstrap",
+);
+
+export function getReloadSafeWorkflowBootstrap(): WorkflowBootstrap {
+  const globalState = globalThis as any;
+  return globalState[RELOAD_SAFE_WORKFLOW_BOOTSTRAP] ??=
+    new WorkflowBootstrap();
+}
+
+export function releaseReloadSafeWorkflowBootstrap(
+  workflowBootstrap: WorkflowBootstrap,
+  reason: unknown,
+): void {
+  if (reason === "reload") return;
+  workflowBootstrap.close();
+  const globalState = globalThis as any;
+  if (globalState[RELOAD_SAFE_WORKFLOW_BOOTSTRAP] === workflowBootstrap) {
+    delete globalState[RELOAD_SAFE_WORKFLOW_BOOTSTRAP];
+  }
+}
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -150,9 +179,17 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let latestAgentRunWasAborted = false;
+  const workflowBootstrap = getReloadSafeWorkflowBootstrap();
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    workflowBootstrap.sessionStarted(ctx);
+    if (ctx.sessionManager.getSessionFile()) {
+      void startDirectSignalRouter(pi, workflowBootstrap, ctx).catch((error) => {
+        ctx.ui.notify(`Direct Signal Router failed to start: ${(error as Error).message}`, "error");
+      });
+    }
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -169,17 +206,31 @@ export default function (pi: ExtensionAPI) {
     userTookOver = true;
   });
 
-  pi.on("before_agent_start", () => {
+  pi.on("before_agent_start", (_event, ctx) => {
+    if (workflowBootstrap.workflow) {
+      confirmProjectedInboxBatches(workflowBootstrap, ctx.sessionManager.getEntries());
+    }
     recorder.beforeAgentStart();
   });
 
-  pi.on("agent_start", () => {
+  pi.on("context", (event) => {
+    if (workflowBootstrap.workflow) {
+      confirmProjectedInboxBatches(workflowBootstrap, event.messages);
+    }
+  });
+
+  pi.on("agent_start", (_event, ctx) => {
     agentStarted = true;
     recorder.agentStart();
+    if (workflowBootstrap.workflow) {
+      confirmProjectedInboxBatches(workflowBootstrap, ctx.sessionManager.getEntries());
+      workflowBootstrap.currentTurnStarted();
+    }
   });
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
+    latestAgentRunWasAborted = latestAssistantTurnWasAborted(messages);
     const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
@@ -212,6 +263,13 @@ export default function (pi: ExtensionAPI) {
       // the latest agent turn completed normally, not by who initiated it.
       userTookOver = false;
     }
+  });
+
+  pi.on("agent_settled", () => {
+    if (workflowBootstrap.workflow) {
+      workflowBootstrap.currentTurnSettled(latestAgentRunWasAborted);
+    }
+    latestAgentRunWasAborted = false;
   });
 
   pi.on("turn_start", (event) => {
@@ -254,8 +312,14 @@ export default function (pi: ExtensionAPI) {
     recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
   });
 
-  pi.on("session_shutdown", (event) => {
-    recorder.sessionShutdown((event as any).reason);
+  pi.on("session_shutdown", async (event) => {
+    const reason = (event as any).reason;
+    recorder.sessionShutdown(reason);
+    try {
+      if (reason !== "reload") await workflowBootstrap.closeDirectSignalRouter();
+    } finally {
+      releaseReloadSafeWorkflowBootstrap(workflowBootstrap, reason);
+    }
   });
 
   // Toggle expand/collapse with Ctrl+J
@@ -266,6 +330,12 @@ export default function (pi: ExtensionAPI) {
       renderWidget(ctx, null);
     },
   });
+
+  registerAgentSendTool(
+    pi,
+    workflowBootstrap,
+    !parseDeniedTools(deniedToolsValue).includes("agent_send"),
+  );
 
   pi.registerTool({
     name: "caller_ping",

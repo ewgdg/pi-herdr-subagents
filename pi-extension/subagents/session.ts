@@ -17,7 +17,8 @@ export interface MessageEntry extends SessionEntry {
   };
 }
 
-export type SeededSubagentSessionMode = "lineage-only" | "fork";
+export type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
+export type SeededSubagentSessionMode = Exclude<SubagentSessionMode, "standalone">;
 
 function getForkContentLines(parentSessionFile: string): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
@@ -51,20 +52,39 @@ export function seedSubagentSessionFile(params: {
   childSessionFile: string;
   childCwd: string;
 }): void {
+  initializeSubagentSessionFile(params);
+}
+
+export function initializeSubagentSessionFile(params: {
+  mode: SubagentSessionMode;
+  parentSessionFile?: string;
+  childSessionFile: string;
+  childCwd: string;
+  childSessionId?: string;
+  timestamp?: string;
+}): string {
+  if (params.mode !== "standalone" && !params.parentSessionFile) {
+    throw new Error(`${params.mode} session creation requires a parent session file`);
+  }
+  const childSessionId = params.childSessionId ?? randomUUID();
   const header = {
     type: "session",
     version: 3,
-    id: randomUUID(),
-    timestamp: new Date().toISOString(),
+    id: childSessionId,
+    timestamp: params.timestamp ?? new Date().toISOString(),
     cwd: params.childCwd,
-    parentSession: params.parentSessionFile,
+    ...(params.mode === "standalone"
+      ? {}
+      : { parentSession: params.parentSessionFile }),
   };
-  const contentLines =
-    params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
+  const contentLines = params.mode === "fork"
+    ? getForkContentLines(params.parentSessionFile!)
+    : [];
   const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
   writeFileSync(params.childSessionFile, lines.join("\n") + "\n", "utf8");
+  return childSessionId;
 }
 
 function readEntries(sessionFile: string): SessionEntry[] {
@@ -184,6 +204,43 @@ export function copySessionFile(sessionFile: string, destDir: string): string {
   const dest = join(destDir, `subagent-${id}.jsonl`);
   copyFileSync(sessionFile, dest);
   return dest;
+}
+
+/**
+ * Clone a session transcript with a fresh Pi session identity.
+ *
+ * A byte-for-byte copy is not a new Agent: Pi keys Agent identity from the
+ * session header UUID. Keep copySessionFile available for file isolation, but
+ * use this helper whenever a new session/Agent is intended.
+ */
+export function cloneSessionFile(
+  sessionFile: string,
+  destination: string,
+  options: { sessionId?: string; timestamp?: string } = {},
+): string {
+  const lines = readFileSync(sessionFile, "utf8").split("\n");
+  const headerIndex = lines.findIndex((line) => line.trim());
+  if (headerIndex < 0) throw new Error(`Session transcript is empty: ${sessionFile}`);
+
+  let header: Record<string, unknown>;
+  try {
+    header = JSON.parse(lines[headerIndex]) as Record<string, unknown>;
+  } catch {
+    throw new Error(`Session transcript starts with invalid JSON: ${sessionFile}`);
+  }
+  if (header.type !== "session") {
+    throw new Error(`Session transcript has no session header: ${sessionFile}`);
+  }
+
+  lines[headerIndex] = JSON.stringify({
+    ...header,
+    id: options.sessionId ?? randomUUID(),
+    timestamp: options.timestamp ?? new Date().toISOString(),
+    parentSession: sessionFile,
+  });
+  mkdirSync(dirname(destination), { recursive: true });
+  writeFileSync(destination, lines.join("\n"), "utf8");
+  return destination;
 }
 
 /**

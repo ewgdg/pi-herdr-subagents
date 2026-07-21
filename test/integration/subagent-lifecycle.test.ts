@@ -7,12 +7,12 @@
  *
  * Duration: ~30-120s per test, depending on the selected model.
  *
- * Run `PI_TEST_MODEL="deepseek/deepseek-v4-flash" PI_TEST_TIMEOUT=180000
+ * Run `PI_TEST_MODEL="openai-codex/gpt-5.6-luna" PI_TEST_TIMEOUT=180000
  * npm run test:integration` from inside herdr. The explicit model keeps
  * real-LLM runs predictable and the longer timeout covers the lifecycle suite.
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: openrouter/free; recommended: deepseek/deepseek-v4-flash)
+ *   PI_TEST_MODEL     — model for all pi sessions (default: openrouter/free; recommended: openai-codex/gpt-5.6-luna)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";
@@ -72,7 +72,7 @@ for (const backend of backends) {
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Echo-${id}"`,
         `  agent: "test-echo"`,
-        `  task: "Run this bash command: echo 'PASS_${id}' > '${markerFile}'"`,
+        `  task: "Run this bash command: echo 'PASS_${id}' > '${markerFile}'. Then call subagent_done."`,
         `Do not do anything else. Just call the subagent tool once.`,
         `After you receive the subagent result, say INTEGRATION_COMPLETE.`,
       ].join("\n");
@@ -124,7 +124,7 @@ for (const backend of backends) {
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Status-${id}"`,
         `  agent: "test-echo"`,
-        `  task: "Run this bash command: echo 'START_${id}' > '${startFile}'; sleep 90; echo 'STATUS_${id}' > '${markerFile}'"`,
+        `  task: "Run this bash command: echo 'START_${id}' > '${startFile}'; sleep 90; echo 'STATUS_${id}' > '${markerFile}'. Then call subagent_done."`,
         `Do not do anything else. Just call the subagent tool once.`,
         `After you receive the subagent result, say STATUS_TEST_DONE.`,
       ].join("\n");
@@ -171,12 +171,12 @@ for (const backend of backends) {
         `First call:`,
         `  name: "ParaA-${id}"`,
         `  agent: "test-echo"`,
-        `  task: "Run: echo 'DONE_A_${id}' > '${fileA}'"`,
+        `  task: "Run: echo 'DONE_A_${id}' > '${fileA}'. Then call subagent_done."`,
         ``,
         `Second call:`,
         `  name: "ParaB-${id}"`,
         `  agent: "test-echo"`,
-        `  task: "Run: echo 'DONE_B_${id}' > '${fileB}'"`,
+        `  task: "Run: echo 'DONE_B_${id}' > '${fileB}'. Then call subagent_done."`,
         ``,
         `Call both subagent tools NOW, do not wait between them.`,
       ].join("\n");
@@ -207,7 +207,7 @@ for (const backend of backends) {
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Fork-${id}"`,
         `  fork: true`,
-        `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
+        `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'. Then call subagent_done."`,
         `Do not set the agent or interactive parameters. Just set name, fork, and task.`,
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
@@ -295,14 +295,14 @@ for (const backend of backends) {
         `Then call the subagent tool:`,
         `  name: "Disco-${id}"`,
         `  agent: "test-echo"`,
-        `  task: "Run: echo 'DISCO_${id}' > '${markerFile}'"`,
+        `  task: "Run: echo 'DISCO_${id}' > '${markerFile}'. Then call subagent_done."`,
         `After you receive the subagent result, say DISCOVERY_DONE.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
 
       // The test-echo agent (discovered from project .pi/agents/) should work
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
+      const content = await waitForFile(markerFile, PI_TIMEOUT, new RegExp(`DISCO_${id}`));
       assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
     });
 
@@ -321,7 +321,7 @@ for (const backend of backends) {
         `  name: "SysP-${id}"`,
         `  agent: "test-echo"`,
         `  systemPrompt: "Always start your response with CUSTOM_PROMPT_ACTIVE."`,
-        `  task: "Write 'SYSPROMPT_${id}' to ${markerFile} using bash: echo 'SYSPROMPT_${id}' > '${markerFile}'"`,
+        `  task: "Write 'SYSPROMPT_${id}' to ${markerFile} using bash: echo 'SYSPROMPT_${id}' > '${markerFile}'. Then call subagent_done."`,
         `After the subagent completes, say SYSPROMPT_TEST_DONE.`,
       ].join("\n");
 

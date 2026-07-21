@@ -1,0 +1,629 @@
+import assert from "node:assert/strict";
+import { copyFileSync, existsSync, symlinkSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { afterEach, describe, it } from "node:test";
+import {
+  hasConfirmedAgentRunTermination,
+  superviseLegacyAgentRun,
+} from "../../pi-extension/subagents/legacy-agent-run.ts";
+import {
+  WorkflowBootstrap,
+  type WorkflowBootstrapContext,
+} from "../../pi-extension/subagents/protocol/workflow-bootstrap.ts";
+import { initializeSubagentSessionFile } from "../../pi-extension/subagents/session.ts";
+import { bindNewWorkflowSession } from "../../pi-extension/subagents/protocol/workflow-session-binding.ts";
+import { DeterministicIdentityFactory, ManualClock } from "./scenario-harness.ts";
+
+const temporaryDirectories: string[] = [];
+
+async function temporaryDirectory(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "pi-herdr-bootstrap-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories.splice(0).map((directory) =>
+      rm(directory, { recursive: true, force: true })),
+  );
+});
+
+function context(sessionId: string, sessionPath: string): WorkflowBootstrapContext {
+  return {
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getSessionFile: () => sessionPath,
+    },
+  };
+}
+
+describe("production Workflow bootstrap", () => {
+  it("leaves ephemeral Pi sessions unbound without retrying forever", async () => {
+    const bootstrap = new WorkflowBootstrap();
+    const ephemeralContext = {
+      sessionManager: {
+        getSessionId: () => "00000000-0000-4000-8000-000000000001",
+        getSessionFile: () => null,
+      },
+    };
+    bootstrap.sessionStarted(ephemeralContext);
+
+    assert.equal(bootstrap.workflow, undefined);
+    await assert.rejects(
+      bootstrap.waitUntilReady(ephemeralContext),
+      /requires a persistent Pi session file/,
+    );
+    bootstrap.close();
+  });
+
+  it("retries Owner bootstrap after Pi creates the persistent transcript", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "delayed-owner.jsonl");
+    const bootstrap = new WorkflowBootstrap();
+
+    bootstrap.sessionStarted(context(ownerId, ownerPath));
+    assert.equal(bootstrap.workflow, undefined);
+
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: ownerPath,
+      childCwd: root,
+      childSessionId: ownerId,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+
+    assert.equal(bootstrap.workflow?.ownerAgentId, ownerId);
+    bootstrap.close();
+  });
+
+  it("waits for delayed session persistence before reporting readiness", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "delayed-owner.jsonl");
+    const bootstrap = new WorkflowBootstrap();
+    const ready = bootstrap.waitUntilReady(context(ownerId, ownerPath));
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: ownerPath,
+      childCwd: root,
+      childSessionId: ownerId,
+    });
+    await ready;
+
+    assert.equal(bootstrap.workflow?.ownerAgentId, ownerId);
+    bootstrap.close();
+  });
+
+  it("rolls back membership and session artifacts for an abandoned spawn", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: ownerPath,
+      childCwd: root,
+      childSessionId: ownerId,
+    });
+    const bootstrap = new WorkflowBootstrap();
+    bootstrap.sessionStarted(context(ownerId, ownerPath));
+    const childId = identities.next();
+    const childPath = join(bootstrap.workflow!.sessionsDirectory, "abandoned.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: childPath,
+      childCwd: root,
+      childSessionId: childId,
+    });
+    const prepared = bootstrap.prepareSpawn({
+      agentId: childId,
+      sessionPath: childPath,
+      name: "Abandoned",
+      runId: "abandoned-run",
+      surface: "abandoned-surface",
+      sessionBinding: bindNewWorkflowSession({
+        workflowOwnerId: ownerId,
+        agentId: childId,
+        sessionPath: childPath,
+      }),
+    });
+
+    bootstrap.abandonPreparedRun(prepared);
+
+    assert.equal(existsSync(childPath), false);
+    assert.equal(existsSync(`${childPath}.workflow.json`), false);
+    assert.throws(() => bootstrap.inspect(childId), (error: unknown) =>
+      (error as { code?: string }).code === "UnknownAgent");
+    bootstrap.close();
+  });
+
+  it("cleans session artifacts when a direct Spawner rejects a child", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: ownerPath, childCwd: root, childSessionId: ownerId });
+    const owner = new WorkflowBootstrap();
+    owner.sessionStarted(context(ownerId, ownerPath));
+
+    const parentId = identities.next();
+    const parentPath = join(owner.workflow!.sessionsDirectory, "parent.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: parentPath, childCwd: root, childSessionId: parentId });
+    const parentRun = owner.prepareSpawn({
+      agentId: parentId,
+      sessionPath: parentPath,
+      runId: "parent-run",
+      name: "Parent",
+      capabilities: { spawning: false },
+      surface: "parent-surface",
+      sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: parentId, sessionPath: parentPath }),
+    });
+    const parent = new WorkflowBootstrap();
+    parent.sessionStarted(context(parentId, parentPath), parentRun.environment);
+
+    const childId = identities.next();
+    const childPath = join(parent.workflow!.sessionsDirectory, "rejected.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: childPath, childCwd: root, childSessionId: childId });
+    const binding = bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: childId, sessionPath: childPath });
+    assert.throws(
+      () => parent.prepareSpawn({ agentId: childId, sessionPath: childPath, name: "Rejected", runId: "rejected-run", surface: "rejected-surface", sessionBinding: binding }),
+      (error: unknown) => (error as { code?: string }).code === "SpawnerCapabilityRequired",
+    );
+    assert.equal(existsSync(childPath), false);
+    assert.equal(existsSync(`${childPath}.workflow.json`), false);
+
+    parent.close();
+    owner.runTerminated(parentRun.ownership, true);
+    owner.close();
+  });
+
+  it("opens durable Owner state and prepares fenced direct-child runs", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const clock = new ManualClock();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: ownerPath,
+      childCwd: root,
+      childSessionId: ownerId,
+      timestamp: new Date(clock.now()).toISOString(),
+    });
+    const bootstrap = new WorkflowBootstrap({ now: clock.now });
+    bootstrap.sessionStarted(context(ownerId, ownerPath));
+    const childId = identities.next();
+    const childPath = join(bootstrap.workflow!.sessionsDirectory, "child.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: childPath,
+      childCwd: root,
+      childSessionId: childId,
+      timestamp: new Date(clock.now()).toISOString(),
+    });
+
+    const prepared = bootstrap.prepareSpawn({
+      agentId: childId,
+      sessionPath: childPath,
+      runId: "run-one",
+      name: "Child",
+      agentDefinition: "worker",
+      capabilities: { spawning: false },
+      surface: "child-surface",
+      sessionBinding: bindNewWorkflowSession({
+        workflowOwnerId: ownerId,
+        agentId: childId,
+        sessionPath: childPath,
+      }),
+    });
+
+    assert.equal(bootstrap.inspect(childId).spawnerAgentId, ownerId);
+    assert.deepEqual(bootstrap.inspect(childId).capabilities, { spawning: false });
+    assert.equal(prepared.environment.PI_WORKFLOW_OWNER_SESSION_ID, ownerId);
+    assert.equal(prepared.environment.PI_WORKFLOW_OWNER_SESSION_PATH, ownerPath);
+    assert.equal(prepared.environment.PI_WORKFLOW_RUN_ID, "run-one");
+
+    const competing = new WorkflowBootstrap({ now: clock.now });
+    competing.sessionStarted(context(ownerId, ownerPath));
+    const copiedSessionPath = join(root, "copied-child.jsonl");
+    copyFileSync(childPath, copiedSessionPath);
+    await assert.rejects(
+      competing.prepareResume({
+        sessionPath: copiedSessionPath,
+        runId: "copied-run",
+        surface: "copied-surface",
+      }),
+      (error: unknown) => (error as { code?: string }).code === "InvalidSessionIdentity",
+    );
+    await assert.rejects(
+      competing.prepareResume({
+        sessionPath: childPath,
+        runId: "run-two",
+        surface: "run-two-surface",
+      }),
+      (error: unknown) => (error as { code?: string }).code === "AgentRunAlreadyOwned",
+    );
+
+    bootstrap.runTerminated(prepared.ownership, false);
+    await assert.rejects(
+      competing.prepareResume({
+        sessionPath: childPath,
+        runId: "still-blocked",
+        surface: "blocked-surface",
+      }),
+      (error: unknown) => (error as { code?: string }).code === "AgentRunAlreadyOwned",
+    );
+    bootstrap.runTerminated(prepared.ownership, true);
+    const symlinkedSessionPath = join(root, "linked-child.jsonl");
+    symlinkSync(childPath, symlinkedSessionPath);
+    const replacement = await competing.prepareResume({
+      sessionPath: symlinkedSessionPath,
+      runId: "run-three",
+      surface: "run-three-surface",
+    });
+    assert.equal(replacement.sessionPath, childPath);
+    assert.ok(replacement.ownership.epoch > prepared.ownership.epoch);
+    competing.runTerminated(replacement.ownership, true);
+    competing.close();
+    bootstrap.close();
+  });
+
+  it("opens a spawned member session as the direct Spawner for nested work", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: ownerPath,
+      childCwd: root,
+      childSessionId: ownerId,
+    });
+    const ownerBootstrap = new WorkflowBootstrap();
+    ownerBootstrap.sessionStarted(context(ownerId, ownerPath));
+    const parentId = identities.next();
+    const parentPath = join(ownerBootstrap.workflow!.sessionsDirectory, "parent.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: parentPath,
+      childCwd: root,
+      childSessionId: parentId,
+    });
+    const parentRun = ownerBootstrap.prepareSpawn({
+      agentId: parentId,
+      sessionPath: parentPath,
+      runId: "parent-run",
+      name: "Parent",
+      capabilities: { spawning: true },
+      surface: "parent-surface",
+      sessionBinding: bindNewWorkflowSession({
+        workflowOwnerId: ownerId,
+        agentId: parentId,
+        sessionPath: parentPath,
+      }),
+    });
+    const parentBootstrap = new WorkflowBootstrap();
+    parentBootstrap.sessionStarted(context(parentId, parentPath), parentRun.environment);
+    const childId = identities.next();
+    const childPath = join(parentBootstrap.workflow!.sessionsDirectory, "nested.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: childPath,
+      childCwd: root,
+      childSessionId: childId,
+    });
+
+    const nestedRun = parentBootstrap.prepareSpawn({
+      agentId: childId,
+      sessionPath: childPath,
+      runId: "nested-run",
+      name: "Nested",
+      surface: "nested-surface",
+      sessionBinding: bindNewWorkflowSession({
+        workflowOwnerId: ownerId,
+        agentId: childId,
+        sessionPath: childPath,
+      }),
+    });
+
+    assert.equal(ownerBootstrap.inspect(childId).spawnerAgentId, parentId);
+    parentBootstrap.runTerminated(nestedRun.ownership, true);
+    parentBootstrap.close();
+    ownerBootstrap.runTerminated(parentRun.ownership, true);
+
+    const resumedParent = new WorkflowBootstrap();
+    resumedParent.sessionStarted(context(parentId, parentPath));
+    assert.equal(resumedParent.currentAgentId, parentId);
+    assert.equal(resumedParent.workflow?.ownerAgentId, ownerId);
+    assert.equal(resumedParent.inspect(childId).spawnerAgentId, parentId);
+    resumedParent.close();
+    ownerBootstrap.close();
+  });
+
+  it("binds Pi turn events to the durable activation lifecycle", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: ownerPath,
+      childCwd: root,
+      childSessionId: ownerId,
+    });
+    const owner = new WorkflowBootstrap();
+    owner.sessionStarted(context(ownerId, ownerPath));
+    assert.equal(owner.currentTurnStarted(), undefined);
+    assert.deepEqual(owner.currentTurnSettled(false), { kind: "owner-turn-settled" });
+
+    const childId = identities.next();
+    const childPath = join(owner.workflow!.sessionsDirectory, "child.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: childPath,
+      childCwd: root,
+      childSessionId: childId,
+    });
+    const prepared = owner.prepareSpawn({
+      agentId: childId,
+      sessionPath: childPath,
+      runId: "child-run",
+      surface: "child-surface",
+      name: "Child",
+      sessionBinding: bindNewWorkflowSession({
+        workflowOwnerId: ownerId,
+        agentId: childId,
+        sessionPath: childPath,
+      }),
+    });
+    owner.runStarted(prepared.ownership);
+
+    const child = new WorkflowBootstrap();
+    child.sessionStarted(context(childId, childPath), prepared.environment);
+    assert.equal(child.currentTurnStarted()?.state.kind, "active");
+    const waiting = child.currentTurnSettled(false);
+    assert.equal("state" in waiting, true);
+    if (!("state" in waiting)) assert.fail("Subagent settlement must return an activation");
+    assert.deepEqual(waiting.state, {
+      kind: "waiting",
+      dependencies: [{ kind: "human", dependencyId: "human" }],
+    });
+
+    child.currentTurnStarted();
+    owner.requestInterruption(prepared.ownership);
+    assert.equal(owner.inspectActivation(childId)?.state.kind, "active");
+    const interrupted = child.currentTurnSettled(true);
+    assert.equal("state" in interrupted, true);
+    if (!("state" in interrupted)) assert.fail("Subagent interruption must return an activation");
+    assert.equal(interrupted.state.kind, "interrupted");
+
+    child.close();
+    owner.runTerminated(prepared.ownership, true);
+    assert.deepEqual(owner.inspectActivation(childId)?.state, {
+      kind: "ended",
+      outcome: "failed",
+      error: "Agent Run runtime closed without committed completion or cancellation",
+    });
+    owner.close();
+  });
+
+  it("fails and releases a manually opened descendant when its runtime closes", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: ownerPath,
+      childCwd: root,
+      childSessionId: ownerId,
+    });
+    const owner = new WorkflowBootstrap();
+    owner.sessionStarted(context(ownerId, ownerPath));
+    const childId = identities.next();
+    const childPath = join(owner.workflow!.sessionsDirectory, "child.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: childPath,
+      childCwd: root,
+      childSessionId: childId,
+    });
+    const prepared = owner.prepareSpawn({
+      agentId: childId,
+      sessionPath: childPath,
+      runId: "prepared-run",
+      surface: "prepared-surface",
+      name: "Child",
+      sessionBinding: bindNewWorkflowSession({
+        workflowOwnerId: ownerId,
+        agentId: childId,
+        sessionPath: childPath,
+      }),
+    });
+    owner.runTerminated(prepared.ownership, true);
+
+    const manual = new WorkflowBootstrap();
+    manual.sessionStarted(context(childId, childPath));
+    assert.equal(manual.inspectActivation(childId)?.state.kind, "active");
+    manual.close();
+    assert.equal(owner.inspectActivation(childId)?.state.kind, "ended");
+
+    const resumed = await owner.prepareResume({
+      sessionPath: childPath,
+      runId: "resumed-run",
+      surface: "resumed-surface",
+    });
+    owner.runTerminated(resumed.ownership, true);
+    owner.close();
+  });
+
+  it("releases manual ownership when activation startup fails", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: ownerPath,
+      childCwd: root,
+      childSessionId: ownerId,
+    });
+    const owner = new WorkflowBootstrap();
+    owner.sessionStarted(context(ownerId, ownerPath));
+    const childId = identities.next();
+    const childPath = join(owner.workflow!.sessionsDirectory, "child.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: childPath,
+      childCwd: root,
+      childSessionId: childId,
+    });
+    const prepared = owner.prepareSpawn({
+      agentId: childId,
+      sessionPath: childPath,
+      runId: "prepared-run",
+      surface: "prepared-surface",
+      name: "Child",
+      sessionBinding: bindNewWorkflowSession({
+        workflowOwnerId: ownerId,
+        agentId: childId,
+        sessionPath: childPath,
+      }),
+    });
+    owner.runTerminated(prepared.ownership, true);
+
+    const database = new DatabaseSync(owner.workflow!.databasePath);
+    database.exec(`
+      CREATE TRIGGER reject_manual_activation
+      BEFORE INSERT ON agent_activations
+      BEGIN
+        SELECT RAISE(ABORT, 'forced activation startup failure');
+      END
+    `);
+    const manual = new WorkflowBootstrap();
+    assert.throws(
+      () => manual.sessionStarted(context(childId, childPath)),
+      /forced activation startup failure/,
+    );
+    database.exec("DROP TRIGGER reject_manual_activation");
+    database.close();
+
+    const resumed = await owner.prepareResume({
+      sessionPath: childPath,
+      runId: "resumed-after-failure",
+      surface: "resumed-surface",
+    });
+    owner.runTerminated(resumed.ownership, true);
+    manual.close();
+    owner.close();
+  });
+
+  it("releases after closed-bootstrap confirmation and reconciles later confirmed process exit", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: ownerPath,
+      childCwd: root,
+      childSessionId: ownerId,
+    });
+    const owner = new WorkflowBootstrap();
+    owner.sessionStarted(context(ownerId, ownerPath));
+    const childId = identities.next();
+    const childPath = join(owner.workflow!.sessionsDirectory, "child.jsonl");
+    initializeSubagentSessionFile({
+      mode: "standalone",
+      childSessionFile: childPath,
+      childCwd: root,
+      childSessionId: childId,
+    });
+    const first = owner.prepareSpawn({
+      agentId: childId,
+      sessionPath: childPath,
+      runId: "first-run",
+      surface: "first-surface",
+      name: "Child",
+      sessionBinding: bindNewWorkflowSession({
+        workflowOwnerId: ownerId,
+        agentId: childId,
+        sessionPath: childPath,
+      }),
+    });
+
+    owner.close();
+    owner.runTerminated(first.ownership, true);
+
+    const strandedOwner = new WorkflowBootstrap();
+    strandedOwner.sessionStarted(context(ownerId, ownerPath));
+    const stranded = await strandedOwner.prepareResume({
+      sessionPath: childPath,
+      runId: "stranded-run",
+      surface: "stranded-surface",
+    });
+    strandedOwner.close();
+
+    let inspectedSurface: string | undefined;
+    const recoveredOwner = new WorkflowBootstrap({
+      async confirmRunTerminated(locator) {
+        inspectedSurface = locator.surface;
+        return true;
+      },
+    });
+    recoveredOwner.sessionStarted(context(ownerId, ownerPath));
+    const recovered = await recoveredOwner.prepareResume({
+      sessionPath: childPath,
+      runId: "recovered-run",
+      surface: "recovered-surface",
+    });
+
+    assert.equal(inspectedSurface, "stranded-surface");
+    assert.ok(recovered.ownership.epoch > stranded.ownership.epoch);
+    recoveredOwner.runTerminated(recovered.ownership, true);
+    recoveredOwner.close();
+  });
+
+  it("runs the ownership completion hook before legacy result relay", async () => {
+    const events: string[] = [];
+    const run = {};
+    await superviseLegacyAgentRun(run, {
+      supervisor: {
+        async watch() {
+          events.push("watched");
+          return { exitCode: 0 };
+        },
+      },
+      ownership: {
+        watchCompleted() {
+          events.push("released");
+        },
+      },
+      resultRelay: {
+        completed() {
+          events.push("relayed");
+        },
+        failed() {
+          assert.fail("successful supervision must not relay failure");
+        },
+      },
+      ui: { runStarted() {} },
+    });
+
+    assert.deepEqual(events, ["watched", "released", "relayed"]);
+  });
+
+  it("releases ownership only from explicit confirmed termination evidence", () => {
+    assert.equal(hasConfirmedAgentRunTermination({ termination: "confirmed" }), true);
+    assert.equal(hasConfirmedAgentRunTermination({ termination: "uncertain" }), false);
+  });
+});
