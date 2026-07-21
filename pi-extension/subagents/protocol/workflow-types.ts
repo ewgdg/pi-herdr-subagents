@@ -45,7 +45,11 @@ export type WorkflowProtocolErrorCode =
   | "ActivationAlreadyOpen"
   | "InvalidLifecycleTransition"
   | "StaleLifecycleTransition"
-  | "UnknownLifecycleDependency";
+  | "UnknownLifecycleDependency"
+  | "RecipientUnreachable"
+  | "RecipientEnded"
+  | "MessageIdentityConflict"
+  | "InvalidMessageSource";
 
 export class WorkflowProtocolError extends Error {
   readonly code: WorkflowProtocolErrorCode;

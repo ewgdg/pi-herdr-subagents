@@ -16,6 +16,11 @@ import {
   type AgentRunOwnership,
   type WorkflowRecord,
 } from "./workflow-control-plane.ts";
+import {
+  DirectSignalRuntime,
+  type InboxBatch,
+  type QueuedSignalReceipt,
+} from "./direct-signal.ts";
 
 export const WORKFLOW_OWNER_SESSION_ID_ENV = "PI_WORKFLOW_OWNER_SESSION_ID";
 export const WORKFLOW_OWNER_SESSION_PATH_ENV = "PI_WORKFLOW_OWNER_SESSION_PATH";
@@ -67,6 +72,7 @@ export class WorkflowBootstrap {
   #sessionPath: string | undefined;
   #selfOwnership: AgentRunOwnership | undefined;
   #sessionBootstrapTimer: ReturnType<typeof setTimeout> | undefined;
+  #directSignals: DirectSignalRuntime | undefined;
   readonly #workflowDatabases = new Map<string, string>();
 
   constructor(options: {
@@ -186,6 +192,12 @@ export class WorkflowBootstrap {
   }
 
   close(): void {
+    if (this.#directSignals) {
+      void Promise.resolve(this.#directSignals.close()).catch((error) => {
+        process.emitWarning(`Direct Signal Router cleanup failed: ${(error as Error).message}`);
+      });
+    }
+    this.#directSignals = undefined;
     if (this.#controlPlane && this.#selfOwnership) {
       const activation = this.#controlPlane.inspectActivation(
         this.#controlPlane.agent(this.#selfOwnership.agentId),
@@ -213,6 +225,38 @@ export class WorkflowBootstrap {
   inspectActivation(agentId: string): ActivationRecord | undefined {
     const controlPlane = this.#requireControlPlane();
     return controlPlane.inspectActivation(controlPlane.agent(agentId));
+  }
+
+  async startDirectSignalRouter(input: {
+    projectInboxBatch(batch: InboxBatch): void;
+    wakeRecipient?: () => void;
+  }): Promise<void> {
+    const runtime = this.#directSignalRuntime();
+    runtime.configureInboxDelivery(input);
+    await runtime.start();
+  }
+
+  sendDirectSignal(input: {
+    targetAgentId: string;
+    message: string;
+    sourceEntryId: string;
+  }): Promise<QueuedSignalReceipt> {
+    const controlPlane = this.#requireControlPlane();
+    return this.#directSignalRuntime().sendSignal({
+      target: controlPlane.agent(input.targetAgentId),
+      message: input.message,
+      sourceEntryId: input.sourceEntryId,
+    });
+  }
+
+  confirmDirectSignalDelivery(messageId: string): boolean {
+    return this.#directSignalRuntime().confirmDelivery(messageId);
+  }
+
+  async closeDirectSignalRouter(): Promise<void> {
+    const runtime = this.#directSignals;
+    this.#directSignals = undefined;
+    if (runtime) await runtime.close();
   }
 
   runStarted(ownership: AgentRunOwnership): ActivationRecord {
@@ -398,6 +442,17 @@ export class WorkflowBootstrap {
       throw new Error("Current Subagent Agent Run ownership is unavailable");
     }
     return this.#selfOwnership;
+  }
+
+  #directSignalRuntime(): DirectSignalRuntime {
+    if (this.#directSignals) return this.#directSignals;
+    const controlPlane = this.#requireControlPlane();
+    this.#directSignals = new DirectSignalRuntime({
+      controlPlane,
+      ownership: this.#selfOwnership,
+      now: this.#now,
+    });
+    return this.#directSignals;
   }
 
   #scheduleSessionBootstrap(

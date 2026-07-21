@@ -88,6 +88,11 @@ import {
 import { WorkflowBootstrap } from "./protocol/workflow-bootstrap.ts";
 import { latestAssistantTurnWasAborted } from "./protocol/pi-activation-events.ts";
 import { bindNewWorkflowSession } from "./protocol/workflow-session-binding.ts";
+import {
+  confirmProjectedInboxBatches,
+  registerAgentSendTool,
+  startDirectSignalRouter,
+} from "./protocol/direct-signal-extension.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -1822,13 +1827,39 @@ function subagentsExtensionWithOptions(
   // subagents whose watchers survived a reload.
   pi.on("session_start", (_event, ctx) => {
     legacyAgentRunAdapters.ui.sessionStarted(ctx);
+    if (ctx.sessionManager?.getSessionFile?.()) {
+      void startDirectSignalRouter(pi, runtime.workflowBootstrap, ctx).catch((error) => {
+        ctx.ui.notify(`Direct Signal Router failed to start: ${(error as Error).message}`, "error");
+      });
+    }
+  });
+
+  pi.on("before_agent_start", (_event, ctx) => {
+    if (runtime.workflowBootstrap.workflow) {
+      confirmProjectedInboxBatches(
+        runtime.workflowBootstrap,
+        ctx.sessionManager.getEntries(),
+      );
+    }
+  });
+
+  pi.on("context", (event) => {
+    if (runtime.workflowBootstrap.workflow) {
+      confirmProjectedInboxBatches(runtime.workflowBootstrap, event.messages);
+    }
   });
 
   if (!process.env.PI_SUBAGENT_SESSION) {
     let latestAgentRunWasAborted = false;
     pi.on("agent_start", (_event, ctx) => {
       runtime.workflowBootstrap.sessionStarted(ctx);
-      if (runtime.workflowBootstrap.workflow) runtime.workflowBootstrap.currentTurnStarted();
+      if (runtime.workflowBootstrap.workflow) {
+        confirmProjectedInboxBatches(
+          runtime.workflowBootstrap,
+          ctx.sessionManager.getEntries(),
+        );
+        runtime.workflowBootstrap.currentTurnStarted();
+      }
     });
 
     pi.on("agent_end", (event) => {
@@ -1847,8 +1878,15 @@ function subagentsExtensionWithOptions(
   }
 
   // Clean up on session shutdown
-  pi.on("session_shutdown", (event, _ctx) => {
-    legacyAgentRunAdapters.ui.sessionShutdown((event as any).reason);
+  pi.on("session_shutdown", async (event, _ctx) => {
+    const reason = (event as any).reason;
+    try {
+      if (!shouldPreserveSubagentsOnShutdown(reason)) {
+        await runtime.workflowBootstrap.closeDirectSignalRouter();
+      }
+    } finally {
+      legacyAgentRunAdapters.ui.sessionShutdown(reason);
+    }
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1860,6 +1898,8 @@ function subagentsExtensionWithOptions(
   );
 
   const shouldRegister = (name: string) => !deniedTools.has(name);
+
+  registerAgentSendTool(pi, runtime.workflowBootstrap, shouldRegister("agent_send"));
 
   // ── subagent tool ──
   if (shouldRegister("subagent"))
@@ -1934,6 +1974,7 @@ function subagentsExtensionWithOptions(
           parentThinking,
         });
         void superviseLegacyAgentRun(running, legacyAgentRunAdapters);
+        const workflowAgentId = running.workflowOwnership?.agentId;
 
         // Return immediately
         return {
@@ -1942,6 +1983,7 @@ function subagentsExtensionWithOptions(
               type: "text",
               text:
                 `Sub-agent "${params.name}" launched and is now running in the background. ` +
+                (workflowAgentId ? `Its Workflow Agent ID is ${workflowAgentId}. ` : "") +
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
                 `Until then, move on to other work or tell the user you're waiting.`,
@@ -1952,6 +1994,7 @@ function subagentsExtensionWithOptions(
             name: params.name,
             task: params.task,
             agent: params.agent,
+            agentId: workflowAgentId,
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
             model: running.runtimePlan?.model,

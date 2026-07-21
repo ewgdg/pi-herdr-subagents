@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { cloneSessionFile, initializeSubagentSessionFile } from "../../pi-extension/subagents/session.ts";
 import {
@@ -17,6 +17,8 @@ import {
   type InterruptionRequest,
   type WorkflowRecord,
 } from "../../pi-extension/subagents/protocol/workflow-control-plane.ts";
+import type { InboxBatch } from "../../pi-extension/subagents/protocol/direct-signal.ts";
+import { projectInboxBatch } from "../../pi-extension/subagents/protocol/direct-signal-extension.ts";
 
 export class ManualClock {
   #now: number;
@@ -98,6 +100,45 @@ export class ControllableTranscriptAdapter {
     return { agentId: identity, sessionPath };
   }
 
+  appendAgentSend(
+    session: ScenarioSession,
+    input: { targetAgentId: string; message: string },
+  ): string {
+    const sourceEntryId = `tool-${this.#identityFactory.next()}`;
+    this.#append(session.sessionPath, {
+      type: "message",
+      id: `entry-${this.#identityFactory.next()}`,
+      timestamp: new Date(this.#clock.now()).toISOString(),
+      message: {
+        role: "assistant",
+        content: [{
+          type: "toolCall",
+          id: sourceEntryId,
+          name: "agent_send",
+          arguments: {
+            target: { agent: input.targetAgentId },
+            message: input.message,
+          },
+        }],
+      },
+    });
+    return sourceEntryId;
+  }
+
+  appendInboxBatch(session: ScenarioSession, batch: InboxBatch): void {
+    const projected = projectInboxBatch(batch);
+    this.#append(session.sessionPath, {
+      type: "custom_message",
+      id: `entry-${this.#identityFactory.next()}`,
+      timestamp: new Date(this.#clock.now()).toISOString(),
+      ...projected,
+    });
+  }
+
+  #append(sessionPath: string, entry: Record<string, unknown>): void {
+    appendFileSync(sessionPath, `${JSON.stringify(entry)}\n`, "utf8");
+  }
+
 }
 
 interface ControllableProcess {
@@ -167,6 +208,10 @@ export class ControllableRuntimeAdapter {
     this.#controlPlane = controlPlane;
     this.processAdapter = processAdapter;
     this.#reopen = reopen;
+  }
+
+  get controlPlane(): WorkflowControlPlane {
+    return this.#controlPlane;
   }
 
   get workflow(): WorkflowRecord {

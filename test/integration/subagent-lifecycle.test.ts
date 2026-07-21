@@ -302,7 +302,7 @@ for (const backend of backends) {
       startPi(surface, env.dir, task);
 
       // The test-echo agent (discovered from project .pi/agents/) should work
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
+      const content = await waitForFile(markerFile, PI_TIMEOUT, new RegExp(`DISCO_${id}`));
       assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
     });
 

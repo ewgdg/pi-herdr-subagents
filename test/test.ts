@@ -1947,7 +1947,7 @@ describe("tool registration", () => {
 
     assert.deepEqual(
       registeredTools.map((tool) => tool.name).sort(),
-      ["subagent", "subagent_interrupt", "subagent_resume", "subagents_list"],
+      ["agent_send", "subagent", "subagent_interrupt", "subagent_resume", "subagents_list"],
     );
     const spawn = registeredTools.find((tool) => tool.name === "subagent");
     const resume = registeredTools.find((tool) => tool.name === "subagent_resume");
