@@ -245,6 +245,23 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 
 ---
 
+## agent_send — Signals, Requests, and Answers
+
+`agent_send` delivers actionable work to a known Agent or answers an existing Request:
+
+```typescript
+// A Signal: no reply obligation.
+agent_send({ target: { agent: agentId }, message: "Status update" });
+
+// A Request: creates one durable Answer obligation using this message ID.
+agent_send({ target: { agent: agentId }, message: "Review this", responseRequired: true });
+
+// An Answer: destination and delivery timing come from the Request.
+agent_send({ target: { request: requestId }, message: "Review complete" });
+```
+
+Only the Agent addressed by a Request may answer it. The first queued Answer closes the Request; retrying that same Answer is idempotent. An Answer can also set `responseRequired: true` to create its own Request atomically. A Request becomes resolved only when its Answer is committed to the requester’s inbox; unresolved Requests remain durable Agent dependencies.
+
 ## caller_ping — Child-to-Parent Help Request
 
 The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.

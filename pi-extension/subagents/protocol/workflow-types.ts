@@ -49,7 +49,10 @@ export type WorkflowProtocolErrorCode =
   | "RecipientUnreachable"
   | "RecipientEnded"
   | "MessageIdentityConflict"
-  | "InvalidMessageSource";
+  | "InvalidMessageSource"
+  | "AnswerUnauthorized"
+  | "AnswerAlreadyClosed"
+  | "UnknownRequest";
 
 export class WorkflowProtocolError extends Error {
   readonly code: WorkflowProtocolErrorCode;

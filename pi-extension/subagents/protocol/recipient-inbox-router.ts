@@ -117,15 +117,21 @@ export class RecipientInboxRouter {
   }
 
   confirmDelivery(messageId: string): boolean {
-    const committed = this.#store.commitDelivery({
+    const message = this.#store.inspectMessage(this.#options.workflowOwnerId, messageId);
+    const delivery = this.#store.commitDelivery({
       recipient: this.#options.recipient,
       ownership: this.#options.ownership,
       endpoint: this.#endpoint,
       messageId,
       deliveredAtMs: this.#options.now(),
     });
-    if (committed) this.#projectedMessageIds.delete(messageId);
-    return committed;
+    const newlyDelivered = delivery === "newly-delivered";
+    if (newlyDelivered) this.#projectedMessageIds.delete(messageId);
+    if (newlyDelivered && message) {
+      const lifecycle = this.#store.recipientLifecycle(this.#options.recipient);
+      if (lifecycle === "waiting" || lifecycle === "owner") this.#options.wakeRecipient?.();
+    }
+    return newlyDelivered;
   }
 
   releaseDeferred(): void {
@@ -224,7 +230,6 @@ export class RecipientInboxRouter {
       return;
     }
     for (const message of messages) this.#projectedMessageIds.add(message.messageId);
-    if (lifecycle === "waiting" || lifecycle === "owner") this.#options.wakeRecipient?.();
   }
 
   #resolve(pointer: PendingMessagePointer): DirectSignalMessage {
@@ -232,13 +237,17 @@ export class RecipientInboxRouter {
       this.#options.workflowOwnerId,
       pointer.senderAgentId,
     );
+    const record = this.#store.inspectMessage(this.#options.workflowOwnerId, pointer.messageId);
+    if (!record) throw new Error(`Queued Message ${pointer.messageId} is missing`);
     return {
-      kind: "signal",
+      kind: record.kind,
       messageId: pointer.messageId,
       senderAgentId: pointer.senderAgentId,
       recipientAgentId: pointer.recipientAgentId,
       deliveryTiming: pointer.deliveryTiming,
       message: resolveCanonicalSignal(sessionPath, pointer),
+      ...(pointer.responseRequired ? { responseRequired: true as const } : {}),
+      ...(pointer.inReplyToRequestId ? { inReplyToRequestId: pointer.inReplyToRequestId } : {}),
     };
   }
 
@@ -281,9 +290,17 @@ function parseSignalRequest(value: unknown): SignalAcceptRequest {
       throw new TypeError(`Signal acceptance ${field} must be a non-empty string`);
     }
   }
+  if (candidate.responseRequired !== undefined && typeof candidate.responseRequired !== "boolean") {
+    throw new TypeError("Signal acceptance responseRequired must be a boolean");
+  }
+  if (candidate.inReplyToRequestId !== undefined && (typeof candidate.inReplyToRequestId !== "string" || !candidate.inReplyToRequestId)) {
+    throw new TypeError("Signal acceptance inReplyToRequestId must be a non-empty string");
+  }
   return {
     ...candidate,
     deliveryTiming: signalDeliveryTiming(candidate.deliveryTiming),
+    responseRequired: candidate.responseRequired === true,
+    ...(typeof candidate.inReplyToRequestId === "string" ? { inReplyToRequestId: candidate.inReplyToRequestId } : {}),
   } as SignalAcceptRequest;
 }
 

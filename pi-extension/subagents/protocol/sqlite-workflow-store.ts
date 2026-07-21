@@ -77,6 +77,22 @@ export class SQLiteWorkflowStore {
 
       CREATE INDEX IF NOT EXISTS workflow_agents_spawner
       ON workflow_agents (spawner_agent_id, created_at_ms, agent_id);
+
+      -- Request obligations are Agent-scoped Workflow state. Messaging owns
+      -- their mutations; the Workflow schema owns their one durable shape.
+      CREATE TABLE IF NOT EXISTS workflow_requests (
+        request_id TEXT PRIMARY KEY REFERENCES direct_signal_messages(message_id),
+        requester_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
+        responder_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
+        answer_delivery_timing TEXT NOT NULL CHECK (answer_delivery_timing IN ('steer', 'deferred')),
+        status TEXT NOT NULL CHECK (status IN ('open', 'answered', 'resolved')),
+        answer_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
+        CHECK ((status = 'open' AND answer_message_id IS NULL)
+          OR (status IN ('answered', 'resolved') AND answer_message_id IS NOT NULL))
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS workflow_requests_requester_open
+      ON workflow_requests (requester_agent_id, status);
     `);
   }
 

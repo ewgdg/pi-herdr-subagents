@@ -102,7 +102,13 @@ export class ControllableTranscriptAdapter {
 
   appendAgentSend(
     session: ScenarioSession,
-    input: { targetAgentId: string; message: string; timing?: "steer" | "deferred" },
+    input: {
+      targetAgentId?: string;
+      targetRequestId?: string;
+      message: string;
+      timing?: "steer" | "deferred";
+      responseRequired?: boolean;
+    },
   ): string {
     const sourceEntryId = `tool-${this.#identityFactory.next()}`;
     this.#append(session.sessionPath, {
@@ -116,9 +122,12 @@ export class ControllableTranscriptAdapter {
           id: sourceEntryId,
           name: "agent_send",
           arguments: {
-            target: { agent: input.targetAgentId },
+            target: input.targetRequestId
+              ? { request: input.targetRequestId }
+              : { agent: input.targetAgentId },
             message: input.message,
             ...(input.timing === undefined ? {} : { timing: input.timing }),
+            ...(input.responseRequired === undefined ? {} : { responseRequired: input.responseRequired }),
           },
         }],
       },

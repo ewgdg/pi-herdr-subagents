@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, describe, it, type TestContext } from "node:test";
 import {
   DEFAULT_MAXIMUM_FRAME_BYTES,
   listenForFramedIpc,
@@ -43,8 +43,328 @@ async function waitFor(condition: () => boolean): Promise<void> {
   assert.fail("condition was not satisfied before timeout");
 }
 
+function closeAfter<T extends { close(): void | Promise<void> }>(test: TestContext, resource: T): T {
+  test.after(async () => { await resource.close(); });
+  return resource;
+}
+
+function directSignalRuntime(test: TestContext, options: ConstructorParameters<typeof DirectSignalRuntime>[0]): DirectSignalRuntime {
+  return closeAfter(test, new DirectSignalRuntime(options));
+}
+
 describe("direct Signal protocol scenarios", () => {
-  it("queues one direct Signal, projects one Inbox Batch, and wakes a waiting recipient", async () => {
+  it("accepts a Request atomically, then an Answer resolves only its durable requester dependency on delivery", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const responderSession = scenario.childSession(ownerRuntime, "responder");
+    const responder = ownerRuntime.addAgent({ session: responderSession, spawner: owner, name: "Responder" });
+    const responderRuntime = scenario.startAgent(ownerRuntime.workflow, responderSession);
+    const responderRun = ownerRuntime.startAgentRun(ownerRuntime.agent(responder.agentId));
+    ownerRuntime.settleActivation(responderRun);
+    const ownerBatches: InboxBatch[] = [];
+    let ownerWakes = 0;
+    const ownerMessages = directSignalRuntime(test, {
+      controlPlane: ownerRuntime.controlPlane,
+      allocateMessageId: () => scenario.identities.next(),
+      projectInboxBatch(batch) { ownerBatches.push(batch); },
+      wakeRecipient() { ownerWakes += 1; },
+    });
+    await ownerMessages.start();
+    const responderMessages = directSignalRuntime(test, {
+      controlPlane: responderRuntime.controlPlane,
+      ownership: responderRun.ownership,
+      allocateMessageId: () => scenario.identities.next(),
+      projectInboxBatch(batch) { scenario.transcripts.appendInboxBatch(responderSession, batch); },
+    });
+    await responderMessages.start();
+    const requestSource = scenario.transcripts.appendAgentSend(
+      { agentId: owner.agentId, sessionPath: ownerRuntime.workflow.ownerSessionPath },
+      { targetAgentId: responder.agentId, message: "do the work", timing: "deferred", responseRequired: true },
+    );
+    const otherSource = scenario.transcripts.appendAgentSend(
+      { agentId: owner.agentId, sessionPath: ownerRuntime.workflow.ownerSessionPath },
+      { targetAgentId: responder.agentId, message: "other work", responseRequired: true },
+    );
+
+    const request = await ownerMessages.sendMessage({
+      target: { agentId: responder.agentId }, message: "do the work", sourceEntryId: requestSource,
+      deliveryTiming: "deferred", responseRequired: true,
+    });
+    await ownerMessages.sendMessage({
+      target: { agentId: responder.agentId }, message: "other work", sourceEntryId: otherSource, responseRequired: true,
+    });
+    assert.deepEqual(ownerMessages.inspectRequest(request.messageId), {
+      requestId: request.messageId,
+      requesterAgentId: owner.agentId,
+      responderAgentId: responder.agentId,
+      answerDeliveryTiming: "deferred",
+      status: "open",
+    });
+    assert.deepEqual(ownerRuntime.inspectActivation(owner)?.state, undefined);
+    ownerRuntime.settleOwnerTurn();
+
+    const answerSource = scenario.transcripts.appendAgentSend(responderSession, {
+      targetRequestId: request.messageId, message: "done",
+    });
+    const answer = await responderMessages.sendMessage({
+      target: { requestId: request.messageId }, message: "done", sourceEntryId: answerSource,
+    });
+    assert.equal(ownerMessages.inspectRequest(request.messageId)?.status, "answered");
+    await waitFor(() => ownerBatches.length === 1);
+    assert.equal(ownerWakes, 0);
+    assert.equal(ownerMessages.confirmDelivery(answer.messageId), true);
+    assert.equal(ownerWakes, 1);
+    assert.equal(ownerMessages.inspectRequest(request.messageId)?.status, "resolved");
+    assert.deepEqual(
+      ownerMessages.listRequests(owner).map((item) => ({ requestId: item.requestId, status: item.status })),
+      [{ requestId: request.messageId, status: "resolved" }, { requestId: ownerMessages.listRequests(owner)[1].requestId, status: "open" }],
+    );
+
+    await ownerMessages.close();
+    await responderMessages.close();
+    ownerRuntime.confirmAgentRunExit(responderRun, { error: "test cleanup" });
+    responderRuntime.close();
+    ownerRuntime.close();
+  });
+
+  it("restricts Answers to the addressed responder, closes the slot once, and permits Answer-plus-Request", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const responderSession = scenario.childSession(ownerRuntime, "responder");
+    const intruderSession = scenario.childSession(ownerRuntime, "intruder");
+    const responder = ownerRuntime.addAgent({ session: responderSession, spawner: owner, name: "Responder" });
+    const intruder = ownerRuntime.addAgent({ session: intruderSession, spawner: owner, name: "Intruder" });
+    const responderRuntime = scenario.startAgent(ownerRuntime.workflow, responderSession);
+    const intruderRuntime = scenario.startAgent(ownerRuntime.workflow, intruderSession);
+    const responderRun = ownerRuntime.startAgentRun(ownerRuntime.agent(responder.agentId));
+    const intruderRun = ownerRuntime.startAgentRun(ownerRuntime.agent(intruder.agentId));
+    ownerRuntime.settleActivation(responderRun);
+    const ownerMessages = directSignalRuntime(test, {
+      controlPlane: ownerRuntime.controlPlane,
+      allocateMessageId: () => scenario.identities.next(),
+      projectInboxBatch() {},
+    });
+    const responderMessages = directSignalRuntime(test, {
+      controlPlane: responderRuntime.controlPlane, ownership: responderRun.ownership,
+      allocateMessageId: () => scenario.identities.next(), projectInboxBatch() {},
+    });
+    const intruderMessages = directSignalRuntime(test, {
+      controlPlane: intruderRuntime.controlPlane, ownership: intruderRun.ownership,
+      allocateMessageId: () => scenario.identities.next(), projectInboxBatch() {},
+    });
+    await ownerMessages.start();
+    await responderMessages.start();
+    const requestSource = scenario.transcripts.appendAgentSend(
+      { agentId: owner.agentId, sessionPath: ownerRuntime.workflow.ownerSessionPath },
+      { targetAgentId: responder.agentId, message: "request", timing: "deferred", responseRequired: true },
+    );
+    const request = await ownerMessages.sendMessage({
+      target: { agentId: responder.agentId }, message: "request", sourceEntryId: requestSource,
+      deliveryTiming: "deferred", responseRequired: true,
+    });
+    const intruderSource = scenario.transcripts.appendAgentSend(intruderSession, {
+      targetRequestId: request.messageId, message: "forged answer",
+    });
+    await assert.rejects(
+      intruderMessages.sendMessage({ target: { requestId: request.messageId }, message: "forged answer", sourceEntryId: intruderSource }),
+      (error: unknown) => (error as { code?: string }).code === "AnswerUnauthorized",
+    );
+    assert.equal(intruderMessages.listMessages().length, 1, "only the Request should be durable before an authorized Answer");
+    const answerSource = scenario.transcripts.appendAgentSend(responderSession, {
+      targetRequestId: request.messageId, message: "answer and ask", responseRequired: true,
+    });
+    const answer = await responderMessages.sendMessage({
+      target: { requestId: request.messageId }, message: "answer and ask", sourceEntryId: answerSource, responseRequired: true,
+    });
+    const retry = await responderMessages.sendMessage({
+      target: { requestId: request.messageId }, message: "answer and ask", sourceEntryId: answerSource, responseRequired: true,
+    });
+    assert.deepEqual(retry, answer);
+    assert.deepEqual(ownerMessages.inspectRequest(request.messageId), {
+      requestId: request.messageId, requesterAgentId: owner.agentId, responderAgentId: responder.agentId,
+      answerDeliveryTiming: "deferred", status: "answered", answerMessageId: answer.messageId,
+    });
+    assert.deepEqual(ownerMessages.inspectRequest(answer.messageId), {
+      requestId: answer.messageId, requesterAgentId: responder.agentId, responderAgentId: owner.agentId,
+      answerDeliveryTiming: "deferred", status: "open",
+    });
+    const laterSource = scenario.transcripts.appendAgentSend(responderSession, {
+      targetRequestId: request.messageId, message: "late answer",
+    });
+    await assert.rejects(
+      responderMessages.sendMessage({ target: { requestId: request.messageId }, message: "late answer", sourceEntryId: laterSource }),
+      (error: unknown) => (error as { code?: string }).code === "AnswerAlreadyClosed",
+    );
+    await assert.rejects(
+      responderMessages.sendMessage({ target: { requestId: answer.messageId }, message: "wrong timing", sourceEntryId: laterSource, deliveryTiming: "steer" }),
+      /derive delivery timing/,
+    );
+
+    await ownerMessages.close();
+    await responderMessages.close();
+    await intruderMessages.close();
+    ownerRuntime.confirmAgentRunExit(responderRun, { error: "test cleanup" });
+    ownerRuntime.confirmAgentRunExit(intruderRun, { error: "test cleanup" });
+    responderRuntime.close();
+    intruderRuntime.close();
+    ownerRuntime.close();
+  });
+
+  it("wakes a waiting requester once for a newly delivered Answer without resolving its other Requests", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const requesterSession = scenario.childSession(ownerRuntime, "requester");
+    const responderSession = scenario.childSession(ownerRuntime, "responder");
+    const requester = ownerRuntime.addAgent({ session: requesterSession, spawner: owner, name: "Requester" });
+    const responder = ownerRuntime.addAgent({ session: responderSession, spawner: owner, name: "Responder" });
+    const requesterRuntime = scenario.startAgent(ownerRuntime.workflow, requesterSession);
+    const responderRuntime = scenario.startAgent(ownerRuntime.workflow, responderSession);
+    const requesterRun = ownerRuntime.startAgentRun(ownerRuntime.agent(requester.agentId));
+    const responderRun = ownerRuntime.startAgentRun(ownerRuntime.agent(responder.agentId));
+    ownerRuntime.settleActivation(requesterRun);
+    ownerRuntime.settleActivation(responderRun);
+    let wakeCount = 0;
+    const requesterMessages = directSignalRuntime(test, {
+      controlPlane: requesterRuntime.controlPlane, ownership: requesterRun.ownership,
+      allocateMessageId: () => scenario.identities.next(), projectInboxBatch() {},
+      wakeRecipient() { wakeCount += 1; ownerRuntime.activateTurn(requesterRun); },
+    });
+    const responderMessages = directSignalRuntime(test, {
+      controlPlane: responderRuntime.controlPlane, ownership: responderRun.ownership,
+      allocateMessageId: () => scenario.identities.next(), projectInboxBatch() {},
+    });
+    await requesterMessages.start();
+    await responderMessages.start();
+    const firstSource = scenario.transcripts.appendAgentSend(requesterSession, {
+      targetAgentId: responder.agentId, message: "first", responseRequired: true,
+    });
+    const secondSource = scenario.transcripts.appendAgentSend(requesterSession, {
+      targetAgentId: responder.agentId, message: "second", responseRequired: true,
+    });
+    const first = await requesterMessages.sendMessage({
+      target: { agentId: responder.agentId }, message: "first", sourceEntryId: firstSource, responseRequired: true,
+    });
+    const second = await requesterMessages.sendMessage({
+      target: { agentId: responder.agentId }, message: "second", sourceEntryId: secondSource, responseRequired: true,
+    });
+    assert.deepEqual(ownerRuntime.inspectActivation(ownerRuntime.agent(requester.agentId))?.state, {
+      kind: "waiting",
+      dependencies: [
+        { kind: "agent", dependencyId: first.messageId, agentId: responder.agentId },
+        { kind: "agent", dependencyId: second.messageId, agentId: responder.agentId },
+      ],
+    });
+    const answerSource = scenario.transcripts.appendAgentSend(responderSession, {
+      targetRequestId: first.messageId, message: "first answer",
+    });
+    const answer = await responderMessages.sendMessage({
+      target: { requestId: first.messageId }, message: "first answer", sourceEntryId: answerSource,
+    });
+    await waitFor(() => requesterMessages.inspectMessage(answer.messageId)?.deliveryStatus === "queued");
+    assert.equal(ownerRuntime.inspectActivation(ownerRuntime.agent(requester.agentId))?.state.kind, "waiting");
+    assert.equal(requesterMessages.confirmDelivery(answer.messageId), true);
+    assert.equal(wakeCount, 1);
+    assert.equal(ownerRuntime.inspectActivation(ownerRuntime.agent(requester.agentId))?.state.kind, "active");
+    ownerRuntime.settleActivation(requesterRun);
+    assert.deepEqual(ownerRuntime.inspectActivation(ownerRuntime.agent(requester.agentId))?.state, {
+      kind: "waiting",
+      dependencies: [{ kind: "agent", dependencyId: second.messageId, agentId: responder.agentId }],
+    });
+    assert.equal(requesterMessages.confirmDelivery(answer.messageId), false);
+    assert.equal(wakeCount, 1, "an idempotent delivery confirmation must not wake another turn");
+    assert.deepEqual(ownerRuntime.inspectActivation(ownerRuntime.agent(requester.agentId))?.state, {
+      kind: "waiting",
+      dependencies: [{ kind: "agent", dependencyId: second.messageId, agentId: responder.agentId }],
+    });
+
+    await requesterMessages.close();
+    await responderMessages.close();
+    ownerRuntime.confirmAgentRunExit(requesterRun, { error: "test cleanup" });
+    ownerRuntime.confirmAgentRunExit(responderRun, { error: "test cleanup" });
+    requesterRuntime.close();
+    responderRuntime.close();
+    ownerRuntime.close();
+  });
+
+  it("rejects forged Answer recipient and timing at the durable acceptance boundary", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const responderSession = scenario.childSession(ownerRuntime, "responder");
+    const intruderSession = scenario.childSession(ownerRuntime, "intruder");
+    const responder = ownerRuntime.addAgent({ session: responderSession, spawner: owner, name: "Responder" });
+    const intruder = ownerRuntime.addAgent({ session: intruderSession, spawner: owner, name: "Intruder" });
+    const responderRuntime = scenario.startAgent(ownerRuntime.workflow, responderSession);
+    const intruderRuntime = scenario.startAgent(ownerRuntime.workflow, intruderSession);
+    const responderRun = ownerRuntime.startAgentRun(responder);
+    const intruderRun = ownerRuntime.startAgentRun(intruder);
+    const ownerMessages = directSignalRuntime(test, { controlPlane: ownerRuntime.controlPlane, projectInboxBatch() {} });
+    const responderMessages = directSignalRuntime(test, {
+      controlPlane: responderRuntime.controlPlane, ownership: responderRun.ownership, projectInboxBatch() {},
+    });
+    const intruderMessages = directSignalRuntime(test, {
+      controlPlane: intruderRuntime.controlPlane, ownership: intruderRun.ownership, projectInboxBatch() {},
+    });
+    await ownerMessages.start();
+    await responderMessages.start();
+    await intruderMessages.start();
+    const requestSource = scenario.transcripts.appendAgentSend(
+      { agentId: owner.agentId, sessionPath: ownerRuntime.workflow.ownerSessionPath },
+      { targetAgentId: responder.agentId, message: "request", timing: "deferred", responseRequired: true },
+    );
+    const request = await ownerMessages.sendMessage({
+      target: { agentId: responder.agentId }, message: "request", sourceEntryId: requestSource,
+      deliveryTiming: "deferred", responseRequired: true,
+    });
+    const store = closeAfter(test, new DirectSignalStore(ownerRuntime.workflow.databasePath));
+    const bindAnswer = (messageId: string, recipientAgentId: string, deliveryTiming: "steer" | "deferred") => {
+      store.bindMessage({
+        messageId, sender: responder, recipient: ownerRuntime.agent(recipientAgentId), sourceEntryId: `${messageId}-source`,
+        payloadDigest: `${messageId}-digest`, deliveryTiming, responseRequired: false,
+        inReplyToRequestId: request.messageId, createdAtMs: scenario.clock.now(),
+      });
+    };
+
+    bindAnswer("wrong-recipient", intruder.agentId, "deferred");
+    assert.throws(() => store.acceptSignal({
+      request: {
+        workflowOwnerId: owner.workflowOwnerId, messageId: "wrong-recipient", senderAgentId: responder.agentId,
+        recipientAgentId: intruder.agentId, sourceEntryId: "wrong-recipient-source", payloadDigest: "wrong-recipient-digest",
+        deliveryTiming: "deferred", responseRequired: false, inReplyToRequestId: request.messageId, message: "forged recipient",
+      },
+      recipient: intruder, ownership: intruderRun.ownership, endpoint: store.readRouter(intruder)!.endpoint,
+      acceptedAtMs: scenario.clock.now(),
+    }), (error: unknown) => (error as { code?: string }).code === "AnswerUnauthorized");
+    assert.equal(store.inspectRequest(owner.workflowOwnerId, request.messageId)?.status, "open");
+    assert.equal(store.inspectMessage(owner.workflowOwnerId, "wrong-recipient")?.deliveryStatus, "bound");
+    assert.equal(store.discardUnacceptedMessage(responder, "wrong-recipient"), true);
+
+    bindAnswer("wrong-timing", owner.agentId, "steer");
+    assert.throws(() => store.acceptSignal({
+      request: {
+        workflowOwnerId: owner.workflowOwnerId, messageId: "wrong-timing", senderAgentId: responder.agentId,
+        recipientAgentId: owner.agentId, sourceEntryId: "wrong-timing-source", payloadDigest: "wrong-timing-digest",
+        deliveryTiming: "steer", responseRequired: false, inReplyToRequestId: request.messageId, message: "forged timing",
+      },
+      recipient: owner, endpoint: store.readRouter(owner)!.endpoint, acceptedAtMs: scenario.clock.now(),
+    }), (error: unknown) => (error as { code?: string }).code === "InvalidMessageSource");
+    assert.equal(store.inspectRequest(owner.workflowOwnerId, request.messageId)?.status, "open");
+    assert.equal(store.inspectMessage(owner.workflowOwnerId, "wrong-timing")?.deliveryStatus, "bound");
+
+    await ownerMessages.close();
+    await responderMessages.close();
+    await intruderMessages.close();
+    ownerRuntime.confirmAgentRunExit(responderRun, { error: "test cleanup" });
+    ownerRuntime.confirmAgentRunExit(intruderRun, { error: "test cleanup" });
+    responderRuntime.close();
+    intruderRuntime.close();
+    ownerRuntime.close();
+  });
+
+  it("queues one direct Signal, projects one Inbox Batch, and wakes a waiting recipient", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
     const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
@@ -59,7 +379,7 @@ describe("direct Signal protocol scenarios", () => {
     ownerRuntime.settleActivation(recipientRun);
     const batches: InboxBatch[] = [];
     let wakeCount = 0;
-    const recipientSignals = new DirectSignalRuntime({
+    const recipientSignals = directSignalRuntime(test, {
       controlPlane: recipientRuntime.controlPlane,
       ownership: recipientRun.ownership,
       projectInboxBatch(batch) {
@@ -72,7 +392,7 @@ describe("direct Signal protocol scenarios", () => {
       },
     });
     await recipientSignals.start();
-    const senderSignals = new DirectSignalRuntime({
+    const senderSignals = directSignalRuntime(test, {
       controlPlane: senderRuntime.controlPlane,
       ownership: senderRun.ownership,
       allocateMessageId: () => scenario.identities.next(),
@@ -114,7 +434,7 @@ describe("direct Signal protocol scenarios", () => {
       1,
     );
 
-    senderSignals.close();
+    await senderSignals.close();
     await recipientSignals.close();
     ownerRuntime.confirmAgentRunExit(senderRun, { error: "test cleanup" });
     ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
@@ -123,7 +443,80 @@ describe("direct Signal protocol scenarios", () => {
     ownerRuntime.close();
   });
 
-  it("stores message identity and routing metadata without copying the Signal payload", async () => {
+  it("accepts and resolves a productive cycle of Requests", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const firstSession = scenario.childSession(ownerRuntime, "first");
+    const secondSession = scenario.childSession(ownerRuntime, "second");
+    const first = ownerRuntime.addAgent({ session: firstSession, spawner: owner, name: "First" });
+    const second = ownerRuntime.addAgent({ session: secondSession, spawner: owner, name: "Second" });
+    const firstRuntime = scenario.startAgent(ownerRuntime.workflow, firstSession);
+    const secondRuntime = scenario.startAgent(ownerRuntime.workflow, secondSession);
+    const firstRun = ownerRuntime.startAgentRun(first);
+    const secondRun = ownerRuntime.startAgentRun(second);
+    const firstMessages = directSignalRuntime(test, {
+      controlPlane: firstRuntime.controlPlane, ownership: firstRun.ownership, projectInboxBatch() {},
+      wakeRecipient() { firstRuntime.activateTurn(firstRun); },
+    });
+    const secondMessages = directSignalRuntime(test, {
+      controlPlane: secondRuntime.controlPlane, ownership: secondRun.ownership, projectInboxBatch() {},
+      wakeRecipient() { secondRuntime.activateTurn(secondRun); },
+    });
+    await firstMessages.start();
+    await secondMessages.start();
+    const firstRequestSource = scenario.transcripts.appendAgentSend(firstSession, {
+      targetAgentId: second.agentId, message: "first request", responseRequired: true,
+    });
+    const firstRequest = await firstMessages.sendMessage({
+      target: { agentId: second.agentId }, message: "first request", sourceEntryId: firstRequestSource, responseRequired: true,
+    });
+    const secondRequestSource = scenario.transcripts.appendAgentSend(secondSession, {
+      targetAgentId: first.agentId, message: "second request", responseRequired: true,
+    });
+    const secondRequest = await secondMessages.sendMessage({
+      target: { agentId: first.agentId }, message: "second request", sourceEntryId: secondRequestSource, responseRequired: true,
+    });
+    firstRuntime.settleActivation(firstRun);
+    secondRuntime.settleActivation(secondRun);
+    assert.deepEqual(firstRuntime.inspectActivation(first)?.state, {
+      kind: "waiting", dependencies: [{ kind: "agent", dependencyId: firstRequest.messageId, agentId: second.agentId }],
+    });
+    assert.deepEqual(secondRuntime.inspectActivation(second)?.state, {
+      kind: "waiting", dependencies: [{ kind: "agent", dependencyId: secondRequest.messageId, agentId: first.agentId }],
+    });
+
+    const firstAnswerSource = scenario.transcripts.appendAgentSend(firstSession, {
+      targetRequestId: secondRequest.messageId, message: "first answer",
+    });
+    const firstAnswer = await firstMessages.sendMessage({
+      target: { requestId: secondRequest.messageId }, message: "first answer", sourceEntryId: firstAnswerSource,
+    });
+    const secondAnswerSource = scenario.transcripts.appendAgentSend(secondSession, {
+      targetRequestId: firstRequest.messageId, message: "second answer",
+    });
+    const secondAnswer = await secondMessages.sendMessage({
+      target: { requestId: firstRequest.messageId }, message: "second answer", sourceEntryId: secondAnswerSource,
+    });
+    await waitFor(() => firstMessages.inspectMessage(secondAnswer.messageId)?.deliveryStatus === "queued");
+    await waitFor(() => secondMessages.inspectMessage(firstAnswer.messageId)?.deliveryStatus === "queued");
+    assert.equal(firstMessages.confirmDelivery(secondAnswer.messageId), true);
+    assert.equal(secondMessages.confirmDelivery(firstAnswer.messageId), true);
+    assert.equal(firstMessages.inspectRequest(firstRequest.messageId)?.status, "resolved");
+    assert.equal(secondMessages.inspectRequest(secondRequest.messageId)?.status, "resolved");
+    assert.equal(firstRuntime.inspectActivation(first)?.state.kind, "active");
+    assert.equal(secondRuntime.inspectActivation(second)?.state.kind, "active");
+
+    await firstMessages.close();
+    await secondMessages.close();
+    ownerRuntime.confirmAgentRunExit(firstRun, { error: "test cleanup" });
+    ownerRuntime.confirmAgentRunExit(secondRun, { error: "test cleanup" });
+    firstRuntime.close();
+    secondRuntime.close();
+    ownerRuntime.close();
+  });
+
+  it("stores message identity and routing metadata without copying the Signal payload", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
     const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
@@ -132,7 +525,7 @@ describe("direct Signal protocol scenarios", () => {
     const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
     const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
     ownerRuntime.settleActivation(recipientRun);
-    const recipientSignals = new DirectSignalRuntime({
+    const recipientSignals = directSignalRuntime(test, {
       controlPlane: recipientRuntime.controlPlane,
       ownership: recipientRun.ownership,
       projectInboxBatch(batch) {
@@ -143,7 +536,7 @@ describe("direct Signal protocol scenarios", () => {
       },
     });
     await recipientSignals.start();
-    const ownerSignals = new DirectSignalRuntime({
+    const ownerSignals = directSignalRuntime(test, {
       controlPlane: ownerRuntime.controlPlane,
       allocateMessageId: () => scenario.identities.next(),
     });
@@ -179,14 +572,14 @@ describe("direct Signal protocol scenarios", () => {
       }
     }
 
-    ownerSignals.close();
+    await ownerSignals.close();
     await recipientSignals.close();
     ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
     recipientRuntime.close();
     ownerRuntime.close();
   });
 
-  it("rejects cross-Workflow targets without message, queue, transcript, or lifecycle effects", async () => {
+  it("rejects cross-Workflow targets without message, queue, transcript, or lifecycle effects", async (test) => {
     const identities = new DeterministicIdentityFactory();
     const workflowA = new WorkflowScenario({
       rootDirectory: await temporaryDirectory(),
@@ -205,7 +598,7 @@ describe("direct Signal protocol scenarios", () => {
       name: "Recipient B",
     });
     const beforeTranscript = readFileSync(recipientSession.sessionPath, "utf8");
-    const senderSignals = new DirectSignalRuntime({
+    const senderSignals = directSignalRuntime(test, {
       controlPlane: runtimeA.controlPlane,
       allocateMessageId: () => identities.next(),
     });
@@ -222,12 +615,12 @@ describe("direct Signal protocol scenarios", () => {
     assert.deepEqual(senderSignals.listMessages(), []);
     assert.equal(readFileSync(recipientSession.sessionPath, "utf8"), beforeTranscript);
     assert.equal(runtimeB.inspectActivation(runtimeB.agent(recipient.agentId)), undefined);
-    senderSignals.close();
+    await senderSignals.close();
     runtimeA.close();
     runtimeB.close();
   });
 
-  it("fails fast when the recipient Router is unavailable and removes the pre-IPC identity binding", async () => {
+  it("fails fast when the recipient Router is unavailable and removes the pre-IPC identity binding", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime } = scenario.createOwner();
     const recipientSession = scenario.childSession(runtime, "offline-recipient");
@@ -238,7 +631,7 @@ describe("direct Signal protocol scenarios", () => {
     });
     const beforeTranscript = readFileSync(recipientSession.sessionPath, "utf8");
     let allocations = 0;
-    const senderSignals = new DirectSignalRuntime({
+    const senderSignals = directSignalRuntime(test, {
       controlPlane: runtime.controlPlane,
       allocateMessageId() {
         allocations += 1;
@@ -259,11 +652,11 @@ describe("direct Signal protocol scenarios", () => {
     assert.deepEqual(senderSignals.listMessages(), []);
     assert.equal(readFileSync(recipientSession.sessionPath, "utf8"), beforeTranscript);
     assert.equal(runtime.inspectActivation(runtime.agent(recipient.agentId)), undefined);
-    senderSignals.close();
+    await senderSignals.close();
     runtime.close();
   });
 
-  it("cleans up a listener and store when Router startup cannot acquire ownership", async () => {
+  it("cleans up a listener and store when Router startup cannot acquire ownership", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime } = scenario.createOwner();
     const recipientSession = scenario.childSession(runtime, "recipient");
@@ -272,22 +665,22 @@ describe("direct Signal protocol scenarios", () => {
       spawner: runtime.agent(runtime.workflow.ownerAgentId),
       name: "Recipient",
     });
-    const router = new RecipientInboxRouter({
+    const router = closeAfter(test, new RecipientInboxRouter({
       workflowOwnerId: runtime.workflow.ownerAgentId,
       recipient: runtime.agent(recipient.agentId),
       databasePath: runtime.workflow.databasePath,
       projectInboxBatch() {},
       now: scenario.clock.now,
-    });
+    }));
 
     await assert.rejects(router.start(), (error: unknown) => (error as { code?: string }).code === "OwnershipLost");
     await router.close();
-    const reopened = new DirectSignalStore(runtime.workflow.databasePath);
+    const reopened = closeAfter(test, new DirectSignalStore(runtime.workflow.databasePath));
     reopened.close();
     runtime.close();
   });
 
-  it("removes the identity binding when the request cannot be written before acceptance", async () => {
+  it("removes the identity binding when the request cannot be written before acceptance", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
     const recipientSession = scenario.childSession(ownerRuntime, "recipient");
@@ -300,7 +693,7 @@ describe("direct Signal protocol scenarios", () => {
     const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
     ownerRuntime.settleActivation(recipientRun);
     let projected = 0;
-    const recipientSignals = new DirectSignalRuntime({
+    const recipientSignals = directSignalRuntime(test, {
       controlPlane: recipientRuntime.controlPlane,
       ownership: recipientRun.ownership,
       projectInboxBatch() {
@@ -308,7 +701,7 @@ describe("direct Signal protocol scenarios", () => {
       },
     });
     await recipientSignals.start();
-    const senderSignals = new DirectSignalRuntime({
+    const senderSignals = directSignalRuntime(test, {
       controlPlane: ownerRuntime.controlPlane,
       allocateMessageId: () => scenario.identities.next(),
     });
@@ -325,14 +718,14 @@ describe("direct Signal protocol scenarios", () => {
     assert.equal(projected, 0);
     assert.deepEqual(senderSignals.listMessages(), []);
     assert.deepEqual(recipientSignals.listPending(recipientRuntime.agent(recipient.agentId)), []);
-    senderSignals.close();
+    await senderSignals.close();
     await recipientSignals.close();
     ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
     recipientRuntime.close();
     ownerRuntime.close();
   });
 
-  it("removes a still-bound identity when the recipient disconnects before acceptance", async () => {
+  it("removes a still-bound identity when the recipient disconnects before acceptance", async (test) => {
     const rootDirectory = await temporaryDirectory();
     const scenario = new WorkflowScenario({ rootDirectory });
     const { runtime } = scenario.createOwner();
@@ -346,17 +739,17 @@ describe("direct Signal protocol scenarios", () => {
     const endpoint = process.platform === "win32"
       ? `\\\\.\\pipe\\pi-herdr-disconnect-${process.pid}-${Date.now()}`
       : join(rootDirectory, "disconnect.sock");
-    const fakeRouter = await listenForFramedIpc(endpoint, (connection) => {
+    closeAfter(test, await listenForFramedIpc(endpoint, (connection) => {
       connection.onMessage(() => connection.end());
-    });
-    const store = new DirectSignalStore(runtime.workflow.databasePath);
+    }));
+    const store = closeAfter(test, new DirectSignalStore(runtime.workflow.databasePath));
     store.registerRouter({
       recipient: runtime.agent(recipient.agentId),
       ownership: recipientRun.ownership,
       endpoint,
       registeredAtMs: scenario.clock.now(),
     });
-    const senderSignals = new DirectSignalRuntime({
+    const senderSignals = directSignalRuntime(test, {
       controlPlane: runtime.controlPlane,
       allocateMessageId: () => scenario.identities.next(),
     });
@@ -371,15 +764,14 @@ describe("direct Signal protocol scenarios", () => {
     );
 
     assert.deepEqual(senderSignals.listMessages(), []);
-    senderSignals.close();
+    await senderSignals.close();
     store.unregisterRouter(runtime.agent(recipient.agentId), endpoint);
     store.close();
-    await fakeRouter.close();
     runtime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
     runtime.close();
   });
 
-  it("reconciles a lost acknowledgement through its original Message Identity", async () => {
+  it("reconciles a lost acknowledgement through its original Message Identity", async (test) => {
     const rootDirectory = await temporaryDirectory();
     const scenario = new WorkflowScenario({ rootDirectory });
     const { runtime } = scenario.createOwner();
@@ -393,14 +785,14 @@ describe("direct Signal protocol scenarios", () => {
     const endpoint = process.platform === "win32"
       ? `\\\\.\\pipe\\pi-herdr-lost-ack-${process.pid}-${Date.now()}`
       : join(rootDirectory, "lost-ack.sock");
-    const store = new DirectSignalStore(runtime.workflow.databasePath);
+    const store = closeAfter(test, new DirectSignalStore(runtime.workflow.databasePath));
     store.registerRouter({
       recipient: runtime.agent(recipient.agentId),
       ownership: recipientRun.ownership,
       endpoint,
       registeredAtMs: scenario.clock.now(),
     });
-    const fakeRouter = await listenForFramedIpc(endpoint, (connection) => {
+    closeAfter(test, await listenForFramedIpc(endpoint, (connection) => {
       connection.onMessage((frame) => {
         store.acceptSignal({
           request: frame.payload as import("../../pi-extension/subagents/protocol/direct-signal-types.ts").SignalAcceptRequest,
@@ -412,9 +804,9 @@ describe("direct Signal protocol scenarios", () => {
         // Deliberately omit the receipt after the durable acceptance commit.
         connection.end();
       });
-    });
+    }));
     let allocations = 0;
-    const senderSignals = new DirectSignalRuntime({
+    const senderSignals = directSignalRuntime(test, {
       controlPlane: runtime.controlPlane,
       allocateMessageId() {
         allocations += 1;
@@ -440,15 +832,14 @@ describe("direct Signal protocol scenarios", () => {
       acceptanceSequence: message.acceptanceSequence,
     })), [{ messageId: first.messageId, deliveryStatus: "queued", acceptanceSequence: 1 }]);
 
-    senderSignals.close();
+    await senderSignals.close();
     store.unregisterRouter(runtime.agent(recipient.agentId), endpoint);
     store.close();
-    await fakeRouter.close();
     runtime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
     runtime.close();
   });
 
-  it("rolls back recipient acceptance atomically when pointer persistence fails", async () => {
+  it("rolls back recipient acceptance atomically when pointer persistence fails", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
     const recipientSession = scenario.childSession(ownerRuntime, "recipient");
@@ -461,7 +852,7 @@ describe("direct Signal protocol scenarios", () => {
     const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
     ownerRuntime.settleActivation(recipientRun);
     let projected = 0;
-    const recipientSignals = new DirectSignalRuntime({
+    const recipientSignals = directSignalRuntime(test, {
       controlPlane: recipientRuntime.controlPlane,
       ownership: recipientRun.ownership,
       projectInboxBatch() {
@@ -472,7 +863,7 @@ describe("direct Signal protocol scenarios", () => {
       },
     });
     await recipientSignals.start();
-    const database = new DatabaseSync(ownerRuntime.workflow.databasePath);
+    const database = closeAfter(test, new DatabaseSync(ownerRuntime.workflow.databasePath));
     database.exec(`
       CREATE TRIGGER reject_signal_pointer
       BEFORE INSERT ON pending_message_pointers
@@ -480,20 +871,21 @@ describe("direct Signal protocol scenarios", () => {
         SELECT RAISE(ABORT, 'forced pointer failure');
       END
     `);
-    const senderSignals = new DirectSignalRuntime({
+    const senderSignals = directSignalRuntime(test, {
       controlPlane: ownerRuntime.controlPlane,
       allocateMessageId: () => scenario.identities.next(),
     });
     const sourceEntryId = scenario.transcripts.appendAgentSend(
       { agentId: ownerRuntime.workflow.ownerAgentId, sessionPath: ownerRuntime.workflow.ownerSessionPath },
-      { targetAgentId: recipient.agentId, message: "atomic payload" },
+      { targetAgentId: recipient.agentId, message: "atomic payload", responseRequired: true },
     );
 
     await assert.rejects(
-      senderSignals.sendSignal({
-        target: ownerRuntime.agent(recipient.agentId),
+      senderSignals.sendMessage({
+        target: { agentId: recipient.agentId },
         message: "atomic payload",
         sourceEntryId,
+        responseRequired: true,
       }),
       /forced pointer failure/,
     );
@@ -506,15 +898,14 @@ describe("direct Signal protocol scenarios", () => {
       dependencies: [{ kind: "human", dependencyId: "human" }],
     });
     database.exec("DROP TRIGGER reject_signal_pointer");
-    database.close();
-    senderSignals.close();
+    await senderSignals.close();
     await recipientSignals.close();
     ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
     recipientRuntime.close();
     ownerRuntime.close();
   });
 
-  it("batches deferred Signals in acceptance order when the recipient settles", async () => {
+  it("batches deferred Signals in acceptance order when the recipient settles", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
     const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
@@ -523,13 +914,13 @@ describe("direct Signal protocol scenarios", () => {
     const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
     const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
     const batches: InboxBatch[] = [];
-    const recipientSignals = new DirectSignalRuntime({
+    const recipientSignals = directSignalRuntime(test, {
       controlPlane: recipientRuntime.controlPlane,
       ownership: recipientRun.ownership,
       projectInboxBatch(batch) { batches.push(batch); },
     });
     await recipientSignals.start();
-    const ownerSignals = new DirectSignalRuntime({
+    const ownerSignals = directSignalRuntime(test, {
       controlPlane: ownerRuntime.controlPlane,
       allocateMessageId: () => scenario.identities.next(),
     });
@@ -558,14 +949,14 @@ describe("direct Signal protocol scenarios", () => {
     for (const message of batches[0].messages) assert.equal(recipientSignals.confirmDelivery(message.messageId), true);
     assert.deepEqual(recipientSignals.listPending(recipientRuntime.agent(recipient.agentId)), []);
 
-    ownerSignals.close();
+    await ownerSignals.close();
     await recipientSignals.close();
     ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
     recipientRuntime.close();
     ownerRuntime.close();
   });
 
-  it("lets active Steer delivery overtake earlier Deferred work", async () => {
+  it("lets active Steer delivery overtake earlier Deferred work", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
     const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
@@ -574,13 +965,13 @@ describe("direct Signal protocol scenarios", () => {
     const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
     const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
     const batches: InboxBatch[] = [];
-    const recipientSignals = new DirectSignalRuntime({
+    const recipientSignals = directSignalRuntime(test, {
       controlPlane: recipientRuntime.controlPlane,
       ownership: recipientRun.ownership,
       projectInboxBatch(batch) { batches.push(batch); },
     });
     await recipientSignals.start();
-    const ownerSignals = new DirectSignalRuntime({ controlPlane: ownerRuntime.controlPlane, allocateMessageId: () => scenario.identities.next() });
+    const ownerSignals = directSignalRuntime(test, { controlPlane: ownerRuntime.controlPlane, allocateMessageId: () => scenario.identities.next() });
     const ownerSession = { agentId: owner.agentId, sessionPath: ownerRuntime.workflow.ownerSessionPath };
     const deferredSource = scenario.transcripts.appendAgentSend(ownerSession, {
       targetAgentId: recipient.agentId, message: "deferred", timing: "deferred",
@@ -603,14 +994,14 @@ describe("direct Signal protocol scenarios", () => {
     assert.deepEqual(batches[1].messages.map((message) => message.messageId), [deferred.messageId]);
     assert.equal(recipientSignals.confirmDelivery(deferred.messageId), true);
 
-    ownerSignals.close();
+    await ownerSignals.close();
     await recipientSignals.close();
     ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
     recipientRuntime.close();
     ownerRuntime.close();
   });
 
-  it("reconciles transcript evidence after projection commits before delivery confirmation", async () => {
+  it("reconciles transcript evidence after projection commits before delivery confirmation", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
     const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
@@ -619,13 +1010,13 @@ describe("direct Signal protocol scenarios", () => {
     const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
     const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
     ownerRuntime.settleActivation(recipientRun);
-    const firstRouter = new DirectSignalRuntime({
+    const firstRouter = directSignalRuntime(test, {
       controlPlane: recipientRuntime.controlPlane,
       ownership: recipientRun.ownership,
       projectInboxBatch(batch) { scenario.transcripts.appendInboxBatch(recipientSession, batch); },
     });
     await firstRouter.start();
-    const ownerSignals = new DirectSignalRuntime({ controlPlane: ownerRuntime.controlPlane, allocateMessageId: () => scenario.identities.next() });
+    const ownerSignals = directSignalRuntime(test, { controlPlane: ownerRuntime.controlPlane, allocateMessageId: () => scenario.identities.next() });
     const sourceEntryId = scenario.transcripts.appendAgentSend(
       { agentId: owner.agentId, sessionPath: ownerRuntime.workflow.ownerSessionPath },
       { targetAgentId: recipient.agentId, message: "durable once" },
@@ -634,7 +1025,7 @@ describe("direct Signal protocol scenarios", () => {
     await waitFor(() => readFileSync(recipientSession.sessionPath, "utf8").includes(receipt.messageId));
     await firstRouter.close();
     let replayed = 0;
-    const recoveredRouter = new DirectSignalRuntime({
+    const recoveredRouter = directSignalRuntime(test, {
       controlPlane: recipientRuntime.controlPlane,
       ownership: recipientRun.ownership,
       projectInboxBatch() { replayed += 1; },
@@ -646,14 +1037,14 @@ describe("direct Signal protocol scenarios", () => {
     assert.equal(recoveredRouter.inspectMessage(receipt.messageId)?.deliveryStatus, "delivered");
     assert.deepEqual(recoveredRouter.listPending(recipientRuntime.agent(recipient.agentId)), []);
 
-    ownerSignals.close();
+    await ownerSignals.close();
     await recoveredRouter.close();
     ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
     recipientRuntime.close();
     ownerRuntime.close();
   });
 
-  it("retains a queued pointer when projection fails and recovers it after restart", async () => {
+  it("retains a queued pointer when projection fails and recovers it after restart", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
     const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
@@ -662,13 +1053,13 @@ describe("direct Signal protocol scenarios", () => {
     const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
     const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
     ownerRuntime.settleActivation(recipientRun);
-    const failingRouter = new DirectSignalRuntime({
+    const failingRouter = directSignalRuntime(test, {
       controlPlane: recipientRuntime.controlPlane,
       ownership: recipientRun.ownership,
       projectInboxBatch() { throw new Error("projection crash"); },
     });
     await failingRouter.start();
-    const ownerSignals = new DirectSignalRuntime({ controlPlane: ownerRuntime.controlPlane, allocateMessageId: () => scenario.identities.next() });
+    const ownerSignals = directSignalRuntime(test, { controlPlane: ownerRuntime.controlPlane, allocateMessageId: () => scenario.identities.next() });
     const sourceEntryId = scenario.transcripts.appendAgentSend(
       { agentId: owner.agentId, sessionPath: ownerRuntime.workflow.ownerSessionPath },
       { targetAgentId: recipient.agentId, message: "recover me" },
@@ -678,7 +1069,7 @@ describe("direct Signal protocol scenarios", () => {
     assert.equal(failingRouter.inspectMessage(receipt.messageId)?.deliveryStatus, "queued");
     await failingRouter.close();
     const recovered: InboxBatch[] = [];
-    const recoveredRouter = new DirectSignalRuntime({
+    const recoveredRouter = directSignalRuntime(test, {
       controlPlane: recipientRuntime.controlPlane,
       ownership: recipientRun.ownership,
       projectInboxBatch(batch) { recovered.push(batch); },
@@ -688,66 +1079,11 @@ describe("direct Signal protocol scenarios", () => {
     assert.deepEqual(recovered[0].messages.map((message) => message.messageId), [receipt.messageId]);
     assert.equal(recoveredRouter.confirmDelivery(receipt.messageId), true);
 
-    ownerSignals.close();
+    await ownerSignals.close();
     await recoveredRouter.close();
     ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
     recipientRuntime.close();
     ownerRuntime.close();
   });
 
-  it("upgrades queued issue #18 pointers with default Steer timing", async () => {
-    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
-    const { runtime: ownerRuntime } = scenario.createOwner();
-    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
-    const recipientSession = scenario.childSession(ownerRuntime, "recipient");
-    const recipient = ownerRuntime.addAgent({ session: recipientSession, spawner: owner, name: "Recipient" });
-    const database = new DatabaseSync(ownerRuntime.workflow.databasePath);
-    database.exec(`
-      CREATE TABLE direct_signal_messages (
-        message_id TEXT PRIMARY KEY,
-        sender_agent_id TEXT NOT NULL,
-        recipient_agent_id TEXT NOT NULL,
-        source_entry_id TEXT NOT NULL,
-        payload_digest TEXT NOT NULL,
-        acceptance_sequence INTEGER,
-        delivery_status TEXT NOT NULL,
-        created_at_ms INTEGER NOT NULL,
-        accepted_at_ms INTEGER,
-        delivered_at_ms INTEGER,
-        UNIQUE (sender_agent_id, source_entry_id)
-      ) STRICT;
-      CREATE TABLE recipient_acceptance_counters (
-        agent_id TEXT PRIMARY KEY,
-        last_sequence INTEGER NOT NULL
-      ) STRICT;
-      CREATE TABLE pending_message_pointers (
-        message_id TEXT PRIMARY KEY,
-        sender_agent_id TEXT NOT NULL,
-        recipient_agent_id TEXT NOT NULL,
-        source_entry_id TEXT NOT NULL,
-        payload_digest TEXT NOT NULL,
-        acceptance_sequence INTEGER NOT NULL,
-        accepted_at_ms INTEGER NOT NULL,
-        UNIQUE (recipient_agent_id, acceptance_sequence)
-      ) STRICT;
-    `);
-    database.prepare(`
-      INSERT INTO direct_signal_messages VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, NULL)
-    `).run("legacy-message", owner.agentId, recipient.agentId, "legacy-source", "legacy-digest", 1, 1, 2);
-    database.prepare(`INSERT INTO recipient_acceptance_counters VALUES (?, ?)`).run(recipient.agentId, 1);
-    database.prepare(`
-      INSERT INTO pending_message_pointers VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run("legacy-message", owner.agentId, recipient.agentId, "legacy-source", "legacy-digest", 1, 2);
-    database.close();
-
-    const store = new DirectSignalStore(ownerRuntime.workflow.databasePath);
-    assert.equal(store.inspectMessage(owner.agentId, "legacy-message")?.deliveryTiming, "steer");
-    assert.deepEqual(store.listPending(ownerRuntime.agent(recipient.agentId)).map((pointer) => ({
-      messageId: pointer.messageId,
-      deliveryTiming: pointer.deliveryTiming,
-      acceptanceSequence: pointer.acceptanceSequence,
-    })), [{ messageId: "legacy-message", deliveryTiming: "steer", acceptanceSequence: 1 }]);
-    store.close();
-    ownerRuntime.close();
-  });
 });

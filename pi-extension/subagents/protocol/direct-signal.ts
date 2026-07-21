@@ -18,17 +18,20 @@ import type {
   InboxBatch,
   PendingMessagePointer,
   QueuedSignalReceipt,
+  RequestRecord,
   SignalAcceptRequest,
   SignalDeliveryTiming,
   SignalReceiptReply,
 } from "./direct-signal-types.ts";
 
 export type {
+  ActionableMessageKind,
   DirectSignalMessage,
   DirectSignalRecord,
   InboxBatch,
   PendingMessagePointer,
   QueuedSignalReceipt,
+  RequestRecord,
   SignalDeliveryTiming,
 } from "./direct-signal-types.ts";
 
@@ -46,6 +49,8 @@ export interface DirectSignalRuntimeOptions {
   now?: () => number;
 }
 
+type MessageTarget = { agentId: string; workflowOwnerId?: string } | { requestId: string };
+
 export class DirectSignalRuntime {
   readonly #controlPlane: WorkflowControlPlane;
   readonly #ownership: AgentRunOwnership | undefined;
@@ -57,6 +62,7 @@ export class DirectSignalRuntime {
   readonly #store: DirectSignalStore;
   #router: RecipientInboxRouter | undefined;
   #routerStartup: Promise<void> | undefined;
+  #closePromise: Promise<void> | undefined;
   #closed = false;
 
   constructor(options: DirectSignalRuntimeOptions) {
@@ -112,37 +118,46 @@ export class DirectSignalRuntime {
     this.#router?.configureDelivery(input);
   }
 
-  async sendSignal(input: {
-    target: AgentReference;
+  /** Send a Signal, Request, Answer, or Answer-and-Request. */
+  async sendMessage(input: {
+    target: MessageTarget;
     message: string;
     sourceEntryId: string;
     deliveryTiming?: SignalDeliveryTiming;
+    responseRequired?: boolean;
   }): Promise<QueuedSignalReceipt> {
     this.#assertOpen();
-    assertNonEmpty(input.message, "Signal message");
-    assertNonEmpty(input.sourceEntryId, "Signal source entry ID");
-    const deliveryTiming = input.deliveryTiming ?? "steer";
+    assertNonEmpty(input.message, "Message");
+    assertNonEmpty(input.sourceEntryId, "Message source entry ID");
     const sender = this.#controlPlane.currentAgent;
-    this.#controlPlane.authorizeDirectTarget(sender, input.target);
+    const responseRequired = input.responseRequired === true;
+    const target = this.#resolveTarget(sender, input.target, input.deliveryTiming);
     const payloadDigest = digestPayload(input.message);
-    const existing = this.#store.findSignalBySource({
+    const existing = this.#store.findMessageBySource({
       sender,
-      recipient: input.target,
+      recipient: target.recipient,
       sourceEntryId: input.sourceEntryId,
       payloadDigest,
-      deliveryTiming,
+      deliveryTiming: target.deliveryTiming,
+      responseRequired,
+      inReplyToRequestId: target.inReplyToRequestId,
     });
     if (existing && existing.deliveryStatus !== "bound") return receiptFor(existing);
+    if (target.inReplyToRequestId && this.#store.inspectRequest(sender.workflowOwnerId, target.inReplyToRequestId)?.status !== "open") {
+      throw new WorkflowProtocolError("AnswerAlreadyClosed", `Request ${target.inReplyToRequestId} already has a terminal Answer`);
+    }
 
-    const route = this.#store.readRouter(input.target);
-    if (!route) throw recipientUnreachable(input.target.agentId);
-    const bound = existing ?? this.#store.bindSignal({
+    const route = this.#store.readRouter(target.recipient);
+    if (!route) throw recipientUnreachable(target.recipient.agentId);
+    const bound = existing ?? this.#store.bindMessage({
       messageId: this.#allocateMessageId(),
       sender,
-      recipient: input.target,
+      recipient: target.recipient,
       sourceEntryId: input.sourceEntryId,
       payloadDigest,
-      deliveryTiming,
+      deliveryTiming: target.deliveryTiming,
+      responseRequired,
+      inReplyToRequestId: target.inReplyToRequestId,
       createdAtMs: this.#now(),
     });
     if (bound.deliveryStatus !== "bound") return receiptFor(bound);
@@ -150,10 +165,12 @@ export class DirectSignalRuntime {
       workflowOwnerId: sender.workflowOwnerId,
       messageId: bound.messageId,
       senderAgentId: sender.agentId,
-      recipientAgentId: input.target.agentId,
+      recipientAgentId: target.recipient.agentId,
       sourceEntryId: input.sourceEntryId,
       payloadDigest,
-      deliveryTiming,
+      deliveryTiming: target.deliveryTiming,
+      responseRequired,
+      ...(target.inReplyToRequestId ? { inReplyToRequestId: target.inReplyToRequestId } : {}),
       message: input.message,
     };
 
@@ -161,18 +178,31 @@ export class DirectSignalRuntime {
     try {
       reply = await this.#requestReceipt(route.endpoint, request);
     } catch (error) {
-      // The recipient and sender share durable coordination state. A closed
-      // receipt channel is ambiguous only until this same identity is read.
       const reconciled = this.#store.inspectMessage(sender.workflowOwnerId, bound.messageId);
       if (reconciled && reconciled.deliveryStatus !== "bound") return receiptFor(reconciled);
-      this.#store.discardUnacceptedSignal(sender, bound.messageId);
-      throw recipientUnreachable(input.target.agentId, error);
+      this.#store.discardUnacceptedMessage(sender, bound.messageId);
+      throw recipientUnreachable(target.recipient.agentId, error);
     }
     if (!reply.accepted || !reply.receipt) {
-      this.#store.discardUnacceptedSignal(sender, bound.messageId);
+      this.#store.discardUnacceptedMessage(sender, bound.messageId);
       throw replyError(reply.error);
     }
     return reply.receipt;
+  }
+
+  /** Compatibility-shaped convenience for ordinary Signals. */
+  sendSignal(input: {
+    target: AgentReference;
+    message: string;
+    sourceEntryId: string;
+    deliveryTiming?: SignalDeliveryTiming;
+  }): Promise<QueuedSignalReceipt> {
+    return this.sendMessage({
+      target: { agentId: input.target.agentId, workflowOwnerId: input.target.workflowOwnerId },
+      message: input.message,
+      sourceEntryId: input.sourceEntryId,
+      deliveryTiming: input.deliveryTiming,
+    });
   }
 
   inspectMessage(messageId: string): DirectSignalRecord | undefined {
@@ -183,6 +213,16 @@ export class DirectSignalRuntime {
   listMessages(): DirectSignalRecord[] {
     this.#assertOpen();
     return this.#store.listMessages(this.#controlPlane.workflow.ownerAgentId);
+  }
+
+  inspectRequest(requestId: string): RequestRecord | undefined {
+    this.#assertOpen();
+    return this.#store.inspectRequest(this.#controlPlane.workflow.ownerAgentId, requestId);
+  }
+
+  listRequests(requester: AgentReference): RequestRecord[] {
+    this.#assertOpen();
+    return this.#store.listRequests(requester);
   }
 
   listPending(recipient: AgentReference): PendingMessagePointer[] {
@@ -200,16 +240,50 @@ export class DirectSignalRuntime {
     this.#router?.releaseDeferred();
   }
 
-  close(): void | Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    if (this.#closePromise) return this.#closePromise;
     this.#closed = true;
-    if (!this.#router) {
-      this.#store.close();
-      return;
-    }
+    this.#closePromise = this.#close();
+    return this.#closePromise;
+  }
+
+  async #close(): Promise<void> {
+    // Router startup reports its own failure; closing must still release the
+    // store when that startup raced with shutdown.
+    await this.#routerStartup?.catch(() => undefined);
     const router = this.#router;
     this.#router = undefined;
-    return router.close().finally(() => this.#store.close());
+    try {
+      await router?.close();
+    } finally {
+      this.#store.close();
+    }
+  }
+
+  #resolveTarget(
+    sender: AgentReference,
+    target: MessageTarget,
+    deliveryTiming: SignalDeliveryTiming | undefined,
+  ): { recipient: AgentReference; deliveryTiming: SignalDeliveryTiming; inReplyToRequestId?: string } {
+    if ("agentId" in target) {
+      const recipient = target.workflowOwnerId
+        ? { workflowOwnerId: target.workflowOwnerId, agentId: target.agentId }
+        : this.#controlPlane.agent(target.agentId);
+      this.#controlPlane.authorizeDirectTarget(sender, recipient);
+      return { recipient, deliveryTiming: deliveryTiming ?? "steer" };
+    }
+    if (deliveryTiming !== undefined) {
+      throw new WorkflowProtocolError(
+        "InvalidMessageSource",
+        "Request-targeted messages derive delivery timing from the referenced Request",
+      );
+    }
+    const request = this.#store.requireAnswerTarget(sender, target.requestId, true);
+    return {
+      recipient: this.#controlPlane.agent(request.requesterAgentId),
+      deliveryTiming: request.answerDeliveryTiming,
+      inReplyToRequestId: request.requestId,
+    };
   }
 
   async #requestReceipt(endpoint: string, request: SignalAcceptRequest): Promise<SignalReceiptReply> {
@@ -222,11 +296,7 @@ export class DirectSignalRuntime {
     try {
       const receiptWaiter = createReceiptWaiter(connection);
       try {
-        await connection.send({
-          version: CURRENT_IPC_VERSION,
-          type: SIGNAL_REQUEST_TYPE,
-          payload: request,
-        });
+        await connection.send({ version: CURRENT_IPC_VERSION, type: SIGNAL_REQUEST_TYPE, payload: request });
       } catch (error) {
         receiptWaiter.cancel();
         throw error;
@@ -244,10 +314,7 @@ export class DirectSignalRuntime {
   }
 }
 
-function createReceiptWaiter(connection: FramedIpcConnection): {
-  promise: Promise<SignalReceiptReply | undefined>;
-  cancel(): void;
-} {
+function createReceiptWaiter(connection: FramedIpcConnection): { promise: Promise<SignalReceiptReply | undefined>; cancel(): void } {
   let resolvePromise!: (receipt: SignalReceiptReply | undefined) => void;
   let rejectPromise!: (error: Error) => void;
   let settled = false;
@@ -255,16 +322,9 @@ function createReceiptWaiter(connection: FramedIpcConnection): {
   let deferErrorUnsubscribe = false;
   let unsubscribeMessage = () => { deferMessageUnsubscribe = true; };
   let unsubscribeError = () => { deferErrorUnsubscribe = true; };
-  const promise = new Promise<SignalReceiptReply | undefined>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
+  const promise = new Promise<SignalReceiptReply | undefined>((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
   const timeout = setTimeout(() => rejectOnce(new Error("Timed out waiting for durable Signal acceptance receipt")), ACCEPTANCE_TIMEOUT_MS);
-  const cleanup = () => {
-    clearTimeout(timeout);
-    unsubscribeMessage();
-    unsubscribeError();
-  };
+  const cleanup = () => { clearTimeout(timeout); unsubscribeMessage(); unsubscribeError(); };
   const resolveOnce = (receipt: SignalReceiptReply | undefined) => {
     if (settled) return;
     settled = true;
@@ -295,29 +355,20 @@ function createReceiptWaiter(connection: FramedIpcConnection): {
 }
 
 function receiptFor(record: DirectSignalRecord): QueuedSignalReceipt {
-  if (record.acceptanceSequence === undefined) throw new Error(`Signal ${record.messageId} is not durably accepted`);
-  return {
-    status: "queued",
-    messageId: record.messageId,
-    recipientAgentId: record.recipientAgentId,
-    acceptanceSequence: record.acceptanceSequence,
-  };
+  if (record.acceptanceSequence === undefined) throw new Error(`Message ${record.messageId} is not durably accepted`);
+  return { status: "queued", messageId: record.messageId, recipientAgentId: record.recipientAgentId, acceptanceSequence: record.acceptanceSequence };
 }
 
 function replyError(error: SignalReceiptReply["error"]): Error {
-  if (!error) return new Error("Recipient Inbox Router rejected Signal acceptance");
+  if (!error) return new Error("Recipient Inbox Router rejected message acceptance");
   if (isWorkflowProtocolErrorCode(error.code)) return new WorkflowProtocolError(error.code, error.message);
   return new Error(error.message);
 }
 
 function isWorkflowProtocolErrorCode(code: string | undefined): code is ConstructorParameters<typeof WorkflowProtocolError>[0] {
-  return code === "WorkflowMismatch"
-    || code === "UnknownAgent"
-    || code === "OwnershipLost"
-    || code === "RecipientUnreachable"
-    || code === "RecipientEnded"
-    || code === "MessageIdentityConflict"
-    || code === "InvalidMessageSource";
+  return code === "WorkflowMismatch" || code === "UnknownAgent" || code === "OwnershipLost"
+    || code === "RecipientUnreachable" || code === "RecipientEnded" || code === "MessageIdentityConflict"
+    || code === "InvalidMessageSource" || code === "AnswerUnauthorized" || code === "AnswerAlreadyClosed" || code === "UnknownRequest";
 }
 
 function recipientUnreachable(agentId: string, cause?: unknown): WorkflowProtocolError {

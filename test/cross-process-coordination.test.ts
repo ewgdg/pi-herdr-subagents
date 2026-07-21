@@ -27,6 +27,7 @@ import {
   connectFramedIpc,
   encodeFramedMessage,
 } from "../pi-extension/subagents/coordination/framed-ipc.ts";
+import { SQLiteWorkflowStore } from "../pi-extension/subagents/protocol/sqlite-workflow-store.ts";
 
 const workerPath = fileURLToPath(new URL("./fixtures/coordination-worker.ts", import.meta.url));
 const WORKER_TIMEOUT_MS = 30_000;
@@ -367,37 +368,26 @@ describe("versioned length-prefixed IPC framing", () => {
 });
 
 describe("SQLite cross-process coordination", () => {
-  it("retries complete non-WAL direct Signal initialization under concurrent startup", async () => {
+  it("retries fresh non-WAL direct Signal initialization under concurrent startup", async () => {
     const directory = await temporaryDirectory();
     const rounds = 25;
     const workersPerRound = 4;
     for (let round = 0; round < rounds; round += 1) {
-      const databasePath = join(directory, `legacy-signals-${round}.sqlite`);
+      const databasePath = join(directory, `signals-${round}.sqlite`);
+      new SQLiteWorkflowStore(databasePath).close();
       const database = new DatabaseSync(databasePath);
       database.exec(`
         PRAGMA journal_mode = DELETE;
-      CREATE TABLE direct_signal_messages (
-        message_id TEXT PRIMARY KEY, sender_agent_id TEXT NOT NULL, recipient_agent_id TEXT NOT NULL,
-        source_entry_id TEXT NOT NULL, payload_digest TEXT NOT NULL, acceptance_sequence INTEGER,
-        delivery_status TEXT NOT NULL, created_at_ms INTEGER NOT NULL, accepted_at_ms INTEGER,
-        delivered_at_ms INTEGER, UNIQUE (sender_agent_id, source_entry_id)
-      ) STRICT;
-      CREATE TABLE recipient_acceptance_counters (agent_id TEXT PRIMARY KEY, last_sequence INTEGER NOT NULL) STRICT;
-      CREATE TABLE pending_message_pointers (
-        message_id TEXT PRIMARY KEY, sender_agent_id TEXT NOT NULL, recipient_agent_id TEXT NOT NULL,
-        source_entry_id TEXT NOT NULL, payload_digest TEXT NOT NULL, acceptance_sequence INTEGER NOT NULL,
-        accepted_at_ms INTEGER NOT NULL, UNIQUE (recipient_agent_id, acceptance_sequence)
-      ) STRICT;
-    `);
+      `);
       database.close();
 
       const workers = Array.from(
         { length: workersPerRound },
-        () => spawnWorker("signal-upgrade", databasePath),
+        () => spawnWorker("signal-initialize", databasePath),
       );
       assert.deepEqual(
         await Promise.all(workers.map((worker) => worker.nextResult())),
-        Array.from({ length: workersPerRound }, () => ({ upgraded: true })),
+        Array.from({ length: workersPerRound }, () => ({ initialized: true })),
       );
       await Promise.all(workers.map((worker) => worker.completed));
       const upgraded = new DatabaseSync(databasePath);

@@ -252,6 +252,16 @@ export class WorkflowBootstrap {
     });
   }
 
+  sendDirectMessage(input: {
+    target: { agentId: string } | { requestId: string };
+    message: string;
+    sourceEntryId: string;
+    deliveryTiming?: "steer" | "deferred";
+    responseRequired?: boolean;
+  }): Promise<QueuedSignalReceipt> {
+    return this.#directSignalRuntime().sendMessage(input);
+  }
+
   confirmDirectSignalDelivery(messageId: string): boolean {
     return this.#directSignalRuntime().confirmDelivery(messageId);
   }

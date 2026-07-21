@@ -136,6 +136,7 @@ export class ActivationLifecycleStore {
           (dependency_kind = 'operation' AND dependency_agent_id IS NULL)
         )
       ) STRICT;
+
     `);
   }
 
@@ -575,8 +576,15 @@ export class ActivationLifecycleStore {
       SELECT dependency_kind, dependency_id, dependency_agent_id AS agent_id
       FROM activation_dependencies
       WHERE activation_id = ?
-      ORDER BY created_at_ms, dependency_kind, dependency_id
-    `).all(activationId) as unknown as DependencyRow[];
+      UNION ALL
+      SELECT 'agent' AS dependency_kind, request_id AS dependency_id,
+             responder_agent_id AS agent_id
+      FROM workflow_requests
+      WHERE requester_agent_id = (
+        SELECT agent_id FROM agent_activations WHERE activation_id = ?
+      ) AND status <> 'resolved'
+      ORDER BY dependency_kind, dependency_id
+    `).all(activationId, activationId) as unknown as DependencyRow[];
     if (rows.length === 0) return [{ kind: "human", dependencyId: HUMAN_DEPENDENCY_ID }];
     return rows.map((row) => row.dependency_kind === "agent"
       ? { kind: "agent", dependencyId: row.dependency_id, agentId: row.agent_id! }

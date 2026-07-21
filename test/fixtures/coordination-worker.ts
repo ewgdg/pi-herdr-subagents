@@ -160,10 +160,10 @@ async function runIdleIpcClose(endpoint: string): Promise<void> {
   }));
 }
 
-async function upgradeSignalStore(databasePath: string): Promise<void> {
+async function initializeSignalStore(databasePath: string): Promise<void> {
   const store = new DirectSignalStore(databasePath);
   store.close();
-  await writeResult({ upgraded: true });
+  await writeResult({ initialized: true });
 }
 
 const [command, ...args] = process.argv.slice(2);
@@ -193,8 +193,8 @@ switch (command) {
   case "ipc-idle-close":
     await runIdleIpcClose(args[0]);
     break;
-  case "signal-upgrade":
-    await upgradeSignalStore(args[0]);
+  case "signal-initialize":
+    await initializeSignalStore(args[0]);
     break;
   default:
     throw new Error(`Unknown coordination worker command: ${command}`);

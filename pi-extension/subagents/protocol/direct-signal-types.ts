@@ -1,12 +1,15 @@
 export type SignalDeliveryTiming = "steer" | "deferred";
+export type ActionableMessageKind = "signal" | "request" | "answer";
 
 export interface DirectSignalMessage {
-  kind: "signal";
+  kind: ActionableMessageKind;
   messageId: string;
   senderAgentId: string;
   recipientAgentId: string;
   deliveryTiming: SignalDeliveryTiming;
   message: string;
+  responseRequired?: true;
+  inReplyToRequestId?: string;
 }
 
 export interface InboxBatch {
@@ -23,16 +26,28 @@ export interface QueuedSignalReceipt {
 
 export interface DirectSignalRecord {
   messageId: string;
+  kind: ActionableMessageKind;
   senderAgentId: string;
   recipientAgentId: string;
   sourceEntryId: string;
   payloadDigest: string;
   deliveryTiming: SignalDeliveryTiming;
+  responseRequired: boolean;
+  inReplyToRequestId?: string;
   acceptanceSequence?: number;
   deliveryStatus: "bound" | "queued" | "delivered";
   createdAtMs: number;
   acceptedAtMs?: number;
   deliveredAtMs?: number;
+}
+
+export interface RequestRecord {
+  requestId: string;
+  requesterAgentId: string;
+  responderAgentId: string;
+  answerDeliveryTiming: SignalDeliveryTiming;
+  status: "open" | "answered" | "resolved";
+  answerMessageId?: string;
 }
 
 export interface PendingMessagePointer {
@@ -42,6 +57,8 @@ export interface PendingMessagePointer {
   sourceEntryId: string;
   payloadDigest: string;
   deliveryTiming: SignalDeliveryTiming;
+  responseRequired: boolean;
+  inReplyToRequestId?: string;
   acceptanceSequence: number;
   acceptedAtMs: number;
 }
@@ -54,6 +71,8 @@ export interface SignalAcceptRequest {
   sourceEntryId: string;
   payloadDigest: string;
   deliveryTiming: SignalDeliveryTiming;
+  responseRequired: boolean;
+  inReplyToRequestId?: string;
   message: string;
 }
 

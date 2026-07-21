@@ -8,21 +8,22 @@ import { WorkflowBootstrap } from "./workflow-bootstrap.ts";
 
 const INBOX_BATCH_CUSTOM_TYPE = "agent_inbox_batch";
 
-const AgentSendParams = Type.Object({
-  target: Type.Object({
-    agent: Type.String({
-      description: "Known Agent session UUID in the current Workflow",
-    }),
-  }, { additionalProperties: false }),
-  message: Type.String({
-    minLength: 1,
-    description: "Plain actionable Signal content",
-  }),
-  timing: Type.Optional(Type.Union([
-    Type.Literal("steer"),
-    Type.Literal("deferred"),
-  ])),
+const AgentTarget = Type.Object({
+  agent: Type.String({ description: "Known Agent session UUID in the current Workflow" }),
 }, { additionalProperties: false });
+const RequestTarget = Type.Object({
+  request: Type.String({ description: "Request ID to Answer; routing is derived from that Request" }),
+}, { additionalProperties: false });
+const Message = Type.String({ minLength: 1, description: "Plain actionable message content" });
+const Timing = Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("deferred")]));
+
+/** Complete legal send forms; Request targets derive timing from their Request. */
+export const AgentSendParams = Type.Union([
+  Type.Object({ target: AgentTarget, message: Message, timing: Timing, responseRequired: Type.Optional(Type.Literal(false)) }, { additionalProperties: false }),
+  Type.Object({ target: AgentTarget, message: Message, timing: Timing, responseRequired: Type.Literal(true) }, { additionalProperties: false }),
+  Type.Object({ target: RequestTarget, message: Message, responseRequired: Type.Optional(Type.Literal(false)) }, { additionalProperties: false }),
+  Type.Object({ target: RequestTarget, message: Message, responseRequired: Type.Literal(true) }, { additionalProperties: false }),
+]);
 
 export async function startDirectSignalRouter(
   pi: ExtensionAPI,
@@ -68,14 +69,14 @@ export function registerAgentSendTool(
 
   pi.registerTool({
     name: "agent_send",
-    label: "Send Signal",
+    label: "Send Message",
     description:
-      "Send one direct Signal to a known, addressable Agent in the same Workflow. " +
-      "A successful result is only a durable queued receipt; it does not claim that the recipient understood or acted on the Signal." +
+      "Send a Signal or Request to an addressable Agent, or Answer a Request. " +
+      "A successful result is only a durable queued receipt; it does not claim that the recipient understood or acted on the message." +
       ownerHint,
     promptSnippet:
-      "Send one direct Signal to a known Agent session UUID in the same Workflow. " +
-      "The result is a durable queued receipt, not a read receipt.",
+      "Send a Signal or Request to a known Agent, or Answer a Request ID. " +
+      "An Answer derives its return route and timing from the Request. The result is a durable queued receipt, not a read receipt.",
     parameters: AgentSendParams,
     async execute(toolCallId, params, _signal, _onUpdate, context) {
       await workflowBootstrap.waitUntilReady(context);
@@ -83,21 +84,25 @@ export function registerAgentSendTool(
       assertCanonicalAgentSendSource(
         context.sessionManager.getEntries(),
         toolCallId,
-        params.target.agent,
+        params.target,
         params.message,
-        params.timing ?? "steer",
+        "agent" in params.target ? params.timing : undefined,
+        params.responseRequired === true,
       );
-      const receipt = await workflowBootstrap.sendDirectSignal({
-        targetAgentId: params.target.agent,
+      const receipt = await workflowBootstrap.sendDirectMessage({
+        target: "agent" in params.target
+          ? { agentId: params.target.agent }
+          : { requestId: params.target.request },
         message: params.message,
         sourceEntryId: toolCallId,
-        deliveryTiming: params.timing,
+        deliveryTiming: "agent" in params.target ? params.timing : undefined,
+        responseRequired: params.responseRequired,
       });
       return {
         content: [{
           type: "text",
           text:
-            `Signal ${receipt.messageId} queued for Agent ${receipt.recipientAgentId} ` +
+            `Message ${receipt.messageId} queued for Agent ${receipt.recipientAgentId} ` +
             `(acceptance sequence ${receipt.acceptanceSequence}).`,
         }],
         details: receipt,
@@ -112,17 +117,17 @@ export function projectInboxBatch(batch: InboxBatch): {
   display: true;
   details: {
     messages: Array<{
-      kind: "signal";
+      kind: "signal" | "request" | "answer";
       messageId: string;
       senderAgentId: string;
       recipientAgentId: string;
       deliveryTiming: "steer" | "deferred";
+      responseRequired?: true;
+      inReplyToRequestId?: string;
     }>;
   };
 } {
-  const content = batch.messages.map((signal) =>
-    `Signal from Agent ${signal.senderAgentId} [${signal.messageId}]\n\n${signal.message}`,
-  ).join("\n\n---\n\n");
+  const content = batch.messages.map(projectInboxMessage).join("\n\n---\n\n");
   return {
     customType: INBOX_BATCH_CUSTOM_TYPE,
     content,
@@ -134,6 +139,8 @@ export function projectInboxBatch(batch: InboxBatch): {
         senderAgentId: signal.senderAgentId,
         recipientAgentId: signal.recipientAgentId,
         deliveryTiming: signal.deliveryTiming,
+        ...(signal.responseRequired ? { responseRequired: true as const } : {}),
+        ...(signal.inReplyToRequestId ? { inReplyToRequestId: signal.inReplyToRequestId } : {}),
       })),
     },
   };
@@ -141,6 +148,27 @@ export function projectInboxBatch(batch: InboxBatch): {
 
 export function sessionContainsInboxMessage(entries: unknown[], messageId: string): boolean {
   return inboxMessageIds(entries).includes(messageId);
+}
+
+function projectInboxMessage(message: InboxBatch["messages"][number]): string {
+  const identity = message.kind === "answer"
+    ? `Answer ID: ${message.messageId}`
+    : message.kind === "request" ? `Request ID: ${message.messageId}` : `Message ID: ${message.messageId}`;
+  const label = message.kind === "answer" && message.responseRequired
+    ? "Answer + Request"
+    : message.kind === "answer" ? "Answer" : message.kind === "request" ? "Request" : "Signal";
+  const requirement = message.responseRequired
+    ? message.kind === "answer"
+      ? `Response Requirement: New Request ID ${message.messageId} requires one terminal Answer.`
+      : `Response Requirement: Request ID ${message.messageId} requires one terminal Answer.`
+    : undefined;
+  return [
+    `${label} from Agent ${message.senderAgentId} [${identity}]`,
+    ...(message.inReplyToRequestId ? [`inReplyToRequestId: ${message.inReplyToRequestId}`] : []),
+    ...(requirement ? [requirement] : []),
+    "",
+    message.message,
+  ].join("\n");
 }
 
 function inboxMessageIds(entries: unknown[]): string[] {
@@ -171,9 +199,10 @@ function inboxMessageIds(entries: unknown[]): string[] {
 function assertCanonicalAgentSendSource(
   entries: unknown[],
   toolCallId: string,
-  targetAgentId: string,
+  target: { agent?: string; request?: string },
   message: string,
-  deliveryTiming: "steer" | "deferred",
+  deliveryTiming: "steer" | "deferred" | undefined,
+  responseRequired: boolean,
 ): void {
   const found = entries.some((entry) => {
     if (!entry || typeof entry !== "object") return false;
@@ -187,14 +216,16 @@ function assertCanonicalAgentSendSource(
         type?: unknown;
         id?: unknown;
         name?: unknown;
-        arguments?: { target?: { agent?: unknown }; message?: unknown; timing?: unknown };
+        arguments?: { target?: { agent?: unknown; request?: unknown }; message?: unknown; timing?: unknown; responseRequired?: unknown };
       };
       return candidate.type === "toolCall"
         && candidate.id === toolCallId
         && candidate.name === "agent_send"
-        && candidate.arguments?.target?.agent === targetAgentId
+        && candidate.arguments?.target?.agent === target.agent
+        && candidate.arguments?.target?.request === target.request
         && candidate.arguments?.message === message
-        && (candidate.arguments?.timing ?? "steer") === deliveryTiming;
+        && candidate.arguments?.timing === deliveryTiming
+        && (candidate.arguments?.responseRequired === true) === responseRequired;
     });
   });
   if (!found) {

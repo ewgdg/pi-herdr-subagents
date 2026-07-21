@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { Value } from "@sinclair/typebox/value";
+import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import {
+  AgentSendParams,
   confirmProjectedInboxBatches,
   projectInboxBatch,
   sessionContainsInboxMessage,
@@ -68,6 +71,61 @@ describe("direct Signal Pi transcript projection", () => {
     }]);
   });
 
+  it("makes a Request's identity and response requirement visible to the model", () => {
+    const projected = projectInboxBatch({
+      messages: [{
+        kind: "request", messageId: "request-1", senderAgentId: "sender", recipientAgentId: "recipient",
+        message: "REQUEST_PAYLOAD", responseRequired: true,
+      }],
+    });
+
+    assert.match(projected.content, /Request ID: request-1/);
+    assert.match(projected.content, /Response Requirement: Request ID request-1 requires one terminal Answer\./);
+    assert.equal(llmVisibleContent(projected), projected.content);
+  });
+
+  it("makes an Answer's identity and Request correlation visible to the model", () => {
+    const projected = projectInboxBatch({
+      messages: [{
+        kind: "answer", messageId: "answer-1", senderAgentId: "sender", recipientAgentId: "recipient",
+        message: "ANSWER_PAYLOAD", inReplyToRequestId: "request-1",
+      }],
+    });
+
+    assert.match(projected.content, /Answer ID: answer-1/);
+    assert.match(projected.content, /inReplyToRequestId: request-1/);
+    assert.equal(llmVisibleContent(projected), projected.content);
+  });
+
+  it("makes an Answer-plus-Request's correlation and response requirement visible to the model", () => {
+    const projected = projectInboxBatch({
+      messages: [{
+        kind: "answer", messageId: "answer-request-1", senderAgentId: "sender", recipientAgentId: "recipient",
+        message: "ANSWER_REQUEST_PAYLOAD", inReplyToRequestId: "request-1", responseRequired: true,
+      }],
+    });
+
+    assert.match(projected.content, /Answer ID: answer-request-1/);
+    assert.match(projected.content, /inReplyToRequestId: request-1/);
+    assert.match(projected.content, /Response Requirement: New Request ID answer-request-1 requires one terminal Answer\./);
+    assert.equal(llmVisibleContent(projected), projected.content);
+  });
+
+  it("validates only the agent_send variants legal at runtime", () => {
+    for (const params of [
+      { target: { agent: "agent" }, message: "signal" },
+      { target: { agent: "agent" }, message: "signal", timing: "deferred", responseRequired: false },
+      { target: { agent: "agent" }, message: "request", timing: "steer", responseRequired: true },
+      { target: { request: "request" }, message: "answer" },
+      { target: { request: "request" }, message: "answer", responseRequired: false },
+      { target: { request: "request" }, message: "answer and request", responseRequired: true },
+    ]) assert.equal(Value.Check(AgentSendParams, params), true, JSON.stringify(params));
+
+    assert.equal(Value.Check(AgentSendParams, {
+      target: { request: "request" }, message: "illegal caller timing", timing: "steer",
+    }), false, "Request-target timing must be rejected by the registered schema");
+  });
+
   it("recognizes durable Inbox Batch evidence by Message Identity", () => {
     const projected = projectInboxBatch({
       messages: [{
@@ -132,3 +190,12 @@ describe("direct Signal Pi transcript projection", () => {
     assert.deepEqual(confirmed, ["message-3"]);
   });
 });
+
+function llmVisibleContent(projected: ReturnType<typeof projectInboxBatch>): string {
+  const [message] = convertToLlm([{
+    role: "custom",
+    ...projected,
+    timestamp: 0,
+  }] as never) as Array<{ content: Array<{ type: string; text?: string }> }>;
+  return message.content[0].text!;
+}
