@@ -1,19 +1,18 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import {
-  createConnection,
   createServer,
-  type AddressInfo,
   type Server,
-  type Socket,
+  Socket,
 } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { afterEach, describe, it } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import {
   SQLiteCoordinationStore,
@@ -151,21 +150,27 @@ function acquired(result: OwnershipAcquisition): OwnershipToken {
 
 async function openSocketPair(
   options: ConstructorParameters<typeof FramedIpcConnection>[1] = {},
+  writableHighWaterMark?: number,
 ): Promise<{
   connection: FramedIpcConnection;
+  transport: Socket;
   peer: Socket;
   server: Server;
 }> {
   const server = createServer();
-  server.listen(0, "127.0.0.1");
+  const endpoint = process.platform === "win32"
+    ? `\\\\.\\pipe\\pi-herdr-${process.pid}-${randomUUID()}`
+    : join(await temporaryDirectory(), "framed-ipc.sock");
+  server.listen(endpoint);
   await once(server, "listening");
-  const address = server.address() as AddressInfo;
   const accepted = once(server, "connection") as Promise<[Socket]>;
-  const client = createConnection({ port: address.port, host: "127.0.0.1" });
-  await once(client, "connect");
+  const transport = new Socket({ writableHighWaterMark });
+  transport.connect(endpoint);
+  await once(transport, "connect");
   const [peer] = await accepted;
   return {
-    connection: new FramedIpcConnection(client, options),
+    connection: new FramedIpcConnection(transport, options),
+    transport,
     peer,
     server,
   };
@@ -242,25 +247,31 @@ describe("versioned length-prefixed IPC framing", () => {
     await Promise.all([client.completed, server.completed]);
   });
 
-  it("waits for a slow reader instead of hiding socket backpressure", async () => {
-    const maximumFrameBytes = 32 * 1024 * 1024;
-    const { connection, peer, server } = await openSocketPair({ maximumFrameBytes });
+  it("waits for a backpressured transport to flush before resolving", async () => {
+    const maximumFrameBytes = 64 * 1024;
+    const { connection, transport, peer, server } = await openSocketPair(
+      { maximumFrameBytes },
+      1,
+    );
     peer.pause();
+    transport.cork();
     let sendCompleted = false;
 
     try {
       const sending = connection.send({
         version: CURRENT_IPC_VERSION,
         type: "large",
-        payload: "x".repeat(24 * 1024 * 1024),
+        payload: "x".repeat(16 * 1024),
       }).then(() => {
         sendCompleted = true;
       });
-      await delay(25);
+      await nextTurn();
+      assert.equal(transport.writableNeedDrain, true, "test must establish backpressure");
       assert.equal(sendCompleted, false);
 
-      peer.resume();
       peer.on("data", () => {});
+      peer.resume();
+      transport.uncork();
       await sending;
       connection.end();
       assert.deepEqual(await connection.closed, { kind: "closed" });
@@ -269,6 +280,7 @@ describe("versioned length-prefixed IPC framing", () => {
         /not writable/,
       );
     } finally {
+      transport.uncork();
       peer.destroy();
       await closeServer(server);
     }
