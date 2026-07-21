@@ -73,7 +73,7 @@ An actionable message targeting one Request, sent only by the Agent that receive
 _Avoid_: Progress update, uncorrelated reply
 
 **Protocol Notice**:
-A runtime-authored actionable input whose canonical payload lives in a Request or Operational Incident record rather than a sender transcript. It has a Workflow-unique identity and uses ordinary recipient ordering, Inbox Batch, deduplication, wake, and transcript-commit rules. Cancellation notices, orphan notices, and Incident Escalations are Protocol Notices; passive lifecycle and delivery facts are not.
+A runtime-authored actionable input whose canonical payload lives in a Request, Operational Incident, or Undeclared Settlement episode record rather than a sender transcript. It has a Workflow-unique identity and uses ordinary recipient ordering, Inbox Batch, deduplication, wake, and transcript-commit rules. Cancellation notices, orphan notices, Undeclared Settlement Notices, and Incident Escalations are Protocol Notices; passive lifecycle and delivery facts are not.
 _Avoid_: Signal, passive runtime event, fabricated Answer
 
 **Spawned Initial Request**:
@@ -82,7 +82,19 @@ _Avoid_: Empty Agent, post-spawn kickoff
 
 **Post-Acceptance Disposition**:
 The sender's declared action after durable message acceptance: `continue` permits another model turn, `settle` suppresses the automatic follow-up model turn and derives typed waiting without ending the Agent Run, and `complete` ends a Subagent activation. For the Workflow Owner, `settle` ends only the current Pi turn and `complete` is invalid. Acceptance failure applies no disposition. Completion is invalid when the same message creates a Response Requirement.
-_Avoid_: Wait operation, delivery status, implicit auto-exit
+_Avoid_: Generic wait operation, delivery status, implicit auto-exit
+
+**Human Interrupt**:
+The durable pause created when an ordinary Subagent calls `agent_ask_user({ question })`. The required plain-text question is canonical in that tool call and is not parsed or semantically validated. The call atomically checkpoints the session, records one pending interrupt identified internally by the tool-call ID, enters `waiting(human)`, and settles. The human answers normally in that Subagent's pane; submission durably binds the input and clears `DECIDE`, but the interrupt remains a response-bound recovery obligation until resume commits the original tool call's result. An unclear response still resolves that interaction, so the Subagent asks again with a new call when needed. Workflow Owners and Moderators cannot create Human Interrupts. While awaiting response, other actionable inputs remain queued and do not wake the Subagent. Human-wait duration alone never escalates.
+_Avoid_: Agent Request, concurrently mutable dependency, model-decided resolution, generic wait marker
+
+**Undeclared Settlement**:
+A Subagent settlement with no terminal action and no declared Agent or operation dependency or Human Interrupt. It is a protocol error represented as `waiting(undeclared)`, never `waiting(human)`. The runtime delivers one durable Undeclared Settlement Notice per continuous episode. Completion or activation cancellation closes the episode; failure preserves it as recovery-pending work without granting another correction allowance. A declared dependency resets the allowance only after new input satisfies it. Another undeclared settlement creates an Operational Incident, except that a Moderator uses the existing Owner Handoff fallback rather than creating nested moderation.
+_Avoid_: Human waiting, elapsed-time stall, silent retry loop
+
+**Undeclared Settlement Notice**:
+The runtime-authored Protocol Notice that starts the single self-correction turn for an Undeclared Settlement episode. Its canonical payload lives in that episode's durable record so the correction is auditable and effectively once rather than a silent resume.
+_Avoid_: Human prompt, passive status, repeated retry loop
 
 **Terminal Message Completion**:
 Completion of a subagent activation atomically combined with durable acceptance of its final outbound Signal or Answer through Post-Acceptance Disposition `complete`. It must satisfy the common Completion Gate.
@@ -93,11 +105,11 @@ A trust-based, no-argument `agent_complete()` lifecycle action for a Subagent th
 _Avoid_: Result-message selection, semantic output validation, human confirmation
 
 **Completion Gate**:
-The mechanical safety conditions shared by fused and standalone Subagent completion. After the completion commit, the Subagent must have no unresolved incoming, outgoing, or recovery-pending Request obligations; no accepted but undelivered actionable inbox inputs; and no unresolved operation, message acceptance, cancellation, ownership, or side-effect uncertainty. Unneeded work must be explicitly cancelled or abandoned first. Concurrent inbound acceptance and completion are serialized, and the first durable commit determines whether completion succeeds or is blocked.
+The mechanical safety conditions shared by fused and standalone Subagent completion. After the completion commit, the Subagent must have no unresolved incoming, outgoing, or recovery-pending Request obligations; no pending Human Interrupt or response-bound result awaiting resume; no accepted but undelivered actionable inbox inputs; and no unresolved operation, message acceptance, cancellation, ownership, or side-effect uncertainty. Unneeded work must be explicitly cancelled or abandoned first. Completion from an Undeclared Settlement correction turn atomically closes that episode. Concurrent inbound acceptance and completion are serialized, and the first durable commit determines whether completion succeeds or is blocked.
 _Avoid_: Semantic result validation, silent obligation abandonment
 
 **Activation Cancellation**:
-An authorized, deliberate termination of an open Agent activation, recorded as `ended(cancelled)` rather than failure. The first durable completion or cancellation commit wins; a cancellation that cannot confirm termination remains in doubt rather than being reported as successful. Cancellation does not fabricate Answers, roll back completed work, or erase unresolved Request obligations.
+An authorized, deliberate termination of an open Agent activation, recorded as `ended(cancelled)` rather than failure. The first durable completion or cancellation commit wins; a cancellation that cannot confirm termination remains in doubt rather than being reported as successful. Cancellation terminalizes any pending or response-bound Human Interrupt and any Undeclared Settlement episode, clears their attention projections, and marks an unconsumed human result stale and non-deliverable. Late human input cannot revive the cancelled work. Cancellation does not fabricate Answers, roll back completed work, or erase unresolved Request obligations.
 _Avoid_: Failure, Request Cancellation, interruption
 
 **Obligation-Preserving Cancellation**:
@@ -109,7 +121,7 @@ Delivery of an actionable message to an active Agent at the next LLM-turn bounda
 _Avoid_: Mid-turn injection, interrupt
 
 **Deferred Delivery**:
-Delivery that preserves an active Agent's current work until `agent_settled`, then starts a new Agent run with the actionable message. When the recipient is already waiting, there is no active work to preserve and delivery may start immediately.
+Delivery that preserves an active Agent's current work until `agent_settled`, then starts a new Agent run with the actionable message. When the recipient is already waiting without a Human Interrupt, there is no active work to preserve and delivery may start immediately. A pending Human Interrupt keeps non-human input queued until its resume boundary.
 _Avoid_: Passive notification, delayed observability
 
 **Inbox Batch**:
@@ -125,11 +137,11 @@ Passive transport and session facts: `queued` means durably accepted into the re
 _Avoid_: Agent lifecycle state, acknowledgement message
 
 **Message Wake Rule**:
-An actionable message schedules immediate work for a waiting Agent and enters an active Agent according to its delivery timing. Signals may queue for an interrupted Agent and are rejected for an ended Agent. A Request from a direct Spawner or Workflow Owner may restart interrupted work or create a new activation for an ended Agent; the same Request from a merely addressable peer is rejected.
+An actionable message schedules immediate work for an ordinarily waiting Agent and enters an active Agent according to its delivery timing. A pending Human Interrupt instead queues non-human input until the human-resume boundary. Signals may queue for an interrupted Agent and are rejected for an ended Agent. A Request from a direct Spawner or Workflow Owner may restart interrupted work or create a new activation for an ended Agent; the same Request from a merely addressable peer is rejected.
 _Avoid_: Addressability as resume authority, revival by Signal
 
 **Independent Dependency Wakeup**:
-Delivery of any Answer starts its requester independently of other outstanding Requests. Unresolved Requests remain dependencies, and the Agent may return to `waiting(agent)` after processing the delivered Answer; transport provides no `all` or `any` synchronization.
+Outside a Human Interrupt, delivery of any Answer starts its requester independently of other outstanding Requests. While a Human Interrupt is pending, Agent and operation inputs remain durably queued without waking the Subagent; the human response resumes the suspended tool call and makes queued eligible inputs available at that resumed model boundary. Transport provides no `all` or `any` synchronization.
 _Avoid_: Barrier, join policy
 
 **Dependency Deadlock**:
@@ -141,7 +153,7 @@ A causal sequence in which an Answer also creates the next Response Requirement.
 _Avoid_: Mandatory hop limit, conversation thread, deadlock proxy
 
 **Operational Incident**:
-One deduplicated episode where a runtime-confirmed operational condition blocks progress or safe cleanup, deterministic recovery or reconciliation is exhausted or cannot choose safely, and resolution requires temporary diagnostic visibility or lifecycle authority. Confirmed Dependency Deadlock, exhausted Automatic Recovery, and persistent cancellation, ownership, acceptance, or side-effect uncertainty after bounded reconciliation qualify. Ordinary watch conditions, domain decisions, bare timeouts, and failures with recovery still available do not.
+One deduplicated episode where a runtime-confirmed operational condition blocks progress or safe cleanup, deterministic recovery or reconciliation is exhausted or cannot choose safely, and resolution requires temporary diagnostic visibility or lifecycle authority. Confirmed Dependency Deadlock, repeated Undeclared Settlement after its single correction, exhausted Automatic Recovery, and persistent cancellation, ownership, acceptance, or side-effect uncertainty after bounded reconciliation qualify. A Moderator's repeated Undeclared Settlement uses Owner Handoff fallback instead of creating another incident. Ordinary watch conditions, domain decisions, bare timeouts, and failures with recovery still available do not.
 _Avoid_: Suspicion, attention item, timeout alert, domain escalation
 
 **Incident Scope**:
@@ -161,7 +173,7 @@ The compact durable initial context for a fresh Moderator. It identifies the inc
 _Avoid_: Full transcript dump, live state substitute, Workflow Owner context injection
 
 **Moderator Outcome**:
-The terminal result of one Moderator engagement. `Operationally resolved` records the rationale, revokes the Moderator's authority, ends it, and closes the incident after runtime verification confirms the blocking or unsafe condition cleared. `Owner handoff` durably delivers a compact actionable escalation, revokes Moderator authority, ends it, transfers Incident Control to the Workflow Owner, and leaves the incident open as `owner-handled`. A voluntary outcome requires all Moderator-created Requests to be answered or cancelled. Failure or process loss is not an outcome.
+The terminal result of one Moderator engagement. Every valid outcome completes the Moderator activation and atomically closes any Undeclared Settlement episode. `Operationally resolved` records the rationale, revokes the Moderator's authority, ends it, and closes the incident after runtime verification confirms the blocking or unsafe condition cleared. `Owner handoff` durably delivers a compact actionable escalation, revokes Moderator authority, ends it, transfers Incident Control to the Workflow Owner, and leaves the incident open as `owner-handled`. A voluntary outcome requires all Moderator-created Requests to be answered or cancelled. Failure or process loss is not an outcome.
 _Avoid_: Silent completion, timeout closure, incident closure on handoff
 
 **Owner Handoff**:
@@ -173,7 +185,7 @@ The exactly-once Protocol Notice that performs Owner Handoff. Its canonical comp
 _Avoid_: Signal, Request, Answer, passive runtime event
 
 **Moderator Failure Fallback**:
-The non-recursive recovery path when a Moderator cannot start, exhausts its single automatic replacement activation, or cannot produce a valid outcome. The runtime produces one deduplicated Owner Handoff packet containing the required decision, immediate risk, attempted actions, recommended choices and consequences, and pointers to the Incident Brief, Moderator transcript, and diagnostics. Until the Workflow Owner accepts it, the incident stays open without usable Moderator authority and surfaces as `ACT`; failed delivery remains durably pending rather than spawning another Moderator.
+The non-recursive recovery path when a Moderator cannot start, exhausts its single automatic replacement activation, repeats Undeclared Settlement after correction, or otherwise cannot produce a valid outcome. The runtime produces one deduplicated Owner Handoff packet containing the required decision, immediate risk, attempted actions, recommended choices and consequences, and pointers to the Incident Brief, Moderator transcript, and diagnostics. Until the Workflow Owner accepts it, the incident stays open without usable Moderator authority and surfaces as `ACT`; failed delivery remains durably pending rather than spawning another Moderator.
 _Avoid_: Nested moderation, incident closure, repeated Owner alerts, full diagnostic injection
 
 **Moderator Escalation Boundary**:
@@ -217,15 +229,15 @@ An unresolved incoming or outgoing Request preserved after an Agent activation e
 _Avoid_: Orphaned Request, automatic Answer, activation-local Request
 
 **Automatic Recovery**:
-Runtime-driven creation of exactly one replacement activation after failure when the Subagent retains open obligations or accepted pending inputs. The episode ends when the replacement reaches durable settlement or completion; another failure exhausts automatic recovery and creates an Operational Incident for Moderator review. The retry count is not configurable by this protocol. Exhaustion does not abandon recovery, terminate Request obligations, or prune descendants.
+Runtime-driven creation of exactly one replacement activation after failure when the Subagent retains recovery-pending Requests, a pending Human Interrupt or response-bound result awaiting resume, an Undeclared Settlement episode, or accepted pending inputs. A pending Human Interrupt continues to surface `DECIDE`; a bound result remains a recovery obligation without `DECIDE`; a preserved Undeclared Settlement episode receives no additional correction allowance. The episode ends when the replacement reaches durable declared settlement or completion; another failure exhausts automatic recovery and creates an Operational Incident for Moderator review. The retry count is not configurable by this protocol. Exhaustion does not abandon recovery, terminate Request obligations, or prune descendants.
 _Avoid_: Unbounded restart, automatic abandonment, recovery without pending work
 
 **Recovery Abandonment**:
-An explicit incident verdict that the current failed work will no longer be recovered. Only an authorized Moderator or the Workflow Owner fallback may make it; retry exhaustion, elapsed time, and observation loss cannot. Abandonment terminally orphans incoming Requests, cancels outgoing Requests, and applies obligation-preserving pruning to descendants while the failed Agent itself remains `ended(failed)` and may still receive unrelated future work through a new activation.
+An explicit incident verdict that the current failed work will no longer be recovered. Only an authorized Moderator or the Workflow Owner fallback may make it; retry exhaustion, elapsed time, and observation loss cannot. Abandonment terminally orphans incoming Requests, cancels outgoing Requests, terminalizes any pending or response-bound Human Interrupt and any Undeclared Settlement episode, clears their attention projections, marks unconsumed human results stale and non-deliverable, and applies obligation-preserving pruning to descendants. Late human input cannot revive the abandoned work. The failed Agent remains `ended(failed)` and may still receive unrelated future work through a new activation.
 _Avoid_: Retry exhaustion, Agent deletion, implicit timeout
 
 **Transcript Projection**:
-An Agent-originated message is canonical in the sender's messaging tool call, while a Protocol Notice is canonical in its Request or incident record. The recipient records either input in an Inbox Batch only when delivery commits it for model consumption. Queueing, acknowledgement, retry, and delivery-status changes remain runtime observability and are not copied into Agent or Workflow Owner model context.
+An Agent-originated message is canonical in the sender's messaging tool call, a Human Interrupt question is canonical in its `agent_ask_user` call, its response is canonical as durable user input bound to that tool-call ID, and a Protocol Notice is canonical in its Request, incident, or Undeclared Settlement episode record. The recipient records actionable input in an Inbox Batch only when delivery commits it for model consumption. Queueing, acknowledgement, retry, and delivery-status changes remain runtime observability and are not copied into Agent or Workflow Owner model context.
 _Avoid_: Audit-log duplication, status notification message
 
 **Atomic Messaging Acceptance**:
