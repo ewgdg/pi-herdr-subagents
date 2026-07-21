@@ -58,6 +58,7 @@ import {
   getReloadSafeWorkflowBootstrap,
   releaseReloadSafeWorkflowBootstrap,
 } from "../pi-extension/subagents/subagent-done.ts";
+import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
 import {
   createLifecycle,
@@ -1429,6 +1430,28 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  it("releases Deferred Signals after the durable agent_settled lifecycle boundary", () => {
+    const key = Symbol.for("pi-herdr-subagents.child-workflow-bootstrap");
+    const prior = (globalThis as Record<PropertyKey, unknown>)[key];
+    const calls: string[] = [];
+    (globalThis as Record<PropertyKey, unknown>)[key] = {
+      workflow: {},
+      currentTurnSettled(interrupted: boolean) { calls.push(`settled:${interrupted}`); },
+      releaseDeferredSignals() { calls.push("released"); },
+    };
+    try {
+      const { api, eventHandlers } = createMockExtensionApi();
+      subagentDoneExtension(api);
+      const settled = eventHandlers.get("agent_settled")?.[0];
+      assert.ok(settled);
+      settled({}, {});
+      assert.deepEqual(calls, ["settled:false", "released"]);
+    } finally {
+      if (prior === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key];
+      else (globalThis as Record<PropertyKey, unknown>)[key] = prior;
+    }
+  });
+
   it("reuses Workflow bootstrap across reload and releases it on final shutdown", () => {
     const first = getReloadSafeWorkflowBootstrap();
     releaseReloadSafeWorkflowBootstrap(first, "reload");

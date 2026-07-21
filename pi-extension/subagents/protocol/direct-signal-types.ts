@@ -1,13 +1,17 @@
+export type SignalDeliveryTiming = "steer" | "deferred";
+
 export interface DirectSignalMessage {
   kind: "signal";
   messageId: string;
   senderAgentId: string;
   recipientAgentId: string;
+  deliveryTiming: SignalDeliveryTiming;
   message: string;
 }
 
 export interface InboxBatch {
-  messages: [DirectSignalMessage];
+  deliveryTiming: SignalDeliveryTiming;
+  messages: DirectSignalMessage[];
 }
 
 export interface QueuedSignalReceipt {
@@ -23,6 +27,7 @@ export interface DirectSignalRecord {
   recipientAgentId: string;
   sourceEntryId: string;
   payloadDigest: string;
+  deliveryTiming: SignalDeliveryTiming;
   acceptanceSequence?: number;
   deliveryStatus: "bound" | "queued" | "delivered";
   createdAtMs: number;
@@ -36,6 +41,7 @@ export interface PendingMessagePointer {
   recipientAgentId: string;
   sourceEntryId: string;
   payloadDigest: string;
+  deliveryTiming: SignalDeliveryTiming;
   acceptanceSequence: number;
   acceptedAtMs: number;
 }
@@ -47,6 +53,7 @@ export interface SignalAcceptRequest {
   recipientAgentId: string;
   sourceEntryId: string;
   payloadDigest: string;
+  deliveryTiming: SignalDeliveryTiming;
   message: string;
 }
 
@@ -58,6 +65,5 @@ export interface SignalReceiptReply {
 
 export interface AcceptedSignal {
   receipt: QueuedSignalReceipt;
-  delivery: "project";
-  wakeRecipient: boolean;
+  delivery: "schedule";
 }

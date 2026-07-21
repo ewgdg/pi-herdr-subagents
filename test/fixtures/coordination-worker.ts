@@ -8,6 +8,7 @@ import {
   connectFramedIpc,
   listenForFramedIpc,
 } from "../../pi-extension/subagents/coordination/framed-ipc.ts";
+import { DirectSignalStore } from "../../pi-extension/subagents/protocol/sqlite-message-store.ts";
 
 function writeResult(result: unknown): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -143,6 +144,28 @@ async function runIpcClient(endpoint: string): Promise<void> {
   if (closeResult.kind === "failed") throw closeResult.error;
 }
 
+async function runIdleIpcClose(endpoint: string): Promise<void> {
+  const server = await listenForFramedIpc(endpoint, () => {});
+  await writeResult({ ready: true });
+  process.stdin.setEncoding("utf8");
+  process.stdin.resume();
+  await new Promise<void>((resolve, reject) => process.stdin.once("data", (command) => {
+    void (async () => {
+      if (command.trim() !== "close") throw new Error(`Unknown idle IPC command: ${command}`);
+      await server.close();
+      await writeResult({ closed: true });
+      process.stdin.pause();
+      resolve();
+    })().catch(reject);
+  }));
+}
+
+async function upgradeSignalStore(databasePath: string): Promise<void> {
+  const store = new DirectSignalStore(databasePath);
+  store.close();
+  await writeResult({ upgraded: true });
+}
+
 const [command, ...args] = process.argv.slice(2);
 
 switch (command) {
@@ -166,6 +189,12 @@ switch (command) {
     break;
   case "ipc-client":
     await runIpcClient(args[0]);
+    break;
+  case "ipc-idle-close":
+    await runIdleIpcClose(args[0]);
+    break;
+  case "signal-upgrade":
+    await upgradeSignalStore(args[0]);
     break;
   default:
     throw new Error(`Unknown coordination worker command: ${command}`);

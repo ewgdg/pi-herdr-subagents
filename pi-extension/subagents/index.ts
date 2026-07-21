@@ -1875,6 +1875,7 @@ function subagentsExtensionWithOptions(
       runtime.workflowBootstrap.sessionStarted(ctx);
       if (runtime.workflowBootstrap.workflow) {
         runtime.workflowBootstrap.currentTurnSettled(latestAgentRunWasAborted);
+        runtime.workflowBootstrap.releaseDeferredSignals();
       }
       latestAgentRunWasAborted = false;
     });

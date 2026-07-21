@@ -204,12 +204,15 @@ export class FramedIpcConnection {
 
 export class FramedIpcServer {
   readonly #server: Server;
+  readonly #sockets: Set<Socket>;
 
-  constructor(server: Server) {
+  constructor(server: Server, sockets: Set<Socket>) {
     this.#server = server;
+    this.#sockets = sockets;
   }
 
   close(): Promise<void> {
+    for (const socket of this.#sockets) socket.destroy();
     return new Promise((resolve, reject) => {
       this.#server.close((error) => {
         if (error) reject(error);
@@ -224,8 +227,12 @@ export async function listenForFramedIpc(
   onConnection: (connection: FramedIpcConnection) => void,
   options: FramedIpcConnectionOptions = {},
 ): Promise<FramedIpcServer> {
-  const server = createServer((socket) =>
-    onConnection(new FramedIpcConnection(socket, options)));
+  const sockets = new Set<Socket>();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    onConnection(new FramedIpcConnection(socket, options));
+  });
   await new Promise<void>((resolve, reject) => {
     const onError = (error: Error) => reject(error);
     server.once("error", onError);
@@ -234,7 +241,7 @@ export async function listenForFramedIpc(
       resolve();
     });
   });
-  return new FramedIpcServer(server);
+  return new FramedIpcServer(server, sockets);
 }
 
 export async function connectFramedIpc(

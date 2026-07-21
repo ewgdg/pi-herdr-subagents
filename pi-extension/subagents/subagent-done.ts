@@ -268,6 +268,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", () => {
     if (workflowBootstrap.workflow) {
       workflowBootstrap.currentTurnSettled(latestAgentRunWasAborted);
+      workflowBootstrap.releaseDeferredSignals();
     }
     latestAgentRunWasAborted = false;
   });

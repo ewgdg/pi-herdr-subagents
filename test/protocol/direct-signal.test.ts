@@ -14,6 +14,7 @@ import {
   DirectSignalRuntime,
   type InboxBatch,
 } from "../../pi-extension/subagents/protocol/direct-signal.ts";
+import { RecipientInboxRouter } from "../../pi-extension/subagents/protocol/recipient-inbox-router.ts";
 import {
   DeterministicIdentityFactory,
   WorkflowScenario,
@@ -87,17 +88,22 @@ describe("direct Signal protocol scenarios", () => {
       sourceEntryId,
     });
     await waitFor(() => batches.length === 1);
+    recipientSignals.releaseDeferred();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(batches.length, 1, "unconfirmed projection must not be injected twice in one Router run");
     assert.equal(recipientSignals.confirmDelivery(receipt.messageId), true);
 
     assert.equal(receipt.status, "queued");
     assert.equal(receipt.recipientAgentId, recipient.agentId);
     assert.equal(receipt.acceptanceSequence, 1);
     assert.deepEqual(batches, [{
+      deliveryTiming: "steer",
       messages: [{
         kind: "signal",
         messageId: receipt.messageId,
         senderAgentId: sender.agentId,
         recipientAgentId: recipient.agentId,
+        deliveryTiming: "steer",
         message: "DIRECT_SIGNAL_PAYLOAD",
       }],
     }]);
@@ -257,6 +263,30 @@ describe("direct Signal protocol scenarios", () => {
     runtime.close();
   });
 
+  it("cleans up a listener and store when Router startup cannot acquire ownership", async () => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime } = scenario.createOwner();
+    const recipientSession = scenario.childSession(runtime, "recipient");
+    const recipient = runtime.addAgent({
+      session: recipientSession,
+      spawner: runtime.agent(runtime.workflow.ownerAgentId),
+      name: "Recipient",
+    });
+    const router = new RecipientInboxRouter({
+      workflowOwnerId: runtime.workflow.ownerAgentId,
+      recipient: runtime.agent(recipient.agentId),
+      databasePath: runtime.workflow.databasePath,
+      projectInboxBatch() {},
+      now: scenario.clock.now,
+    });
+
+    await assert.rejects(router.start(), (error: unknown) => (error as { code?: string }).code === "OwnershipLost");
+    await router.close();
+    const reopened = new DirectSignalStore(runtime.workflow.databasePath);
+    reopened.close();
+    runtime.close();
+  });
+
   it("removes the identity binding when the request cannot be written before acceptance", async () => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
@@ -349,6 +379,75 @@ describe("direct Signal protocol scenarios", () => {
     runtime.close();
   });
 
+  it("reconciles a lost acknowledgement through its original Message Identity", async () => {
+    const rootDirectory = await temporaryDirectory();
+    const scenario = new WorkflowScenario({ rootDirectory });
+    const { runtime } = scenario.createOwner();
+    const recipientSession = scenario.childSession(runtime, "recipient");
+    const recipient = runtime.addAgent({
+      session: recipientSession,
+      spawner: runtime.agent(runtime.workflow.ownerAgentId),
+      name: "Recipient",
+    });
+    const recipientRun = runtime.startAgentRun(runtime.agent(recipient.agentId));
+    const endpoint = process.platform === "win32"
+      ? `\\\\.\\pipe\\pi-herdr-lost-ack-${process.pid}-${Date.now()}`
+      : join(rootDirectory, "lost-ack.sock");
+    const store = new DirectSignalStore(runtime.workflow.databasePath);
+    store.registerRouter({
+      recipient: runtime.agent(recipient.agentId),
+      ownership: recipientRun.ownership,
+      endpoint,
+      registeredAtMs: scenario.clock.now(),
+    });
+    const fakeRouter = await listenForFramedIpc(endpoint, (connection) => {
+      connection.onMessage((frame) => {
+        store.acceptSignal({
+          request: frame.payload as import("../../pi-extension/subagents/protocol/direct-signal-types.ts").SignalAcceptRequest,
+          recipient: runtime.agent(recipient.agentId),
+          ownership: recipientRun.ownership,
+          endpoint,
+          acceptedAtMs: scenario.clock.now(),
+        });
+        // Deliberately omit the receipt after the durable acceptance commit.
+        connection.end();
+      });
+    });
+    let allocations = 0;
+    const senderSignals = new DirectSignalRuntime({
+      controlPlane: runtime.controlPlane,
+      allocateMessageId() {
+        allocations += 1;
+        return scenario.identities.next();
+      },
+    });
+    const sourceEntryId = scenario.transcripts.appendAgentSend(
+      { agentId: runtime.workflow.ownerAgentId, sessionPath: runtime.workflow.ownerSessionPath },
+      { targetAgentId: recipient.agentId, message: "lost acknowledgement" },
+    );
+
+    const first = await senderSignals.sendSignal({
+      target: runtime.agent(recipient.agentId), message: "lost acknowledgement", sourceEntryId,
+    });
+    const second = await senderSignals.sendSignal({
+      target: runtime.agent(recipient.agentId), message: "lost acknowledgement", sourceEntryId,
+    });
+    assert.deepEqual(second, first);
+    assert.equal(allocations, 1);
+    assert.deepEqual(senderSignals.listMessages().map((message) => ({
+      messageId: message.messageId,
+      deliveryStatus: message.deliveryStatus,
+      acceptanceSequence: message.acceptanceSequence,
+    })), [{ messageId: first.messageId, deliveryStatus: "queued", acceptanceSequence: 1 }]);
+
+    senderSignals.close();
+    store.unregisterRouter(runtime.agent(recipient.agentId), endpoint);
+    store.close();
+    await fakeRouter.close();
+    runtime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
+    runtime.close();
+  });
+
   it("rolls back recipient acceptance atomically when pointer persistence fails", async () => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
@@ -385,12 +484,16 @@ describe("direct Signal protocol scenarios", () => {
       controlPlane: ownerRuntime.controlPlane,
       allocateMessageId: () => scenario.identities.next(),
     });
+    const sourceEntryId = scenario.transcripts.appendAgentSend(
+      { agentId: ownerRuntime.workflow.ownerAgentId, sessionPath: ownerRuntime.workflow.ownerSessionPath },
+      { targetAgentId: recipient.agentId, message: "atomic payload" },
+    );
 
     await assert.rejects(
       senderSignals.sendSignal({
         target: ownerRuntime.agent(recipient.agentId),
         message: "atomic payload",
-        sourceEntryId: "atomic-source",
+        sourceEntryId,
       }),
       /forced pointer failure/,
     );
@@ -408,6 +511,243 @@ describe("direct Signal protocol scenarios", () => {
     await recipientSignals.close();
     ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
     recipientRuntime.close();
+    ownerRuntime.close();
+  });
+
+  it("batches deferred Signals in acceptance order when the recipient settles", async () => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const recipientSession = scenario.childSession(ownerRuntime, "recipient");
+    const recipient = ownerRuntime.addAgent({ session: recipientSession, spawner: owner, name: "Recipient" });
+    const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
+    const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
+    const batches: InboxBatch[] = [];
+    const recipientSignals = new DirectSignalRuntime({
+      controlPlane: recipientRuntime.controlPlane,
+      ownership: recipientRun.ownership,
+      projectInboxBatch(batch) { batches.push(batch); },
+    });
+    await recipientSignals.start();
+    const ownerSignals = new DirectSignalRuntime({
+      controlPlane: ownerRuntime.controlPlane,
+      allocateMessageId: () => scenario.identities.next(),
+    });
+    const ownerSession = { agentId: owner.agentId, sessionPath: ownerRuntime.workflow.ownerSessionPath };
+    const firstSource = scenario.transcripts.appendAgentSend(ownerSession, {
+      targetAgentId: recipient.agentId, message: "first deferred", timing: "deferred",
+    });
+    const secondSource = scenario.transcripts.appendAgentSend(ownerSession, {
+      targetAgentId: recipient.agentId, message: "second deferred", timing: "deferred",
+    });
+    const first = await ownerSignals.sendSignal({
+      target: ownerRuntime.agent(recipient.agentId), message: "first deferred", sourceEntryId: firstSource, deliveryTiming: "deferred",
+    });
+    const second = await ownerSignals.sendSignal({
+      target: ownerRuntime.agent(recipient.agentId), message: "second deferred", sourceEntryId: secondSource, deliveryTiming: "deferred",
+    });
+    assert.equal(batches.length, 0);
+    assert.deepEqual([first.acceptanceSequence, second.acceptanceSequence], [1, 2]);
+
+    ownerRuntime.settleActivation(recipientRun);
+    recipientSignals.releaseDeferred();
+    await waitFor(() => batches.length === 1);
+    assert.equal(batches[0].deliveryTiming, "deferred");
+    assert.deepEqual(batches[0].messages.map((message) => message.messageId), [first.messageId, second.messageId]);
+    assert.deepEqual(batches[0].messages.map((message) => message.message), ["first deferred", "second deferred"]);
+    for (const message of batches[0].messages) assert.equal(recipientSignals.confirmDelivery(message.messageId), true);
+    assert.deepEqual(recipientSignals.listPending(recipientRuntime.agent(recipient.agentId)), []);
+
+    ownerSignals.close();
+    await recipientSignals.close();
+    ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
+    recipientRuntime.close();
+    ownerRuntime.close();
+  });
+
+  it("lets active Steer delivery overtake earlier Deferred work", async () => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const recipientSession = scenario.childSession(ownerRuntime, "recipient");
+    const recipient = ownerRuntime.addAgent({ session: recipientSession, spawner: owner, name: "Recipient" });
+    const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
+    const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
+    const batches: InboxBatch[] = [];
+    const recipientSignals = new DirectSignalRuntime({
+      controlPlane: recipientRuntime.controlPlane,
+      ownership: recipientRun.ownership,
+      projectInboxBatch(batch) { batches.push(batch); },
+    });
+    await recipientSignals.start();
+    const ownerSignals = new DirectSignalRuntime({ controlPlane: ownerRuntime.controlPlane, allocateMessageId: () => scenario.identities.next() });
+    const ownerSession = { agentId: owner.agentId, sessionPath: ownerRuntime.workflow.ownerSessionPath };
+    const deferredSource = scenario.transcripts.appendAgentSend(ownerSession, {
+      targetAgentId: recipient.agentId, message: "deferred", timing: "deferred",
+    });
+    const deferred = await ownerSignals.sendSignal({
+      target: ownerRuntime.agent(recipient.agentId), message: "deferred", sourceEntryId: deferredSource, deliveryTiming: "deferred",
+    });
+    const steerSource = scenario.transcripts.appendAgentSend(ownerSession, {
+      targetAgentId: recipient.agentId, message: "steer", timing: "steer",
+    });
+    const steer = await ownerSignals.sendSignal({
+      target: ownerRuntime.agent(recipient.agentId), message: "steer", sourceEntryId: steerSource,
+    });
+    await waitFor(() => batches.length === 1);
+    assert.deepEqual(batches[0].messages.map((message) => message.messageId), [steer.messageId]);
+    assert.equal(recipientSignals.confirmDelivery(steer.messageId), true);
+    ownerRuntime.settleActivation(recipientRun);
+    recipientSignals.releaseDeferred();
+    await waitFor(() => batches.length === 2);
+    assert.deepEqual(batches[1].messages.map((message) => message.messageId), [deferred.messageId]);
+    assert.equal(recipientSignals.confirmDelivery(deferred.messageId), true);
+
+    ownerSignals.close();
+    await recipientSignals.close();
+    ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
+    recipientRuntime.close();
+    ownerRuntime.close();
+  });
+
+  it("reconciles transcript evidence after projection commits before delivery confirmation", async () => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const recipientSession = scenario.childSession(ownerRuntime, "recipient");
+    const recipient = ownerRuntime.addAgent({ session: recipientSession, spawner: owner, name: "Recipient" });
+    const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
+    const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
+    ownerRuntime.settleActivation(recipientRun);
+    const firstRouter = new DirectSignalRuntime({
+      controlPlane: recipientRuntime.controlPlane,
+      ownership: recipientRun.ownership,
+      projectInboxBatch(batch) { scenario.transcripts.appendInboxBatch(recipientSession, batch); },
+    });
+    await firstRouter.start();
+    const ownerSignals = new DirectSignalRuntime({ controlPlane: ownerRuntime.controlPlane, allocateMessageId: () => scenario.identities.next() });
+    const sourceEntryId = scenario.transcripts.appendAgentSend(
+      { agentId: owner.agentId, sessionPath: ownerRuntime.workflow.ownerSessionPath },
+      { targetAgentId: recipient.agentId, message: "durable once" },
+    );
+    const receipt = await ownerSignals.sendSignal({ target: ownerRuntime.agent(recipient.agentId), message: "durable once", sourceEntryId });
+    await waitFor(() => readFileSync(recipientSession.sessionPath, "utf8").includes(receipt.messageId));
+    await firstRouter.close();
+    let replayed = 0;
+    const recoveredRouter = new DirectSignalRuntime({
+      controlPlane: recipientRuntime.controlPlane,
+      ownership: recipientRun.ownership,
+      projectInboxBatch() { replayed += 1; },
+      hasProjectedMessage(messageId) { return readFileSync(recipientSession.sessionPath, "utf8").includes(messageId); },
+    });
+    await recoveredRouter.start();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(replayed, 0);
+    assert.equal(recoveredRouter.inspectMessage(receipt.messageId)?.deliveryStatus, "delivered");
+    assert.deepEqual(recoveredRouter.listPending(recipientRuntime.agent(recipient.agentId)), []);
+
+    ownerSignals.close();
+    await recoveredRouter.close();
+    ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
+    recipientRuntime.close();
+    ownerRuntime.close();
+  });
+
+  it("retains a queued pointer when projection fails and recovers it after restart", async () => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const recipientSession = scenario.childSession(ownerRuntime, "recipient");
+    const recipient = ownerRuntime.addAgent({ session: recipientSession, spawner: owner, name: "Recipient" });
+    const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
+    const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
+    ownerRuntime.settleActivation(recipientRun);
+    const failingRouter = new DirectSignalRuntime({
+      controlPlane: recipientRuntime.controlPlane,
+      ownership: recipientRun.ownership,
+      projectInboxBatch() { throw new Error("projection crash"); },
+    });
+    await failingRouter.start();
+    const ownerSignals = new DirectSignalRuntime({ controlPlane: ownerRuntime.controlPlane, allocateMessageId: () => scenario.identities.next() });
+    const sourceEntryId = scenario.transcripts.appendAgentSend(
+      { agentId: owner.agentId, sessionPath: ownerRuntime.workflow.ownerSessionPath },
+      { targetAgentId: recipient.agentId, message: "recover me" },
+    );
+    const receipt = await ownerSignals.sendSignal({ target: ownerRuntime.agent(recipient.agentId), message: "recover me", sourceEntryId });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(failingRouter.inspectMessage(receipt.messageId)?.deliveryStatus, "queued");
+    await failingRouter.close();
+    const recovered: InboxBatch[] = [];
+    const recoveredRouter = new DirectSignalRuntime({
+      controlPlane: recipientRuntime.controlPlane,
+      ownership: recipientRun.ownership,
+      projectInboxBatch(batch) { recovered.push(batch); },
+    });
+    await recoveredRouter.start();
+    await waitFor(() => recovered.length === 1);
+    assert.deepEqual(recovered[0].messages.map((message) => message.messageId), [receipt.messageId]);
+    assert.equal(recoveredRouter.confirmDelivery(receipt.messageId), true);
+
+    ownerSignals.close();
+    await recoveredRouter.close();
+    ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
+    recipientRuntime.close();
+    ownerRuntime.close();
+  });
+
+  it("upgrades queued issue #18 pointers with default Steer timing", async () => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const recipientSession = scenario.childSession(ownerRuntime, "recipient");
+    const recipient = ownerRuntime.addAgent({ session: recipientSession, spawner: owner, name: "Recipient" });
+    const database = new DatabaseSync(ownerRuntime.workflow.databasePath);
+    database.exec(`
+      CREATE TABLE direct_signal_messages (
+        message_id TEXT PRIMARY KEY,
+        sender_agent_id TEXT NOT NULL,
+        recipient_agent_id TEXT NOT NULL,
+        source_entry_id TEXT NOT NULL,
+        payload_digest TEXT NOT NULL,
+        acceptance_sequence INTEGER,
+        delivery_status TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        accepted_at_ms INTEGER,
+        delivered_at_ms INTEGER,
+        UNIQUE (sender_agent_id, source_entry_id)
+      ) STRICT;
+      CREATE TABLE recipient_acceptance_counters (
+        agent_id TEXT PRIMARY KEY,
+        last_sequence INTEGER NOT NULL
+      ) STRICT;
+      CREATE TABLE pending_message_pointers (
+        message_id TEXT PRIMARY KEY,
+        sender_agent_id TEXT NOT NULL,
+        recipient_agent_id TEXT NOT NULL,
+        source_entry_id TEXT NOT NULL,
+        payload_digest TEXT NOT NULL,
+        acceptance_sequence INTEGER NOT NULL,
+        accepted_at_ms INTEGER NOT NULL,
+        UNIQUE (recipient_agent_id, acceptance_sequence)
+      ) STRICT;
+    `);
+    database.prepare(`
+      INSERT INTO direct_signal_messages VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, NULL)
+    `).run("legacy-message", owner.agentId, recipient.agentId, "legacy-source", "legacy-digest", 1, 1, 2);
+    database.prepare(`INSERT INTO recipient_acceptance_counters VALUES (?, ?)`).run(recipient.agentId, 1);
+    database.prepare(`
+      INSERT INTO pending_message_pointers VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run("legacy-message", owner.agentId, recipient.agentId, "legacy-source", "legacy-digest", 1, 2);
+    database.close();
+
+    const store = new DirectSignalStore(ownerRuntime.workflow.databasePath);
+    assert.equal(store.inspectMessage(owner.agentId, "legacy-message")?.deliveryTiming, "steer");
+    assert.deepEqual(store.listPending(ownerRuntime.agent(recipient.agentId)).map((pointer) => ({
+      messageId: pointer.messageId,
+      deliveryTiming: pointer.deliveryTiming,
+      acceptanceSequence: pointer.acceptanceSequence,
+    })), [{ messageId: "legacy-message", deliveryTiming: "steer", acceptanceSequence: 1 }]);
+    store.close();
     ownerRuntime.close();
   });
 });

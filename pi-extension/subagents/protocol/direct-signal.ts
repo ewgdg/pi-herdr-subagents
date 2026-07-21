@@ -1,9 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   CURRENT_IPC_VERSION,
   connectFramedIpc,
   type FramedIpcConnection,
 } from "../coordination/framed-ipc.ts";
+import { digestPayload } from "./direct-signal-transcript.ts";
 import type { WorkflowControlPlane } from "./workflow-control-plane.ts";
 import { RecipientInboxRouter } from "./recipient-inbox-router.ts";
 import { DirectSignalStore } from "./sqlite-message-store.ts";
@@ -18,6 +19,7 @@ import type {
   PendingMessagePointer,
   QueuedSignalReceipt,
   SignalAcceptRequest,
+  SignalDeliveryTiming,
   SignalReceiptReply,
 } from "./direct-signal-types.ts";
 
@@ -27,6 +29,7 @@ export type {
   InboxBatch,
   PendingMessagePointer,
   QueuedSignalReceipt,
+  SignalDeliveryTiming,
 } from "./direct-signal-types.ts";
 
 const ACCEPTANCE_TIMEOUT_MS = 5_000;
@@ -38,6 +41,7 @@ export interface DirectSignalRuntimeOptions {
   ownership?: AgentRunOwnership;
   allocateMessageId?: () => string;
   projectInboxBatch?: (batch: InboxBatch) => void;
+  hasProjectedMessage?: (messageId: string) => boolean;
   wakeRecipient?: () => void;
   now?: () => number;
 }
@@ -47,6 +51,7 @@ export class DirectSignalRuntime {
   readonly #ownership: AgentRunOwnership | undefined;
   readonly #allocateMessageId: () => string;
   #projectInboxBatch: ((batch: InboxBatch) => void) | undefined;
+  #hasProjectedMessage: ((messageId: string) => boolean) | undefined;
   #wakeRecipient: (() => void) | undefined;
   readonly #now: () => number;
   readonly #store: DirectSignalStore;
@@ -59,6 +64,7 @@ export class DirectSignalRuntime {
     this.#ownership = options.ownership;
     this.#allocateMessageId = options.allocateMessageId ?? randomUUID;
     this.#projectInboxBatch = options.projectInboxBatch;
+    this.#hasProjectedMessage = options.hasProjectedMessage;
     this.#wakeRecipient = options.wakeRecipient;
     this.#now = options.now ?? Date.now;
     this.#store = new DirectSignalStore(options.controlPlane.workflow.databasePath);
@@ -68,9 +74,7 @@ export class DirectSignalRuntime {
     this.#assertOpen();
     if (this.#router) return;
     if (this.#routerStartup) return this.#routerStartup;
-    if (!this.#projectInboxBatch) {
-      throw new Error("Recipient Inbox Router requires an Inbox Batch projector");
-    }
+    if (!this.#projectInboxBatch) throw new Error("Recipient Inbox Router requires an Inbox Batch projector");
     this.#routerStartup = (async () => {
       const router = new RecipientInboxRouter({
         workflowOwnerId: this.#controlPlane.workflow.ownerAgentId,
@@ -78,6 +82,7 @@ export class DirectSignalRuntime {
         ownership: this.#ownership,
         databasePath: this.#controlPlane.workflow.databasePath,
         projectInboxBatch: this.#projectInboxBatch!,
+        hasProjectedMessage: this.#hasProjectedMessage,
         wakeRecipient: this.#wakeRecipient,
         now: this.#now,
       });
@@ -97,10 +102,12 @@ export class DirectSignalRuntime {
 
   configureInboxDelivery(input: {
     projectInboxBatch(batch: InboxBatch): void;
+    hasProjectedMessage?(messageId: string): boolean;
     wakeRecipient?: () => void;
   }): void {
     this.#assertOpen();
     this.#projectInboxBatch = input.projectInboxBatch;
+    this.#hasProjectedMessage = input.hasProjectedMessage;
     this.#wakeRecipient = input.wakeRecipient;
     this.#router?.configureDelivery(input);
   }
@@ -109,73 +116,63 @@ export class DirectSignalRuntime {
     target: AgentReference;
     message: string;
     sourceEntryId: string;
+    deliveryTiming?: SignalDeliveryTiming;
   }): Promise<QueuedSignalReceipt> {
     this.#assertOpen();
     assertNonEmpty(input.message, "Signal message");
     assertNonEmpty(input.sourceEntryId, "Signal source entry ID");
+    const deliveryTiming = input.deliveryTiming ?? "steer";
     const sender = this.#controlPlane.currentAgent;
     this.#controlPlane.authorizeDirectTarget(sender, input.target);
-    const route = this.#store.readRouter(input.target);
-    if (!route) throw recipientUnreachable(input.target.agentId);
-
-    const messageId = this.#allocateMessageId();
     const payloadDigest = digestPayload(input.message);
-    this.#store.bindSignal({
-      messageId,
+    const existing = this.#store.findSignalBySource({
       sender,
       recipient: input.target,
       sourceEntryId: input.sourceEntryId,
       payloadDigest,
+      deliveryTiming,
+    });
+    if (existing && existing.deliveryStatus !== "bound") return receiptFor(existing);
+
+    const route = this.#store.readRouter(input.target);
+    if (!route) throw recipientUnreachable(input.target.agentId);
+    const bound = existing ?? this.#store.bindSignal({
+      messageId: this.#allocateMessageId(),
+      sender,
+      recipient: input.target,
+      sourceEntryId: input.sourceEntryId,
+      payloadDigest,
+      deliveryTiming,
       createdAtMs: this.#now(),
     });
+    if (bound.deliveryStatus !== "bound") return receiptFor(bound);
+    const request: SignalAcceptRequest = {
+      workflowOwnerId: sender.workflowOwnerId,
+      messageId: bound.messageId,
+      senderAgentId: sender.agentId,
+      recipientAgentId: input.target.agentId,
+      sourceEntryId: input.sourceEntryId,
+      payloadDigest,
+      deliveryTiming,
+      message: input.message,
+    };
 
-    let connection: FramedIpcConnection;
+    let reply: SignalReceiptReply;
     try {
-      connection = await connectFramedIpc(route.endpoint);
+      reply = await this.#requestReceipt(route.endpoint, request);
     } catch (error) {
-      this.#store.discardUnacceptedSignal(sender, messageId);
+      // The recipient and sender share durable coordination state. A closed
+      // receipt channel is ambiguous only until this same identity is read.
+      const reconciled = this.#store.inspectMessage(sender.workflowOwnerId, bound.messageId);
+      if (reconciled && reconciled.deliveryStatus !== "bound") return receiptFor(reconciled);
+      this.#store.discardUnacceptedSignal(sender, bound.messageId);
       throw recipientUnreachable(input.target.agentId, error);
     }
-
-    try {
-      const receiptWaiter = createReceiptWaiter(connection);
-      try {
-        await connection.send({
-          version: CURRENT_IPC_VERSION,
-          type: SIGNAL_REQUEST_TYPE,
-          payload: {
-            workflowOwnerId: sender.workflowOwnerId,
-            messageId,
-            senderAgentId: sender.agentId,
-            recipientAgentId: input.target.agentId,
-            sourceEntryId: input.sourceEntryId,
-            payloadDigest,
-            message: input.message,
-          } satisfies SignalAcceptRequest,
-        });
-      } catch (error) {
-        receiptWaiter.cancel();
-        this.#store.discardUnacceptedSignal(sender, messageId);
-        throw recipientUnreachable(input.target.agentId, error);
-      }
-      let result: SignalReceiptReply | undefined;
-      try {
-        result = await receiptWaiter.promise;
-      } catch (error) {
-        if (this.#store.discardUnacceptedSignal(sender, messageId)) {
-          throw recipientUnreachable(input.target.agentId, error);
-        }
-        throw error;
-      }
-      if (!result) throw new Error("Signal receipt wait was cancelled unexpectedly");
-      if (!result.accepted || !result.receipt) {
-        this.#store.discardUnacceptedSignal(sender, messageId);
-        throw replyError(result.error);
-      }
-      return result.receipt;
-    } finally {
-      connection.end();
+    if (!reply.accepted || !reply.receipt) {
+      this.#store.discardUnacceptedSignal(sender, bound.messageId);
+      throw replyError(reply.error);
     }
+    return reply.receipt;
   }
 
   inspectMessage(messageId: string): DirectSignalRecord | undefined {
@@ -195,8 +192,12 @@ export class DirectSignalRuntime {
 
   confirmDelivery(messageId: string): boolean {
     this.#assertOpen();
-    if (!this.#router) return false;
-    return this.#router.confirmDelivery(messageId);
+    return this.#router?.confirmDelivery(messageId) ?? false;
+  }
+
+  releaseDeferred(): void {
+    this.#assertOpen();
+    this.#router?.releaseDeferred();
   }
 
   close(): void | Promise<void> {
@@ -209,6 +210,33 @@ export class DirectSignalRuntime {
     const router = this.#router;
     this.#router = undefined;
     return router.close().finally(() => this.#store.close());
+  }
+
+  async #requestReceipt(endpoint: string, request: SignalAcceptRequest): Promise<SignalReceiptReply> {
+    let connection: FramedIpcConnection;
+    try {
+      connection = await connectFramedIpc(endpoint);
+    } catch (error) {
+      throw recipientUnreachable(request.recipientAgentId, error);
+    }
+    try {
+      const receiptWaiter = createReceiptWaiter(connection);
+      try {
+        await connection.send({
+          version: CURRENT_IPC_VERSION,
+          type: SIGNAL_REQUEST_TYPE,
+          payload: request,
+        });
+      } catch (error) {
+        receiptWaiter.cancel();
+        throw error;
+      }
+      const reply = await receiptWaiter.promise;
+      if (!reply) throw new Error("Signal receipt wait was cancelled unexpectedly");
+      return reply;
+    } finally {
+      connection.end();
+    }
   }
 
   #assertOpen(): void {
@@ -225,20 +253,13 @@ function createReceiptWaiter(connection: FramedIpcConnection): {
   let settled = false;
   let deferMessageUnsubscribe = false;
   let deferErrorUnsubscribe = false;
-  let unsubscribeMessage = () => {
-    deferMessageUnsubscribe = true;
-  };
-  let unsubscribeError = () => {
-    deferErrorUnsubscribe = true;
-  };
+  let unsubscribeMessage = () => { deferMessageUnsubscribe = true; };
+  let unsubscribeError = () => { deferErrorUnsubscribe = true; };
   const promise = new Promise<SignalReceiptReply | undefined>((resolve, reject) => {
     resolvePromise = resolve;
     rejectPromise = reject;
   });
-  const timeout = setTimeout(() => {
-    rejectOnce(new Error("Timed out waiting for durable Signal acceptance receipt"));
-  }, ACCEPTANCE_TIMEOUT_MS);
-
+  const timeout = setTimeout(() => rejectOnce(new Error("Timed out waiting for durable Signal acceptance receipt")), ACCEPTANCE_TIMEOUT_MS);
   const cleanup = () => {
     clearTimeout(timeout);
     unsubscribeMessage();
@@ -256,15 +277,11 @@ function createReceiptWaiter(connection: FramedIpcConnection): {
     cleanup();
     rejectPromise(error);
   }
-
   const removeMessageListener = connection.onMessage((frame) => {
-    if (frame.type === SIGNAL_RECEIPT_TYPE) {
-      resolveOnce(frame.payload as SignalReceiptReply);
-    }
+    if (frame.type === SIGNAL_RECEIPT_TYPE) resolveOnce(frame.payload as SignalReceiptReply);
   });
   unsubscribeMessage = removeMessageListener;
   if (deferMessageUnsubscribe) removeMessageListener();
-
   if (!settled) {
     const removeErrorListener = connection.onError(rejectOnce);
     unsubscribeError = removeErrorListener;
@@ -274,21 +291,26 @@ function createReceiptWaiter(connection: FramedIpcConnection): {
     if (result.kind === "failed") rejectOnce(result.error);
     else rejectOnce(new Error("Recipient closed before returning a Signal receipt"));
   });
-
   return { promise, cancel: () => resolveOnce(undefined) };
+}
+
+function receiptFor(record: DirectSignalRecord): QueuedSignalReceipt {
+  if (record.acceptanceSequence === undefined) throw new Error(`Signal ${record.messageId} is not durably accepted`);
+  return {
+    status: "queued",
+    messageId: record.messageId,
+    recipientAgentId: record.recipientAgentId,
+    acceptanceSequence: record.acceptanceSequence,
+  };
 }
 
 function replyError(error: SignalReceiptReply["error"]): Error {
   if (!error) return new Error("Recipient Inbox Router rejected Signal acceptance");
-  if (isWorkflowProtocolErrorCode(error.code)) {
-    return new WorkflowProtocolError(error.code, error.message);
-  }
+  if (isWorkflowProtocolErrorCode(error.code)) return new WorkflowProtocolError(error.code, error.message);
   return new Error(error.message);
 }
 
-function isWorkflowProtocolErrorCode(
-  code: string | undefined,
-): code is ConstructorParameters<typeof WorkflowProtocolError>[0] {
+function isWorkflowProtocolErrorCode(code: string | undefined): code is ConstructorParameters<typeof WorkflowProtocolError>[0] {
   return code === "WorkflowMismatch"
     || code === "UnknownAgent"
     || code === "OwnershipLost"
@@ -300,14 +322,7 @@ function isWorkflowProtocolErrorCode(
 
 function recipientUnreachable(agentId: string, cause?: unknown): WorkflowProtocolError {
   const detail = cause instanceof Error ? `: ${cause.message}` : "";
-  return new WorkflowProtocolError(
-    "RecipientUnreachable",
-    `Recipient Inbox Router is unavailable for Agent ${agentId}${detail}`,
-  );
-}
-
-function digestPayload(message: string): string {
-  return createHash("sha256").update(message, "utf8").digest("hex");
+  return new WorkflowProtocolError("RecipientUnreachable", `Recipient Inbox Router is unavailable for Agent ${agentId}${detail}`);
 }
 
 function assertNonEmpty(value: string, label: string): void {

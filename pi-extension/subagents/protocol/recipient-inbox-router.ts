@@ -9,6 +9,7 @@ import {
   type FramedIpcMessage,
   type FramedIpcServer,
 } from "../coordination/framed-ipc.ts";
+import { resolveCanonicalSignal, signalDeliveryTiming } from "./direct-signal-transcript.ts";
 import { DirectSignalStore } from "./sqlite-message-store.ts";
 import {
   WorkflowProtocolError,
@@ -17,7 +18,9 @@ import {
 } from "./workflow-types.ts";
 import type {
   AcceptedSignal,
+  DirectSignalMessage,
   InboxBatch,
+  PendingMessagePointer,
   SignalAcceptRequest,
   SignalReceiptReply,
 } from "./direct-signal-types.ts";
@@ -31,15 +34,19 @@ export interface RecipientInboxRouterOptions {
   ownership?: AgentRunOwnership;
   databasePath: string;
   projectInboxBatch(batch: InboxBatch): void;
+  hasProjectedMessage?(messageId: string): boolean;
   wakeRecipient?: () => void;
   now: () => number;
 }
+
 export class RecipientInboxRouter {
   #options: RecipientInboxRouterOptions;
   readonly #store: DirectSignalStore;
   readonly #endpoint: string;
   #server: FramedIpcServer | undefined;
   #closed = false;
+  #scheduling = false;
+  readonly #projectedMessageIds = new Set<string>();
 
   constructor(options: RecipientInboxRouterOptions) {
     this.#options = options;
@@ -49,14 +56,13 @@ export class RecipientInboxRouter {
 
   async start(): Promise<void> {
     if (this.#server) return;
-    const server = await listenForFramedIpc(this.#endpoint, (connection) => {
-      connection.onMessage((message) => {
-        void this.#handle(connection, message).catch(() => {
-          connection.end();
+    let server: FramedIpcServer | undefined;
+    try {
+      server = await listenForFramedIpc(this.#endpoint, (connection) => {
+        connection.onMessage((message) => {
+          void this.#handle(connection, message).catch(() => connection.end());
         });
       });
-    });
-    try {
       this.#store.registerRouter({
         recipient: this.#options.recipient,
         ownership: this.#options.ownership,
@@ -64,10 +70,9 @@ export class RecipientInboxRouter {
         registeredAtMs: this.#options.now(),
       });
       this.#server = server;
+      this.#schedule();
     } catch (error) {
-      await server.close();
-      removeSocketFile(this.#endpoint);
-      throw error;
+      await this.#cleanupFailedStart(server, error);
     }
   }
 
@@ -104,19 +109,27 @@ export class RecipientInboxRouter {
 
   configureDelivery(input: {
     projectInboxBatch(batch: InboxBatch): void;
+    hasProjectedMessage?(messageId: string): boolean;
     wakeRecipient?: () => void;
   }): void {
     this.#options = { ...this.#options, ...input };
+    this.#schedule();
   }
 
   confirmDelivery(messageId: string): boolean {
-    return this.#store.commitDelivery({
+    const committed = this.#store.commitDelivery({
       recipient: this.#options.recipient,
       ownership: this.#options.ownership,
       endpoint: this.#endpoint,
       messageId,
       deliveredAtMs: this.#options.now(),
     });
+    if (committed) this.#projectedMessageIds.delete(messageId);
+    return committed;
+  }
+
+  releaseDeferred(): void {
+    this.#schedule();
   }
 
   async #handle(connection: FramedIpcConnection, frame: FramedIpcMessage): Promise<void> {
@@ -125,10 +138,9 @@ export class RecipientInboxRouter {
       return;
     }
 
-    let request: SignalAcceptRequest;
     let accepted: AcceptedSignal;
     try {
-      request = parseSignalRequest(frame.payload);
+      const request = parseSignalRequest(frame.payload);
       if (request.workflowOwnerId !== this.#options.workflowOwnerId) {
         throw new WorkflowProtocolError(
           "WorkflowMismatch",
@@ -147,6 +159,8 @@ export class RecipientInboxRouter {
           `Signal ${request.messageId} payload does not match its durable source binding`,
         );
       }
+      const senderSessionPath = this.#store.senderSessionPath(request.workflowOwnerId, request.senderAgentId);
+      resolveCanonicalSignal(senderSessionPath, request);
       accepted = this.#store.acceptSignal({
         request,
         recipient: this.#options.recipient,
@@ -164,31 +178,92 @@ export class RecipientInboxRouter {
       payload: { accepted: true, receipt: accepted.receipt } satisfies SignalReceiptReply,
     });
     connection.end();
-    if (accepted.delivery === "project") {
+    this.#schedule();
+  }
+
+  #schedule(): void {
+    if (this.#closed || this.#scheduling || !this.#server) return;
+    this.#scheduling = true;
+    queueMicrotask(() => {
       try {
-        this.#project(request, accepted);
-      } catch {
-        // Acceptance is already durable. Leave the pointer queued rather than
-        // misreporting delivery or sending a second acceptance response.
+        this.#deliverEligible();
+      } finally {
+        this.#scheduling = false;
+      }
+    });
+  }
+
+  #deliverEligible(): void {
+    if (this.#closed) return;
+    const pending = this.#store.listPending(this.#options.recipient);
+    for (const pointer of pending) {
+      if (this.#options.hasProjectedMessage?.(pointer.messageId)) {
+        this.confirmDelivery(pointer.messageId);
       }
     }
+    const lifecycle = this.#store.recipientLifecycle(this.#options.recipient);
+    if (lifecycle === "ended" || lifecycle === "interrupted") return;
+    const queued = this.#store.listPending(this.#options.recipient);
+    const eligible = (lifecycle === "active"
+      ? queued.filter((pointer) => pointer.deliveryTiming === "steer")
+      : queued).filter((pointer) => !this.#projectedMessageIds.has(pointer.messageId));
+    if (eligible.length === 0) return;
+
+    const messages = eligible.map((pointer) => this.#resolve(pointer));
+    const batch: InboxBatch = {
+      // A mixed batch can only be released while idle. Mark it deferred so the
+      // Pi bridge never treats it as permission to interrupt active work.
+      deliveryTiming: messages.some((message) => message.deliveryTiming === "deferred") ? "deferred" : "steer",
+      messages,
+    };
+    try {
+      this.#options.projectInboxBatch(batch);
+    } catch {
+      // Projection is the durability boundary. Keep every pointer until a
+      // later Router startup or delivery point can safely project the batch.
+      return;
+    }
+    for (const message of messages) this.#projectedMessageIds.add(message.messageId);
+    if (lifecycle === "waiting" || lifecycle === "owner") this.#options.wakeRecipient?.();
   }
 
-  #project(request: SignalAcceptRequest, accepted: AcceptedSignal): void {
-    const batch: InboxBatch = {
-      messages: [{
-        kind: "signal",
-        messageId: request.messageId,
-        senderAgentId: request.senderAgentId,
-        recipientAgentId: request.recipientAgentId,
-        message: request.message,
-      }],
+  #resolve(pointer: PendingMessagePointer): DirectSignalMessage {
+    const sessionPath = this.#store.senderSessionPath(
+      this.#options.workflowOwnerId,
+      pointer.senderAgentId,
+    );
+    return {
+      kind: "signal",
+      messageId: pointer.messageId,
+      senderAgentId: pointer.senderAgentId,
+      recipientAgentId: pointer.recipientAgentId,
+      deliveryTiming: pointer.deliveryTiming,
+      message: resolveCanonicalSignal(sessionPath, pointer),
     };
-    this.#options.projectInboxBatch(batch);
-    if (accepted.wakeRecipient) this.#options.wakeRecipient?.();
+  }
+
+  async #cleanupFailedStart(server: FramedIpcServer | undefined, cause: unknown): Promise<never> {
+    this.#closed = true;
+    const errors = [cause];
+    try {
+      await server?.close();
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      this.#store.close();
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      removeSocketFile(this.#endpoint);
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length === 1) throw cause;
+    throw new AggregateError(errors, `Failed to start Inbox Router ${this.#endpoint}`);
   }
 }
-
 
 function parseSignalRequest(value: unknown): SignalAcceptRequest {
   if (!value || typeof value !== "object") throw new TypeError("Signal acceptance payload must be an object");
@@ -206,7 +281,10 @@ function parseSignalRequest(value: unknown): SignalAcceptRequest {
       throw new TypeError(`Signal acceptance ${field} must be a non-empty string`);
     }
   }
-  return candidate as unknown as SignalAcceptRequest;
+  return {
+    ...candidate,
+    deliveryTiming: signalDeliveryTiming(candidate.deliveryTiming),
+  } as SignalAcceptRequest;
 }
 
 async function sendRejected(

@@ -18,6 +18,10 @@ const AgentSendParams = Type.Object({
     minLength: 1,
     description: "Plain actionable Signal content",
   }),
+  timing: Type.Optional(Type.Union([
+    Type.Literal("steer"),
+    Type.Literal("deferred"),
+  ])),
 }, { additionalProperties: false });
 
 export async function startDirectSignalRouter(
@@ -30,8 +34,13 @@ export async function startDirectSignalRouter(
     projectInboxBatch(batch) {
       pi.sendMessage(projectInboxBatch(batch), {
         triggerTurn: true,
+        // Deferred batches are selected only after durable settlement. At the
+        // Pi boundary they are safe to inject as a non-aborting steer.
         deliverAs: "steer",
       });
+    },
+    hasProjectedMessage(messageId) {
+      return sessionContainsInboxMessage(context.sessionManager.getEntries(), messageId);
     },
   });
 }
@@ -76,11 +85,13 @@ export function registerAgentSendTool(
         toolCallId,
         params.target.agent,
         params.message,
+        params.timing ?? "steer",
       );
       const receipt = await workflowBootstrap.sendDirectSignal({
         targetAgentId: params.target.agent,
         message: params.message,
         sourceEntryId: toolCallId,
+        deliveryTiming: params.timing,
       });
       return {
         content: [{
@@ -105,21 +116,25 @@ export function projectInboxBatch(batch: InboxBatch): {
       messageId: string;
       senderAgentId: string;
       recipientAgentId: string;
+      deliveryTiming: "steer" | "deferred";
     }>;
   };
 } {
-  const signal = batch.messages[0];
+  const content = batch.messages.map((signal) =>
+    `Signal from Agent ${signal.senderAgentId} [${signal.messageId}]\n\n${signal.message}`,
+  ).join("\n\n---\n\n");
   return {
     customType: INBOX_BATCH_CUSTOM_TYPE,
-    content: `Signal from Agent ${signal.senderAgentId} [${signal.messageId}]\n\n${signal.message}`,
+    content,
     display: true,
     details: {
-      messages: [{
+      messages: batch.messages.map((signal) => ({
         kind: signal.kind,
         messageId: signal.messageId,
         senderAgentId: signal.senderAgentId,
         recipientAgentId: signal.recipientAgentId,
-      }],
+        deliveryTiming: signal.deliveryTiming,
+      })),
     },
   };
 }
@@ -158,6 +173,7 @@ function assertCanonicalAgentSendSource(
   toolCallId: string,
   targetAgentId: string,
   message: string,
+  deliveryTiming: "steer" | "deferred",
 ): void {
   const found = entries.some((entry) => {
     if (!entry || typeof entry !== "object") return false;
@@ -171,13 +187,14 @@ function assertCanonicalAgentSendSource(
         type?: unknown;
         id?: unknown;
         name?: unknown;
-        arguments?: { target?: { agent?: unknown }; message?: unknown };
+        arguments?: { target?: { agent?: unknown }; message?: unknown; timing?: unknown };
       };
       return candidate.type === "toolCall"
         && candidate.id === toolCallId
         && candidate.name === "agent_send"
         && candidate.arguments?.target?.agent === targetAgentId
-        && candidate.arguments?.message === message;
+        && candidate.arguments?.message === message
+        && (candidate.arguments?.timing ?? "steer") === deliveryTiming;
     });
   });
   if (!found) {

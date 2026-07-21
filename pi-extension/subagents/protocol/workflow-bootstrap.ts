@@ -229,6 +229,7 @@ export class WorkflowBootstrap {
 
   async startDirectSignalRouter(input: {
     projectInboxBatch(batch: InboxBatch): void;
+    hasProjectedMessage?(messageId: string): boolean;
     wakeRecipient?: () => void;
   }): Promise<void> {
     const runtime = this.#directSignalRuntime();
@@ -240,17 +241,23 @@ export class WorkflowBootstrap {
     targetAgentId: string;
     message: string;
     sourceEntryId: string;
+    deliveryTiming?: "steer" | "deferred";
   }): Promise<QueuedSignalReceipt> {
     const controlPlane = this.#requireControlPlane();
     return this.#directSignalRuntime().sendSignal({
       target: controlPlane.agent(input.targetAgentId),
       message: input.message,
       sourceEntryId: input.sourceEntryId,
+      deliveryTiming: input.deliveryTiming,
     });
   }
 
   confirmDirectSignalDelivery(messageId: string): boolean {
     return this.#directSignalRuntime().confirmDelivery(messageId);
+  }
+
+  releaseDeferredSignals(): void {
+    this.#directSignals?.releaseDeferred();
   }
 
   async closeDirectSignalRouter(): Promise<void> {
