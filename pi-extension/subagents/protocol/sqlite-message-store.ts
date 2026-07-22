@@ -378,6 +378,17 @@ export class DirectSignalStore {
       if (message.in_reply_to_request_id) {
         const updated = this.#database.prepare(`UPDATE workflow_requests SET status = 'resolved' WHERE request_id = ? AND answer_message_id = ? AND status = 'answered'`).run(message.in_reply_to_request_id, message.message_id);
         if (Number(updated.changes) !== 1) throw new Error(`Answer ${message.message_id} no longer owns Request ${message.in_reply_to_request_id}`);
+        this.#database.prepare(`
+          UPDATE undeclared_settlement_episodes
+          SET status = 'closed', updated_at_ms = ?
+          WHERE agent_id = (
+            SELECT requester_agent_id FROM workflow_requests WHERE request_id = ?
+          ) AND status = 'open' AND EXISTS (
+            SELECT 1 FROM undeclared_settlement_dependencies
+            WHERE episode_id = undeclared_settlement_episodes.episode_id
+              AND dependency_kind = 'agent' AND dependency_id = ?
+          )
+        `).run(input.deliveredAtMs, message.in_reply_to_request_id, message.in_reply_to_request_id);
       }
       return "newly-delivered";
     });
@@ -390,7 +401,7 @@ export class DirectSignalStore {
     return row.session_path;
   }
 
-  recipientLifecycle(recipient: AgentReference): "owner" | "active" | "waiting" | "interrupted" | "ended" { this.#assertWorkflow(recipient.workflowOwnerId); return this.#recipientLifecycle(recipient); }
+  recipientLifecycle(recipient: AgentReference): "owner" | "active" | "waiting" | "waiting-human" | "interrupted" | "ended" { this.#assertWorkflow(recipient.workflowOwnerId); return this.#recipientLifecycle(recipient); }
   inspectMessage(owner: string, messageId: string): DirectSignalRecord | undefined { this.#assertWorkflow(owner); const row = this.#readMessage(messageId); return row ? mapMessage(row) : undefined; }
   listMessages(owner: string): DirectSignalRecord[] { this.#assertWorkflow(owner); return (this.#database.prepare("SELECT * FROM direct_signal_messages ORDER BY created_at_ms, message_id").all() as unknown as MessageRow[]).map(mapMessage); }
   inspectRequest(owner: string, requestId: string): RequestRecord | undefined { this.#assertWorkflow(owner); const row = this.#readRequest(requestId); return row ? mapRequest(row) : undefined; }
@@ -494,10 +505,18 @@ export class DirectSignalStore {
     const row = this.#database.prepare("SELECT owner_id, fencing_epoch FROM ownership WHERE resource_id = ?").get(ownership.resourceId) as { owner_id: string; fencing_epoch: number } | undefined;
     if (!row || row.owner_id !== ownership.runId || Number(row.fencing_epoch) !== ownership.epoch) throw new WorkflowProtocolError("OwnershipLost", `Recipient Inbox Router no longer owns ${recipient.agentId} at fencing epoch ${ownership.epoch}`);
   }
-  #recipientLifecycle(recipient: AgentReference): "owner" | "active" | "waiting" | "interrupted" | "ended" {
+  #recipientLifecycle(recipient: AgentReference): "owner" | "active" | "waiting" | "waiting-human" | "interrupted" | "ended" {
     if (recipient.agentId === this.#workflowOwnerId()) return "owner";
     const row = this.#database.prepare("SELECT phase, open_state FROM agent_activations WHERE agent_id = ? ORDER BY activation_sequence DESC LIMIT 1").get(recipient.agentId) as { phase: "open" | "ended"; open_state: "active" | "waiting" | "interrupted" | null } | undefined;
-    return !row || row.phase === "ended" ? "ended" : row.open_state ?? "ended";
+    if (!row || row.phase === "ended") return "ended";
+    // The returned Human result remains non-durable until Pi appends it. It
+    // must fence Inbox projection even during the active tool-resume turn.
+    const human = this.#database.prepare(`
+      SELECT 1 FROM human_interrupts
+      WHERE agent_id = ? AND status IN ('pending', 'response-bound', 'result-pending')
+    `).get(recipient.agentId);
+    if (human) return "waiting-human";
+    return row.open_state ?? "ended";
   }
   #nextAcceptanceSequence(agentId: string): number { const row = this.#database.prepare("SELECT last_sequence FROM recipient_acceptance_counters WHERE agent_id = ?").get(agentId) as { last_sequence: number } | undefined; const next = Number(row?.last_sequence ?? 0) + 1; this.#database.prepare("INSERT INTO recipient_acceptance_counters (agent_id, last_sequence) VALUES (?, ?) ON CONFLICT (agent_id) DO UPDATE SET last_sequence = excluded.last_sequence").run(agentId, next); return next; }
   #reactivateForAuthorizedRequest(input: { request: SignalAcceptRequest; recipient: AgentReference; ownership?: AgentRunOwnership; acceptedAtMs: number }): void {

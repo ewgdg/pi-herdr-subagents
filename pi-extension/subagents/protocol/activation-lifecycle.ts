@@ -7,13 +7,38 @@ import {
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 const HUMAN_DEPENDENCY_ID = "human";
+const UNDECLARED_DEPENDENCY_ID = "undeclared";
+const UNDECLARED_SETTLEMENT_NOTICE_TEXT = "Your last settlement declared no Human Interrupt, Agent dependency, or operation dependency. Continue by declaring a real dependency, or complete the activation through its lifecycle action.";
 
 export type ActivationDependency =
   | { kind: "human"; dependencyId: typeof HUMAN_DEPENDENCY_ID }
+  | { kind: "undeclared"; dependencyId: typeof UNDECLARED_DEPENDENCY_ID }
   | { kind: "agent"; dependencyId: string; agentId: string }
   | { kind: "operation"; dependencyId: string };
 
-export type DeclaredActivationDependency = Exclude<ActivationDependency, { kind: "human" }>;
+export type DeclaredActivationDependency = Exclude<ActivationDependency, { kind: "human" | "undeclared" }>;
+
+export interface HumanInterruptRecord {
+  toolCallId: string;
+  status: "pending" | "response-bound" | "result-pending" | "consumed" | "terminal";
+  responseInputId?: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface UndeclaredSettlementEpisode {
+  episodeId: string;
+  noticeId: string;
+  noticeText: string;
+  agentId: string;
+  status: "open" | "closed";
+  noticeQueued: boolean;
+  noticeDelivered: boolean;
+  repeatTriggered: boolean;
+  triggerKind?: "incident" | "owner-handoff";
+  createdAtMs: number;
+  updatedAtMs: number;
+}
 
 export type ActivationState =
   | { kind: "active" }
@@ -80,6 +105,31 @@ interface OwnerRow {
   fencing_epoch: number;
 }
 
+interface HumanInterruptRow {
+  agent_id: string;
+  activation_id: string;
+  tool_call_id: string;
+  status: "pending" | "response-bound" | "result-pending" | "consumed" | "terminal";
+  response_input_id: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+  terminal_reason: string | null;
+}
+
+interface UndeclaredEpisodeRow {
+  episode_id: string;
+  agent_id: string;
+  status: "open" | "closed";
+  notice_queued: number;
+  notice_delivered: number;
+  notice_text: string;
+  declared_waiting: number;
+  repeat_triggered: number;
+  trigger_kind: "incident" | "owner-handoff" | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
 export class ActivationLifecycleStore {
   readonly #database: DatabaseSync;
   #closed = false;
@@ -137,7 +187,70 @@ export class ActivationLifecycleStore {
         )
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS human_interrupts (
+        agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
+        activation_id TEXT NOT NULL REFERENCES agent_activations(activation_id),
+        tool_call_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'response-bound', 'result-pending', 'consumed', 'terminal')),
+        response_input_id TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        terminal_reason TEXT,
+        PRIMARY KEY (agent_id, tool_call_id),
+        CHECK ((status IN ('response-bound', 'result-pending', 'consumed') AND response_input_id IS NOT NULL)
+          OR (status IN ('pending', 'terminal') AND response_input_id IS NULL)),
+        CHECK ((status = 'terminal' AND terminal_reason IS NOT NULL)
+          OR (status != 'terminal' AND terminal_reason IS NULL))
+      ) STRICT;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS human_interrupts_one_open
+      ON human_interrupts (agent_id)
+      WHERE status IN ('pending', 'response-bound');
+
+      CREATE UNIQUE INDEX IF NOT EXISTS human_interrupts_response_input
+      ON human_interrupts (response_input_id)
+      WHERE response_input_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS human_attention (
+        agent_id TEXT PRIMARY KEY REFERENCES workflow_agents(agent_id),
+        tool_call_id TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS undeclared_settlement_episodes (
+        episode_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
+        status TEXT NOT NULL CHECK (status IN ('open', 'closed')),
+        notice_queued INTEGER NOT NULL DEFAULT 0 CHECK (notice_queued IN (0, 1)),
+        notice_delivered INTEGER NOT NULL DEFAULT 0 CHECK (notice_delivered IN (0, 1)),
+        notice_text TEXT NOT NULL,
+        declared_waiting INTEGER NOT NULL DEFAULT 0 CHECK (declared_waiting IN (0, 1)),
+        repeat_triggered INTEGER NOT NULL DEFAULT 0 CHECK (repeat_triggered IN (0, 1)),
+        trigger_kind TEXT CHECK (trigger_kind IN ('incident', 'owner-handoff')),
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS undeclared_settlement_one_open
+      ON undeclared_settlement_episodes (agent_id)
+      WHERE status = 'open';
+
+      CREATE TABLE IF NOT EXISTS undeclared_settlement_dependencies (
+        episode_id TEXT NOT NULL REFERENCES undeclared_settlement_episodes(episode_id),
+        dependency_kind TEXT NOT NULL CHECK (dependency_kind IN ('agent', 'operation', 'human')),
+        dependency_id TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (episode_id, dependency_kind, dependency_id)
+      ) STRICT;
+
     `);
+    const episodeColumns = this.#database.prepare("PRAGMA table_info(undeclared_settlement_episodes)").all() as Array<{ name: string }>;
+    if (!episodeColumns.some((column) => column.name === "notice_text")) {
+      this.#database.exec(`ALTER TABLE undeclared_settlement_episodes ADD COLUMN notice_text TEXT NOT NULL DEFAULT '${UNDECLARED_SETTLEMENT_NOTICE_TEXT.replace(/'/g, "''")}'`);
+    }
+    if (!episodeColumns.some((column) => column.name === "notice_queued")) {
+      this.#database.exec("ALTER TABLE undeclared_settlement_episodes ADD COLUMN notice_queued INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   close(): void {
@@ -164,22 +277,30 @@ export class ActivationLifecycleStore {
         );
       }
       const sequence = Number(current?.activation_sequence ?? 0) + 1;
+      const recoveredHuman = this.#unresolvedHumanInterrupt(ownership.agentId);
       this.#database.prepare(`
         INSERT INTO agent_activations (
           activation_id, agent_id, run_id, fencing_epoch, activation_sequence,
           revision, turn_sequence, phase, open_state, ended_outcome,
           failure_error, failure_exit_code, interrupt_turn_sequence,
           interrupt_requested_at_ms, created_at_ms, updated_at_ms
-        ) VALUES (?, ?, ?, ?, ?, 1, 1, 'open', 'active', NULL, NULL, NULL, NULL, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, 1, 1, 'open', ?, NULL, NULL, NULL, NULL, NULL, ?, ?)
       `).run(
         ownership.runId,
         ownership.agentId,
         ownership.runId,
         ownership.epoch,
         sequence,
+        recoveredHuman ? "waiting" : "active",
         now,
         now,
       );
+      if (recoveredHuman) {
+        this.#database.prepare(`
+          UPDATE human_interrupts SET activation_id = ?, updated_at_ms = ?
+          WHERE agent_id = ? AND tool_call_id = ?
+        `).run(ownership.runId, now, ownership.agentId, recoveredHuman.tool_call_id);
+      }
       return this.#requireCurrent(ownership.agentId, ownership.workflowOwnerId);
     });
   }
@@ -245,14 +366,44 @@ export class ActivationLifecycleStore {
     });
   }
 
+  satisfyDependency(
+    ownership: AgentRunOwnership,
+    dependency: Pick<DeclaredActivationDependency, "kind" | "dependencyId">,
+    now: number,
+    expectedRevision?: number,
+  ): ActivationRecord {
+    assertNonEmpty(dependency.dependencyId, "dependency ID");
+    return this.#mutateOpen(ownership, expectedRevision, (row) => {
+      const result = this.#database.prepare(`
+        DELETE FROM activation_dependencies
+        WHERE activation_id = ? AND dependency_kind = ? AND dependency_id = ?
+      `).run(row.activation_id, dependency.kind, dependency.dependencyId);
+      if (Number(result.changes) === 0) {
+        throw new WorkflowProtocolError(
+          "UnknownLifecycleDependency",
+          `Activation ${row.activation_id} has no ${dependency.kind} dependency ${dependency.dependencyId}`,
+        );
+      }
+      this.#satisfyUndeclaredDependency(row.agent_id, dependency.kind, dependency.dependencyId, now);
+      this.#touch(row, now);
+    });
+  }
+
   settle(
     ownership: AgentRunOwnership,
     now: number,
     expectedRevision?: number,
+    actorRole: "ordinary" | "moderator" = "ordinary",
   ): ActivationRecord {
     return this.#mutateOpen(ownership, expectedRevision, (row) => {
       if (row.open_state !== "active") {
         throw this.#invalidTransition(row, "settle");
+      }
+      const declaredDependencies = this.#readDeclaredDependencies(row.activation_id, row.agent_id);
+      if (declaredDependencies.length === 0 && !this.#openHumanInterrupt(row.agent_id)) {
+        this.#recordUndeclaredSettlement(row, now, actorRole);
+      } else if (declaredDependencies.length > 0) {
+        this.#declareUndeclaredDependencies(row.agent_id, declaredDependencies, now);
       }
       this.#database.prepare(`
         UPDATE agent_activations
@@ -271,6 +422,12 @@ export class ActivationLifecycleStore {
   ): ActivationRecord {
     return this.#mutateOpen(ownership, expectedRevision, (row) => {
       if (row.open_state === "active") return;
+      if (this.#unresolvedHumanInterrupt(row.agent_id)) {
+        throw new WorkflowProtocolError(
+          "InvalidLifecycleTransition",
+          `Activation ${row.activation_id} is waiting for a Human Interrupt result`,
+        );
+      }
       this.#database.prepare(`
         UPDATE agent_activations
         SET open_state = 'active', revision = revision + 1,
@@ -280,6 +437,204 @@ export class ActivationLifecycleStore {
         WHERE activation_id = ?
       `).run(now, row.activation_id);
     }, { allowNoop: true });
+  }
+
+  beginHumanInterrupt(
+    ownership: AgentRunOwnership,
+    toolCallId: string,
+    now: number,
+    actorRole: "ordinary" | "moderator" = "ordinary",
+  ): HumanInterruptRecord {
+    assertNonEmpty(toolCallId, "Human Interrupt tool-call ID");
+    return this.#withImmediateTransaction(() => {
+      this.#assertCurrentOwnership(ownership);
+      const row = this.#requireOwnedOpenRow(ownership);
+      this.#assertOrdinarySubagent(row.agent_id, actorRole);
+      const existing = this.#humanInterrupt(row.agent_id, toolCallId);
+      if (existing) return mapHumanInterrupt(existing);
+      const unresolved = this.#unresolvedHumanInterrupt(row.agent_id);
+      if (unresolved) {
+        throw new WorkflowProtocolError(
+          "HumanInterruptAlreadyPending",
+          `Agent ${row.agent_id} already has a pending Human Interrupt`,
+        );
+      }
+      if (row.open_state !== "active") throw this.#invalidTransition(row, "ask a human");
+      this.#database.prepare(`
+        INSERT INTO human_interrupts (
+          agent_id, activation_id, tool_call_id, status, response_input_id,
+          created_at_ms, updated_at_ms, terminal_reason
+        ) VALUES (?, ?, ?, 'pending', NULL, ?, ?, NULL)
+      `).run(row.agent_id, row.activation_id, toolCallId, now, now);
+      this.#declareUndeclaredDependency(row.agent_id, "human", toolCallId, now);
+      this.#database.prepare(`
+        INSERT INTO human_attention (agent_id, tool_call_id, created_at_ms)
+        VALUES (?, ?, ?)
+      `).run(row.agent_id, toolCallId, now);
+      this.#database.prepare(`
+        UPDATE agent_activations
+        SET open_state = 'waiting', revision = revision + 1,
+            updated_at_ms = ?
+        WHERE activation_id = ?
+      `).run(now, row.activation_id);
+      return mapHumanInterrupt(this.#humanInterrupt(row.agent_id, toolCallId)!);
+    });
+  }
+
+  bindHumanResponse(
+    ownership: AgentRunOwnership,
+    toolCallId: string,
+    responseInputId: string,
+    now: number,
+  ): HumanInterruptRecord | undefined {
+    assertNonEmpty(responseInputId, "Human response input ID");
+    assertNonEmpty(toolCallId, "Human Interrupt tool-call ID");
+    return this.#withImmediateTransaction(() => {
+      this.#assertCurrentOwnership(ownership);
+      const row = this.#requireOwnedOpenRow(ownership);
+      const interrupt = this.#humanInterrupt(row.agent_id, toolCallId);
+      if (!interrupt || interrupt.status !== "pending") return undefined;
+      if (row.open_state !== "waiting") throw this.#invalidTransition(row, "bind human input");
+      const result = this.#database.prepare(`
+        UPDATE human_interrupts
+        SET status = 'response-bound', response_input_id = ?, updated_at_ms = ?
+        WHERE agent_id = ? AND tool_call_id = ? AND status = 'pending'
+      `).run(responseInputId, now, row.agent_id, toolCallId);
+      if (Number(result.changes) !== 1) throw new WorkflowProtocolError("HumanInterruptTerminal", "Human Interrupt no longer accepts input");
+      this.#database.prepare("DELETE FROM human_attention WHERE agent_id = ?").run(row.agent_id);
+      return mapHumanInterrupt(this.#humanInterrupt(row.agent_id, toolCallId)!);
+    });
+  }
+
+  prepareHumanResponseResult(
+    ownership: AgentRunOwnership,
+    toolCallId: string,
+    now: number,
+  ): HumanInterruptRecord {
+    return this.#withImmediateTransaction(() => {
+      this.#assertCurrentOwnership(ownership);
+      const row = this.#requireOwnedOpenRow(ownership);
+      const interrupt = this.#humanInterrupt(row.agent_id, toolCallId);
+      if (!interrupt || interrupt.status === "terminal") {
+        throw new WorkflowProtocolError("HumanInterruptTerminal", `Human Interrupt ${toolCallId} is terminal`);
+      }
+      if (interrupt.status !== "response-bound") {
+        throw new WorkflowProtocolError("HumanInterruptResponseMissing", `Human Interrupt ${toolCallId} has no bound response`);
+      }
+      if (row.open_state !== "waiting") throw this.#invalidTransition(row, "resume Human Interrupt");
+      this.#database.prepare(`
+        UPDATE human_interrupts
+        SET status = 'result-pending', updated_at_ms = ?
+        WHERE agent_id = ? AND tool_call_id = ? AND status = 'response-bound'
+      `).run(now, row.agent_id, toolCallId);
+      this.#database.prepare(`
+        UPDATE agent_activations
+        SET open_state = 'active', revision = revision + 1,
+            turn_sequence = turn_sequence + 1, updated_at_ms = ?
+        WHERE activation_id = ?
+      `).run(now, row.activation_id);
+      return mapHumanInterrupt(this.#humanInterrupt(row.agent_id, toolCallId)!);
+    });
+  }
+
+  resumeHumanResponseResult(
+    ownership: AgentRunOwnership,
+    toolCallId: string,
+    now: number,
+  ): HumanInterruptRecord {
+    return this.#withImmediateTransaction(() => {
+      this.#assertCurrentOwnership(ownership);
+      const row = this.#requireOwnedOpenRow(ownership);
+      const interrupt = this.#humanInterrupt(row.agent_id, toolCallId);
+      if (!interrupt || interrupt.status !== "result-pending") {
+        throw new WorkflowProtocolError("HumanInterruptResponseMissing", `Human Interrupt ${toolCallId} has no pending result`);
+      }
+      if (row.open_state !== "waiting") throw this.#invalidTransition(row, "replay Human Interrupt result");
+      this.#database.prepare(`
+        UPDATE agent_activations
+        SET open_state = 'active', revision = revision + 1,
+            turn_sequence = turn_sequence + 1, updated_at_ms = ?
+        WHERE activation_id = ?
+      `).run(now, row.activation_id);
+      return mapHumanInterrupt(interrupt);
+    });
+  }
+
+  confirmHumanResponseResult(
+    ownership: AgentRunOwnership,
+    toolCallId: string,
+    now: number,
+  ): HumanInterruptRecord | undefined {
+    return this.#withImmediateTransaction(() => {
+      this.#assertAgentReference(ownership);
+      const result = this.#database.prepare(`
+        UPDATE human_interrupts
+        SET status = 'consumed', updated_at_ms = ?
+        WHERE agent_id = ? AND tool_call_id = ? AND status = 'result-pending'
+      `).run(now, ownership.agentId, toolCallId);
+      if (Number(result.changes) === 0) return undefined;
+      // result-pending is the durable authorization fence. Pi may persist the
+      // already-returned result after cancellation releases this run's lease.
+      this.#satisfyUndeclaredDependency(ownership.agentId, "human", toolCallId, now);
+      return mapHumanInterrupt(this.#humanInterrupt(ownership.agentId, toolCallId)!);
+    });
+  }
+
+  inspectHumanInterrupt(agent: AgentReference): HumanInterruptRecord | undefined {
+    this.#assertAgentReference(agent);
+    const row = this.#database.prepare(`
+      SELECT agent_id, activation_id, tool_call_id, status, response_input_id,
+             created_at_ms, updated_at_ms, terminal_reason
+      FROM human_interrupts WHERE agent_id = ?
+      ORDER BY updated_at_ms DESC, tool_call_id DESC LIMIT 1
+    `).get(agent.agentId) as HumanInterruptRow | undefined;
+    return row ? mapHumanInterrupt(row) : undefined;
+  }
+
+  humanAttention(agent: AgentReference): boolean {
+    this.#assertAgentReference(agent);
+    return Boolean(this.#database.prepare("SELECT 1 FROM human_attention WHERE agent_id = ?").get(agent.agentId));
+  }
+
+  pendingUndeclaredNotice(agent: AgentReference): UndeclaredSettlementEpisode | undefined {
+    this.#assertAgentReference(agent);
+    const row = this.#openUndeclaredEpisode(agent.agentId);
+    return row && !Number(row.notice_delivered) ? mapUndeclaredEpisode(row) : undefined;
+  }
+
+  confirmUndeclaredNotice(agent: AgentReference, episodeId: string, now: number): boolean {
+    this.#assertAgentReference(agent);
+    const result = this.#database.prepare(`
+      UPDATE undeclared_settlement_episodes
+      SET notice_delivered = 1, updated_at_ms = ?
+      WHERE episode_id = ? AND agent_id = ? AND status = 'open' AND notice_delivered = 0
+    `).run(now, episodeId, agent.agentId);
+    return Number(result.changes) === 1;
+  }
+
+  queueUndeclaredNotice(agent: AgentReference, episodeId: string, now: number): UndeclaredSettlementEpisode | undefined {
+    this.#assertAgentReference(agent);
+    return this.#withImmediateTransaction(() => {
+      const result = this.#database.prepare(`
+        UPDATE undeclared_settlement_episodes
+        SET notice_queued = 1, updated_at_ms = ?
+        WHERE episode_id = ? AND agent_id = ? AND status = 'open' AND notice_delivered = 0
+      `).run(now, episodeId, agent.agentId);
+      if (Number(result.changes) !== 1) return undefined;
+      return mapUndeclaredEpisode(this.#openUndeclaredEpisode(agent.agentId)!);
+    });
+  }
+
+  inspectUndeclaredEpisode(agent: AgentReference): UndeclaredSettlementEpisode | undefined {
+    this.#assertAgentReference(agent);
+    const row = this.#database.prepare(`
+      SELECT episode_id, agent_id, status, notice_queued, notice_delivered,
+             notice_text, declared_waiting, repeat_triggered, trigger_kind,
+             created_at_ms, updated_at_ms
+      FROM undeclared_settlement_episodes WHERE agent_id = ?
+      ORDER BY created_at_ms DESC LIMIT 1
+    `).get(agent.agentId) as UndeclaredEpisodeRow | undefined;
+    return row ? mapUndeclaredEpisode(row) : undefined;
   }
 
   requestInterruption(
@@ -364,6 +719,41 @@ export class ActivationLifecycleStore {
           "OwnershipLost",
           `Agent Run no longer owns ${ownership.agentId} at fencing epoch ${ownership.epoch}`,
         );
+      }
+      return this.#requireCurrent(ownership.agentId, ownership.workflowOwnerId);
+    });
+  }
+
+  cancelAndRelease(ownership: AgentRunOwnership, now: number): ActivationRecord {
+    return this.#withImmediateTransaction(() => {
+      this.#assertCurrentOwnership(ownership);
+      const row = this.#requireOwnedOpenRow(ownership);
+      this.#database.prepare(`
+        UPDATE human_interrupts
+        SET status = 'terminal', response_input_id = NULL,
+            terminal_reason = 'activation-cancelled', updated_at_ms = ?
+        WHERE agent_id = ? AND status IN ('pending', 'response-bound')
+      `).run(now, row.agent_id);
+      this.#database.prepare("DELETE FROM human_attention WHERE agent_id = ?").run(row.agent_id);
+      this.#database.prepare(`
+        UPDATE undeclared_settlement_episodes
+        SET status = 'closed', updated_at_ms = ?
+        WHERE agent_id = ? AND status = 'open'
+      `).run(now, row.agent_id);
+      this.#database.prepare(`
+        UPDATE agent_activations
+        SET phase = 'ended', open_state = NULL, ended_outcome = 'cancelled',
+            failure_error = NULL, failure_exit_code = NULL, revision = revision + 1,
+            interrupt_turn_sequence = NULL, interrupt_requested_at_ms = NULL,
+            updated_at_ms = ?
+        WHERE activation_id = ?
+      `).run(now, row.activation_id);
+      const released = this.#database.prepare(`
+        DELETE FROM ownership
+        WHERE resource_id = ? AND owner_id = ? AND fencing_epoch = ?
+      `).run(ownership.resourceId, ownership.runId, ownership.epoch);
+      if (Number(released.changes) !== 1) {
+        throw new WorkflowProtocolError("OwnershipLost", `Agent Run no longer owns ${ownership.agentId} at fencing epoch ${ownership.epoch}`);
       }
       return this.#requireCurrent(ownership.agentId, ownership.workflowOwnerId);
     });
@@ -572,6 +962,11 @@ export class ActivationLifecycleStore {
   }
 
   #readDependencies(activationId: string): ActivationDependency[] {
+    const activation = this.#database.prepare("SELECT agent_id FROM agent_activations WHERE activation_id = ?").get(activationId) as { agent_id: string } | undefined;
+    if (!activation) throw new Error(`Activation ${activationId} is missing`);
+    if (this.#unresolvedHumanInterrupt(activation.agent_id)) {
+      return [{ kind: "human", dependencyId: HUMAN_DEPENDENCY_ID }];
+    }
     const rows = this.#database.prepare(`
       SELECT dependency_kind, dependency_id, dependency_agent_id AS agent_id
       FROM activation_dependencies
@@ -585,10 +980,144 @@ export class ActivationLifecycleStore {
       ) AND status <> 'resolved'
       ORDER BY dependency_kind, dependency_id
     `).all(activationId, activationId) as unknown as DependencyRow[];
-    if (rows.length === 0) return [{ kind: "human", dependencyId: HUMAN_DEPENDENCY_ID }];
+    if (rows.length === 0) return [{ kind: "undeclared", dependencyId: UNDECLARED_DEPENDENCY_ID }];
     return rows.map((row) => row.dependency_kind === "agent"
       ? { kind: "agent", dependencyId: row.dependency_id, agentId: row.agent_id! }
       : { kind: "operation", dependencyId: row.dependency_id });
+  }
+
+  #readDeclaredDependencies(activationId: string, agentId: string): DependencyRow[] {
+    return this.#database.prepare(`
+      SELECT dependency_kind, dependency_id, dependency_agent_id AS agent_id
+      FROM activation_dependencies WHERE activation_id = ?
+      UNION ALL
+      SELECT 'agent' AS dependency_kind, request_id AS dependency_id,
+             responder_agent_id AS agent_id
+      FROM workflow_requests
+      WHERE requester_agent_id = ? AND status <> 'resolved'
+    `).all(activationId, agentId) as unknown as DependencyRow[];
+  }
+
+  #humanInterrupt(agentId: string, toolCallId: string): HumanInterruptRow | undefined {
+    return this.#database.prepare(`
+      SELECT agent_id, activation_id, tool_call_id, status, response_input_id,
+             created_at_ms, updated_at_ms, terminal_reason
+      FROM human_interrupts WHERE agent_id = ? AND tool_call_id = ?
+    `).get(agentId, toolCallId) as HumanInterruptRow | undefined;
+  }
+
+  #openHumanInterrupt(agentId: string): HumanInterruptRow | undefined {
+    return this.#database.prepare(`
+      SELECT agent_id, activation_id, tool_call_id, status, response_input_id,
+             created_at_ms, updated_at_ms, terminal_reason
+      FROM human_interrupts
+      WHERE agent_id = ? AND status IN ('pending', 'response-bound')
+      ORDER BY created_at_ms DESC LIMIT 1
+    `).get(agentId) as HumanInterruptRow | undefined;
+  }
+
+  #unresolvedHumanInterrupt(agentId: string): HumanInterruptRow | undefined {
+    return this.#database.prepare(`
+      SELECT agent_id, activation_id, tool_call_id, status, response_input_id,
+             created_at_ms, updated_at_ms, terminal_reason
+      FROM human_interrupts
+      WHERE agent_id = ? AND status IN ('pending', 'response-bound', 'result-pending')
+      ORDER BY created_at_ms DESC LIMIT 1
+    `).get(agentId) as HumanInterruptRow | undefined;
+  }
+
+  #openUndeclaredEpisode(agentId: string): UndeclaredEpisodeRow | undefined {
+    return this.#database.prepare(`
+      SELECT episode_id, agent_id, status, notice_queued, notice_delivered,
+             notice_text, declared_waiting, repeat_triggered, trigger_kind,
+             created_at_ms, updated_at_ms
+      FROM undeclared_settlement_episodes
+      WHERE agent_id = ? AND status = 'open'
+    `).get(agentId) as UndeclaredEpisodeRow | undefined;
+  }
+
+  #recordUndeclaredSettlement(
+    row: ActivationRow,
+    now: number,
+    actorRole: "ordinary" | "moderator",
+  ): void {
+    const existing = this.#openUndeclaredEpisode(row.agent_id);
+    if (!existing) {
+      this.#database.prepare(`
+        INSERT INTO undeclared_settlement_episodes (
+          episode_id, agent_id, status, notice_queued, notice_delivered,
+          notice_text, declared_waiting, repeat_triggered, trigger_kind,
+          created_at_ms, updated_at_ms
+        ) VALUES (?, ?, 'open', 0, 0, ?, 0, 0, NULL, ?, ?)
+      `).run(`${row.activation_id}:undeclared`, row.agent_id, UNDECLARED_SETTLEMENT_NOTICE_TEXT, now, now);
+      return;
+    }
+    if (Number(existing.notice_delivered) === 0 || Number(existing.repeat_triggered) === 1) return;
+    this.#database.prepare(`
+      UPDATE undeclared_settlement_episodes
+      SET repeat_triggered = 1, trigger_kind = ?, updated_at_ms = ?
+      WHERE episode_id = ? AND repeat_triggered = 0
+    `).run(actorRole === "moderator" ? "owner-handoff" : "incident", now, existing.episode_id);
+  }
+
+  #declareUndeclaredDependencies(
+    agentId: string,
+    dependencies: DependencyRow[],
+    now: number,
+  ): void {
+    for (const dependency of dependencies) {
+      this.#declareUndeclaredDependency(agentId, dependency.dependency_kind, dependency.dependency_id, now);
+    }
+  }
+
+  #declareUndeclaredDependency(
+    agentId: string,
+    kind: "agent" | "operation" | "human",
+    dependencyId: string,
+    now: number,
+  ): void {
+    const episode = this.#openUndeclaredEpisode(agentId);
+    if (!episode) return;
+    this.#database.prepare(`
+      INSERT INTO undeclared_settlement_dependencies (
+        episode_id, dependency_kind, dependency_id, created_at_ms
+      ) VALUES (?, ?, ?, ?)
+      ON CONFLICT (episode_id, dependency_kind, dependency_id) DO NOTHING
+    `).run(episode.episode_id, kind, dependencyId, now);
+  }
+
+  #satisfyUndeclaredDependency(
+    agentId: string,
+    kind: "agent" | "operation" | "human",
+    dependencyId: string,
+    now: number,
+  ): boolean {
+    const episode = this.#openUndeclaredEpisode(agentId);
+    if (!episode) return false;
+    const dependency = this.#database.prepare(`
+      DELETE FROM undeclared_settlement_dependencies
+      WHERE episode_id = ? AND dependency_kind = ? AND dependency_id = ?
+    `).run(episode.episode_id, kind, dependencyId);
+    if (Number(dependency.changes) === 0) return false;
+    this.#database.prepare(`
+      UPDATE undeclared_settlement_episodes
+      SET status = 'closed', updated_at_ms = ?
+      WHERE episode_id = ? AND status = 'open'
+    `).run(now, episode.episode_id);
+    return true;
+  }
+
+  #assertOrdinarySubagent(agentId: string, actorRole: "ordinary" | "moderator"): void {
+    if (agentId === this.#workflowOwnerId() || actorRole !== "ordinary") {
+      throw new WorkflowProtocolError("HumanInterruptForbidden", "Only an ordinary Subagent can ask a human");
+    }
+  }
+
+  #assertAgentReference(reference: AgentReference): void {
+    if (reference.workflowOwnerId !== this.#workflowOwnerId()) {
+      throw new WorkflowProtocolError("WorkflowMismatch", `Identity ${reference.agentId} belongs to another Workflow`);
+    }
+    this.#requireAgent(reference.agentId);
   }
 
   #withImmediateTransaction<T>(operation: () => T): T {
@@ -607,6 +1136,32 @@ export class ActivationLifecycleStore {
 function assertDependency(dependency: DeclaredActivationDependency): void {
   assertNonEmpty(dependency.dependencyId, "dependency ID");
   if (dependency.kind === "agent") assertNonEmpty(dependency.agentId, "dependency Agent ID");
+}
+
+function mapHumanInterrupt(row: HumanInterruptRow): HumanInterruptRecord {
+  return {
+    toolCallId: row.tool_call_id,
+    status: row.status,
+    ...(row.response_input_id ? { responseInputId: row.response_input_id } : {}),
+    createdAtMs: Number(row.created_at_ms),
+    updatedAtMs: Number(row.updated_at_ms),
+  };
+}
+
+function mapUndeclaredEpisode(row: UndeclaredEpisodeRow): UndeclaredSettlementEpisode {
+  return {
+    episodeId: row.episode_id,
+    noticeId: `${row.episode_id}:notice`,
+    noticeText: row.notice_text,
+    agentId: row.agent_id,
+    status: row.status,
+    noticeQueued: Number(row.notice_queued) === 1,
+    noticeDelivered: Number(row.notice_delivered) === 1,
+    repeatTriggered: Number(row.repeat_triggered) === 1,
+    ...(row.trigger_kind ? { triggerKind: row.trigger_kind } : {}),
+    createdAtMs: Number(row.created_at_ms),
+    updatedAtMs: Number(row.updated_at_ms),
+  };
 }
 
 function assertNonEmpty(value: string, label: string): void {

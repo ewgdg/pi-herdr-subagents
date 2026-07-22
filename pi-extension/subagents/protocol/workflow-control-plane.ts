@@ -6,7 +6,9 @@ import {
   type ActivationRecord,
   type DeclaredActivationDependency,
   type FailedExit,
+  type HumanInterruptRecord,
   type InterruptionRequest,
+  type UndeclaredSettlementEpisode,
 } from "./activation-lifecycle.ts";
 import { readPiSessionUuid, assertSessionUuid } from "./workflow-identity.ts";
 import { assertDescendantTranscriptPath, createWorkflowLayout } from "./workflow-layout.ts";
@@ -46,7 +48,9 @@ export type {
   ActivationState,
   DeclaredActivationDependency,
   FailedExit,
+  HumanInterruptRecord,
   InterruptionRequest,
+  UndeclaredSettlementEpisode,
 } from "./activation-lifecycle.ts";
 
 const DEFAULT_CAPABILITIES: AgentCapabilityConfiguration = { spawning: true };
@@ -511,12 +515,22 @@ export class WorkflowControlPlane {
     return this.#activations.removeDependency(ownership, dependency, this.#now(), expectedRevision);
   }
 
-  settleActivation(
+  satisfyActivationDependency(
     ownership: AgentRunOwnership,
+    dependency: Pick<DeclaredActivationDependency, "kind" | "dependencyId">,
     expectedRevision?: number,
   ): ActivationRecord {
     this.#assertOwnershipReference(ownership);
-    return this.#activations.settle(ownership, this.#now(), expectedRevision);
+    return this.#activations.satisfyDependency(ownership, dependency, this.#now(), expectedRevision);
+  }
+
+  settleActivation(
+    ownership: AgentRunOwnership,
+    expectedRevision?: number,
+    actorRole: "ordinary" | "moderator" = "ordinary",
+  ): ActivationRecord {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.settle(ownership, this.#now(), expectedRevision, actorRole);
   }
 
   settleOwnerTurn(): { kind: "owner-turn-settled" } {
@@ -536,6 +550,69 @@ export class WorkflowControlPlane {
   ): ActivationRecord {
     this.#assertOwnershipReference(ownership);
     return this.#activations.activateTurn(ownership, this.#now(), expectedRevision);
+  }
+
+  beginHumanInterrupt(
+    ownership: AgentRunOwnership,
+    toolCallId: string,
+    actorRole: "ordinary" | "moderator" = "ordinary",
+  ): HumanInterruptRecord {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.beginHumanInterrupt(ownership, toolCallId, this.#now(), actorRole);
+  }
+
+  bindHumanResponse(
+    ownership: AgentRunOwnership,
+    toolCallId: string,
+    responseInputId: string,
+  ): HumanInterruptRecord | undefined {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.bindHumanResponse(ownership, toolCallId, responseInputId, this.#now());
+  }
+
+  prepareHumanResponseResult(ownership: AgentRunOwnership, toolCallId: string): HumanInterruptRecord {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.prepareHumanResponseResult(ownership, toolCallId, this.#now());
+  }
+
+  resumeHumanResponseResult(ownership: AgentRunOwnership, toolCallId: string): HumanInterruptRecord {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.resumeHumanResponseResult(ownership, toolCallId, this.#now());
+  }
+
+  confirmHumanResponseResult(ownership: AgentRunOwnership, toolCallId: string): HumanInterruptRecord | undefined {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.confirmHumanResponseResult(ownership, toolCallId, this.#now());
+  }
+
+  inspectHumanInterrupt(agent: AgentReference): HumanInterruptRecord | undefined {
+    this.#assertReference(agent);
+    return this.#activations.inspectHumanInterrupt(agent);
+  }
+
+  hasHumanAttention(agent: AgentReference): boolean {
+    this.#assertReference(agent);
+    return this.#activations.humanAttention(agent);
+  }
+
+  pendingUndeclaredNotice(agent: AgentReference): UndeclaredSettlementEpisode | undefined {
+    this.#assertReference(agent);
+    return this.#activations.pendingUndeclaredNotice(agent);
+  }
+
+  confirmUndeclaredNotice(agent: AgentReference, episodeId: string): boolean {
+    this.#assertReference(agent);
+    return this.#activations.confirmUndeclaredNotice(agent, episodeId, this.#now());
+  }
+
+  queueUndeclaredNotice(agent: AgentReference, episodeId: string): UndeclaredSettlementEpisode | undefined {
+    this.#assertReference(agent);
+    return this.#activations.queueUndeclaredNotice(agent, episodeId, this.#now());
+  }
+
+  inspectUndeclaredEpisode(agent: AgentReference): UndeclaredSettlementEpisode | undefined {
+    this.#assertReference(agent);
+    return this.#activations.inspectUndeclaredEpisode(agent);
   }
 
   requestInterruption(
@@ -563,6 +640,11 @@ export class WorkflowControlPlane {
   failAgentRun(ownership: AgentRunOwnership, failure: FailedExit): ActivationRecord {
     this.#assertOwnershipReference(ownership);
     return this.#activations.failAndRelease(ownership, failure, this.#now());
+  }
+
+  cancelActivation(ownership: AgentRunOwnership): ActivationRecord {
+    this.#assertOwnershipReference(ownership);
+    return this.#activations.cancelAndRelease(ownership, this.#now());
   }
 
   acquireCurrentAgentRun(runId: string): AgentRunOwnership {

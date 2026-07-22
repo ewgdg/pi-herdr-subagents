@@ -55,6 +55,7 @@ import {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   buildCompletionSidecar,
+  emitUndeclaredSettlementNotice,
   getReloadSafeWorkflowBootstrap,
   releaseReloadSafeWorkflowBootstrap,
 } from "../pi-extension/subagents/subagent-done.ts";
@@ -1430,22 +1431,157 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
-  it("releases Deferred Signals after the durable agent_settled lifecycle boundary", () => {
+  it("retries a non-projected undeclared notice and confirms exactly one durable projection", async () => {
+    const sent: Array<{ message: any; options: unknown }> = [];
+    const confirmed: string[] = [];
+    let delivered = false;
+    const entries: unknown[] = [];
+    const bootstrap = {
+      pendingUndeclaredNotice() {
+        return delivered ? undefined : { episodeId: "episode-1", noticeId: "notice-1", noticeText: "Correct this settlement." };
+      },
+      queueUndeclaredNotice() { return { episodeId: "episode-1" }; },
+      confirmUndeclaredNotice(episodeId: string) { delivered = true; confirmed.push(episodeId); return true; },
+    };
+    const pi = { sendMessage(message: any, options: unknown) { sent.push({ message, options }); } };
+    const inFlight = new Set<string>();
+    emitUndeclaredSettlementNotice(pi as never, bootstrap as never, entries, inFlight);
+    assert.equal(sent[0].message.customType, "undeclared_settlement_notice");
+    assert.deepEqual(confirmed, []);
+
+    // A void send gives no success evidence. It only fences this JavaScript
+    // turn; after a non-projected attempt the next turn must retry.
+    emitUndeclaredSettlementNotice(pi as never, bootstrap as never, entries, inFlight);
+    assert.equal(sent.length, 1);
+    await Promise.resolve();
+    emitUndeclaredSettlementNotice(pi as never, bootstrap as never, entries, inFlight);
+    assert.equal(sent.length, 2);
+
+    entries.push({ type: "custom_message", ...sent[1].message });
+    emitUndeclaredSettlementNotice(pi as never, bootstrap as never, entries, inFlight);
+    assert.deepEqual(confirmed, ["episode-1"]);
+    emitUndeclaredSettlementNotice(pi as never, bootstrap as never, entries, inFlight);
+    assert.equal(sent.length, 2);
+    assert.deepEqual(confirmed, ["episode-1"]);
+  });
+
+  it("fences duplicate undeclared notice projections in one activation", () => {
+    const sent: unknown[] = [];
+    const bootstrap = {
+      pendingUndeclaredNotice() { return { episodeId: "episode-1", noticeId: "notice-1", noticeText: "Correct this settlement." }; },
+      queueUndeclaredNotice() { return { episodeId: "episode-1" }; },
+      confirmUndeclaredNotice() { return true; },
+    };
+    const pi = { sendMessage(message: unknown) { sent.push(message); } };
+    const inFlight = new Set<string>();
+    emitUndeclaredSettlementNotice(pi as never, bootstrap as never, [], inFlight);
+    emitUndeclaredSettlementNotice(pi as never, bootstrap as never, [], inFlight);
+    assert.equal(sent.length, 1);
+  });
+
+  it("releases Deferred Signals after the durable agent_settled lifecycle boundary", async () => {
     const key = Symbol.for("pi-herdr-subagents.child-workflow-bootstrap");
     const prior = (globalThis as Record<PropertyKey, unknown>)[key];
     const calls: string[] = [];
     (globalThis as Record<PropertyKey, unknown>)[key] = {
       workflow: {},
+      async waitUntilReady() {},
+      currentHumanInterrupt() { return undefined; },
+      bindHumanResponse() { return undefined; },
+      confirmHumanResponseResult() { return undefined; },
       currentTurnSettled(interrupted: boolean) { calls.push(`settled:${interrupted}`); },
       releaseDeferredSignals() { calls.push("released"); },
+      pendingUndeclaredNotice() { return undefined; },
     };
     try {
       const { api, eventHandlers } = createMockExtensionApi();
       subagentDoneExtension(api);
       const settled = eventHandlers.get("agent_settled")?.[0];
       assert.ok(settled);
-      settled({}, {});
+      await settled({}, { sessionManager: { getEntries: () => [] } });
       assert.deepEqual(calls, ["settled:false", "released"]);
+    } finally {
+      if (prior === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key];
+      else (globalThis as Record<PropertyKey, unknown>)[key] = prior;
+    }
+  });
+
+  it("reconciles Human tool-result evidence during context before the next model turn", async () => {
+    const key = Symbol.for("pi-herdr-subagents.child-workflow-bootstrap");
+    const prior = (globalThis as Record<PropertyKey, unknown>)[key];
+    const calls: string[] = [];
+    let resultPending = true;
+    let releaseReady: (() => void) | undefined;
+    const ready = new Promise<void>((resolve) => { releaseReady = resolve; });
+    (globalThis as Record<PropertyKey, unknown>)[key] = {
+      workflow: {},
+      waitUntilReady() { return ready; },
+      currentHumanInterrupt() { return undefined; },
+      bindHumanResponse() { return undefined; },
+      confirmHumanResponseResult(toolCallId: string) {
+        calls.push(`confirmed:${toolCallId}`);
+        if (!resultPending) return undefined;
+        resultPending = false;
+        return { status: "consumed" };
+      },
+      releaseDeferredSignals() { calls.push("released"); },
+      confirmDirectSignalDelivery() { return false; },
+      pendingUndeclaredNotice() { return undefined; },
+    };
+    try {
+      const { api, eventHandlers } = createMockExtensionApi();
+      subagentDoneExtension(api);
+      const context = eventHandlers.get("context")?.[0];
+      assert.ok(context);
+      const entries = [{ message: {
+        role: "toolResult", toolCallId: "ask-1", toolName: "agent_ask_user", isError: false,
+      } }];
+      const boundary = context({ messages: entries }, { sessionManager: { getEntries: () => entries } });
+      let continued = false;
+      void Promise.resolve(boundary).then(() => { continued = true; });
+      await Promise.resolve();
+      assert.equal(continued, false, "the next model turn must wait for Human-result reconciliation");
+      releaseReady!();
+      await boundary;
+      assert.deepEqual(calls, ["confirmed:ask-1", "released"]);
+
+      await context({ messages: entries }, { sessionManager: { getEntries: () => entries } });
+      assert.deepEqual(calls, ["confirmed:ask-1", "released", "confirmed:ask-1"]);
+    } finally {
+      if (prior === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key];
+      else (globalThis as Record<PropertyKey, unknown>)[key] = prior;
+    }
+  });
+
+  it("registers agent_ask_user only after child startup resolves the durable role", async () => {
+    const key = Symbol.for("pi-herdr-subagents.child-workflow-bootstrap");
+    const prior = (globalThis as Record<PropertyKey, unknown>)[key];
+    try {
+      for (const [role, expectedRegistration] of [["ordinary", true], ["moderator", false]] as const) {
+        (globalThis as Record<PropertyKey, unknown>)[key] = {
+          workflow: {},
+          humanInterruptActorRole: role,
+          sessionStarted() {},
+          async waitUntilReady() {},
+          currentHumanInterrupt() { return undefined; },
+          bindHumanResponse() { return undefined; },
+          confirmHumanResponseResult() { return undefined; },
+          pendingUndeclaredNotice() { return undefined; },
+        };
+        const { api, eventHandlers, registeredTools } = createMockExtensionApi();
+        subagentDoneExtension(api);
+        const sessionStart = eventHandlers.get("session_start")?.[0];
+        assert.ok(sessionStart);
+        await sessionStart({}, {
+          sessionManager: { getEntries: () => [], getSessionFile: () => null },
+          ui: { setWidget() {} },
+        });
+        assert.equal(
+          registeredTools.some((tool) => tool.name === "agent_ask_user"),
+          expectedRegistration,
+          role,
+        );
+      }
     } finally {
       if (prior === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key];
       else (globalThis as Record<PropertyKey, unknown>)[key] = prior;

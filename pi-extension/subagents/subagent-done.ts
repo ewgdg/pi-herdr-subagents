@@ -15,6 +15,10 @@ import {
   registerAgentSendTool,
   startDirectSignalRouter,
 } from "./protocol/direct-signal-extension.ts";
+import {
+  HumanInterruptInputBridge,
+  registerAgentAskUserTool,
+} from "./protocol/human-interrupt-extension.ts";
 
 const RELOAD_SAFE_WORKFLOW_BOOTSTRAP = Symbol.for(
   "pi-herdr-subagents.child-workflow-bootstrap",
@@ -111,6 +115,58 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
+const UNDECLARED_SETTLEMENT_NOTICE = "undeclared_settlement_notice";
+
+/** Reconcile the transcript before retrying; sendMessage alone is not delivery. */
+export function emitUndeclaredSettlementNotice(
+  pi: Pick<ExtensionAPI, "sendMessage">,
+  workflowBootstrap: Pick<WorkflowBootstrap, "pendingUndeclaredNotice" | "queueUndeclaredNotice" | "confirmUndeclaredNotice">,
+  entries: unknown[],
+  inFlight = new Set<string>(),
+): void {
+  const episode = workflowBootstrap.pendingUndeclaredNotice();
+  if (!episode) return;
+  if (sessionContainsUndeclaredSettlementNotice(entries, episode.noticeId)) {
+    inFlight.delete(episode.noticeId);
+    workflowBootstrap.confirmUndeclaredNotice(episode.episodeId);
+    return;
+  }
+  if (inFlight.has(episode.noticeId)) return;
+  // The episode remains durably queued until transcript evidence confirms it.
+  // This process-local fence prevents duplicate projections before that evidence.
+  if (!workflowBootstrap.queueUndeclaredNotice(episode.episodeId)) return;
+  inFlight.add(episode.noticeId);
+  try {
+    pi.sendMessage({
+      customType: UNDECLARED_SETTLEMENT_NOTICE,
+      content: episode.noticeText,
+      display: true,
+      details: { noticeId: episode.noticeId },
+    }, { triggerTurn: true, deliverAs: "steer" });
+  } catch (error) {
+    inFlight.delete(episode.noticeId);
+    throw error;
+  } finally {
+    // Pi reports no send outcome here. Hold the local fence only through this
+    // JavaScript turn; a later transcript reconciliation retries unless the
+    // durable projection below has become visible.
+    queueMicrotask(() => inFlight.delete(episode.noticeId));
+  }
+}
+
+export function sessionContainsUndeclaredSettlementNotice(entries: unknown[], noticeId: string): boolean {
+  return entries.some((entry) => {
+    if (!entry || typeof entry !== "object") return false;
+    const record = entry as { type?: unknown; role?: unknown; message?: unknown };
+    const message = (record.type === "custom_message" || record.role === "custom")
+      ? record
+      : record.message as { role?: unknown; customType?: unknown; details?: unknown } | undefined;
+    if (!message || typeof message !== "object") return false;
+    const candidate = message as { role?: unknown; customType?: unknown; details?: { noticeId?: unknown } };
+    return candidate.customType === UNDECLARED_SETTLEMENT_NOTICE && candidate.details?.noticeId === noticeId;
+  });
+}
+
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -181,10 +237,36 @@ export default function (pi: ExtensionAPI) {
   let agentStarted = false;
   let latestAgentRunWasAborted = false;
   const workflowBootstrap = getReloadSafeWorkflowBootstrap();
+  const humanInterruptBridge = new HumanInterruptInputBridge();
+  const undeclaredNoticeDeliveries = new Set<string>();
+  let agentAskUserToolRegistered = false;
+
+  function registerHumanInterruptTool(): void {
+    if (agentAskUserToolRegistered) return;
+    agentAskUserToolRegistered = true;
+    registerAgentAskUserTool(
+      pi,
+      workflowBootstrap,
+      humanInterruptBridge,
+      !parseDeniedTools(deniedToolsValue).includes("agent_ask_user"),
+      workflowBootstrap.humanInterruptActorRole,
+    );
+  }
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     workflowBootstrap.sessionStarted(ctx);
+    if (workflowBootstrap.workflow) {
+      registerHumanInterruptTool();
+    } else {
+      void workflowBootstrap.waitUntilHumanInterruptRoleReady(ctx).then((role) => {
+        if (role) registerHumanInterruptTool();
+      }).catch(() => undefined);
+    }
+    void humanInterruptBridge.reconcile(ctx, workflowBootstrap).catch(() => undefined);
+    if (workflowBootstrap.workflow) {
+      emitUndeclaredSettlementNotice(pi, workflowBootstrap, ctx.sessionManager.getEntries(), undeclaredNoticeDeliveries);
+    }
     if (ctx.sessionManager.getSessionFile()) {
       void startDirectSignalRouter(pi, workflowBootstrap, ctx).catch((error) => {
         ctx.ui.notify(`Direct Signal Router failed to start: ${(error as Error).message}`, "error");
@@ -206,16 +288,22 @@ export default function (pi: ExtensionAPI) {
     userTookOver = true;
   });
 
-  pi.on("before_agent_start", (_event, ctx) => {
+  humanInterruptBridge.install(pi, workflowBootstrap);
+
+  pi.on("before_agent_start", async (_event, ctx) => {
     if (workflowBootstrap.workflow) {
+      await humanInterruptBridge.reconcile(ctx, workflowBootstrap);
       confirmProjectedInboxBatches(workflowBootstrap, ctx.sessionManager.getEntries());
+      emitUndeclaredSettlementNotice(pi, workflowBootstrap, ctx.sessionManager.getEntries(), undeclaredNoticeDeliveries);
     }
     recorder.beforeAgentStart();
   });
 
-  pi.on("context", (event) => {
+  pi.on("context", async (event, ctx) => {
     if (workflowBootstrap.workflow) {
+      await humanInterruptBridge.reconcile(ctx, workflowBootstrap);
       confirmProjectedInboxBatches(workflowBootstrap, event.messages);
+      emitUndeclaredSettlementNotice(pi, workflowBootstrap, event.messages, undeclaredNoticeDeliveries);
     }
   });
 
@@ -265,10 +353,12 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("agent_settled", () => {
+  pi.on("agent_settled", async (_event, ctx) => {
     if (workflowBootstrap.workflow) {
+      await humanInterruptBridge.reconcile(ctx, workflowBootstrap);
       workflowBootstrap.currentTurnSettled(latestAgentRunWasAborted);
       workflowBootstrap.releaseDeferredSignals();
+      emitUndeclaredSettlementNotice(pi, workflowBootstrap, ctx.sessionManager.getEntries(), undeclaredNoticeDeliveries);
     }
     latestAgentRunWasAborted = false;
   });
@@ -337,7 +427,6 @@ export default function (pi: ExtensionAPI) {
     workflowBootstrap,
     !parseDeniedTools(deniedToolsValue).includes("agent_send"),
   );
-
   pi.registerTool({
     name: "caller_ping",
     label: "Caller Ping",

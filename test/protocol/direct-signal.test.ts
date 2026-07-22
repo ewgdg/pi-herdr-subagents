@@ -129,6 +129,61 @@ describe("direct Signal protocol scenarios", () => {
     ownerRuntime.close();
   });
 
+  it("resets an undeclared episode only when its declared Request receives a delivered Answer", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const requesterSession = scenario.childSession(ownerRuntime, "requester");
+    const responderSession = scenario.childSession(ownerRuntime, "responder");
+    const requester = ownerRuntime.addAgent({ session: requesterSession, spawner: owner, name: "Requester" });
+    const responder = ownerRuntime.addAgent({ session: responderSession, spawner: owner, name: "Responder" });
+    const requesterRuntime = scenario.startAgent(ownerRuntime.workflow, requesterSession);
+    const responderRuntime = scenario.startAgent(ownerRuntime.workflow, responderSession);
+    const requesterRun = ownerRuntime.startAgentRun(ownerRuntime.agent(requester.agentId));
+    const responderRun = ownerRuntime.startAgentRun(ownerRuntime.agent(responder.agentId));
+
+    ownerRuntime.settleActivation(requesterRun);
+    const episode = ownerRuntime.pendingUndeclaredNotice(ownerRuntime.agent(requester.agentId))!;
+    ownerRuntime.confirmUndeclaredNotice(ownerRuntime.agent(requester.agentId), episode.episodeId);
+    ownerRuntime.activateTurn(requesterRun);
+    const requesterMessages = directSignalRuntime(test, {
+      controlPlane: requesterRuntime.controlPlane, ownership: requesterRun.ownership,
+      allocateMessageId: () => scenario.identities.next(), projectInboxBatch() {},
+      wakeRecipient() { ownerRuntime.activateTurn(requesterRun); },
+    });
+    const responderMessages = directSignalRuntime(test, {
+      controlPlane: responderRuntime.controlPlane, ownership: responderRun.ownership,
+      allocateMessageId: () => scenario.identities.next(), projectInboxBatch() {},
+    });
+    await requesterMessages.start();
+    await responderMessages.start();
+    const requestSource = scenario.transcripts.appendAgentSend(requesterSession, {
+      targetAgentId: responder.agentId, message: "need answer", responseRequired: true,
+    });
+    const request = await requesterMessages.sendMessage({
+      target: { agentId: responder.agentId }, message: "need answer", sourceEntryId: requestSource, responseRequired: true,
+    });
+    ownerRuntime.settleActivation(requesterRun);
+    assert.equal(ownerRuntime.inspectUndeclaredEpisode(ownerRuntime.agent(requester.agentId))?.status, "open");
+    const answerSource = scenario.transcripts.appendAgentSend(responderSession, {
+      targetRequestId: request.messageId, message: "answer",
+    });
+    const answer = await responderMessages.sendMessage({
+      target: { requestId: request.messageId }, message: "answer", sourceEntryId: answerSource,
+    });
+    await waitFor(() => requesterMessages.inspectMessage(answer.messageId)?.deliveryStatus === "queued");
+    requesterMessages.confirmDelivery(answer.messageId);
+    assert.equal(ownerRuntime.inspectUndeclaredEpisode(ownerRuntime.agent(requester.agentId))?.status, "closed");
+
+    await requesterMessages.close();
+    await responderMessages.close();
+    ownerRuntime.confirmAgentRunExit(requesterRun, { error: "test cleanup" });
+    ownerRuntime.confirmAgentRunExit(responderRun, { error: "test cleanup" });
+    requesterRuntime.close();
+    responderRuntime.close();
+    ownerRuntime.close();
+  });
+
   it("restricts Answers to the addressed responder, closes the slot once, and permits Answer-plus-Request", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
@@ -439,6 +494,138 @@ describe("direct Signal protocol scenarios", () => {
     await recipientSignals.close();
     ownerRuntime.confirmAgentRunExit(senderRun, { error: "test cleanup" });
     ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
+    senderRuntime.close();
+    recipientRuntime.close();
+    ownerRuntime.close();
+  });
+
+  it("releases queued inputs once at the normal Human tool-result boundary", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const senderSession = scenario.childSession(ownerRuntime, "sender");
+    const recipientSession = scenario.childSession(ownerRuntime, "recipient");
+    const sender = ownerRuntime.addAgent({ session: senderSession, spawner: owner, name: "Sender" });
+    const recipient = ownerRuntime.addAgent({ session: recipientSession, spawner: owner, name: "Recipient" });
+    const senderRuntime = scenario.startAgent(ownerRuntime.workflow, senderSession);
+    const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
+    const senderRun = ownerRuntime.startAgentRun(ownerRuntime.agent(sender.agentId));
+    const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
+    ownerRuntime.beginHumanInterrupt(recipientRun, "ask-1");
+    const batches: InboxBatch[] = [];
+    const recipientSignals = directSignalRuntime(test, {
+      controlPlane: recipientRuntime.controlPlane,
+      ownership: recipientRun.ownership,
+      projectInboxBatch(batch) { batches.push(batch); },
+    });
+    await recipientSignals.start();
+    const senderSignals = directSignalRuntime(test, {
+      controlPlane: senderRuntime.controlPlane,
+      ownership: senderRun.ownership,
+      allocateMessageId: () => scenario.identities.next(),
+    });
+    const sourceEntryId = scenario.transcripts.appendAgentSend(senderSession, {
+      targetAgentId: recipient.agentId, message: "QUEUED_UNTIL_HUMAN_RESUME",
+    });
+
+    await senderSignals.sendSignal({
+      target: senderRuntime.agent(recipient.agentId),
+      message: "QUEUED_UNTIL_HUMAN_RESUME",
+      sourceEntryId,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(batches.length, 0);
+    assert.equal(ownerRuntime.listPending(ownerRuntime.agent(recipient.agentId)).length, 1);
+
+    ownerRuntime.bindHumanResponse(recipientRun, "ask-1", "input-1");
+    ownerRuntime.prepareHumanResponseResult(recipientRun, "ask-1");
+    const pendingResultSource = scenario.transcripts.appendAgentSend(senderSession, {
+      targetAgentId: recipient.agentId, message: "QUEUED_DURING_RESULT_PENDING",
+    });
+    await senderSignals.sendSignal({
+      target: senderRuntime.agent(recipient.agentId),
+      message: "QUEUED_DURING_RESULT_PENDING",
+      sourceEntryId: pendingResultSource,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(batches.length, 0, "InboxBatch must not precede original tool-result evidence");
+
+    assert.equal(ownerRuntime.confirmHumanResponseResult(recipientRun, "ask-1")?.status, "consumed");
+    recipientSignals.releaseDeferred();
+    await waitFor(() => batches.length === 1);
+    assert.deepEqual(
+      batches[0].messages.map((message) => message.message),
+      ["QUEUED_UNTIL_HUMAN_RESUME", "QUEUED_DURING_RESULT_PENDING"],
+    );
+    recipientSignals.releaseDeferred();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(batches.length, 1, "eligible input must release exactly once");
+
+    await senderSignals.close();
+    await recipientSignals.close();
+    ownerRuntime.confirmAgentRunExit(senderRun, { error: "test cleanup" });
+    ownerRuntime.confirmAgentRunExit(recipientRun, { error: "test cleanup" });
+    senderRuntime.close();
+    recipientRuntime.close();
+    ownerRuntime.close();
+  });
+
+  it("releases recovered result-pending inputs only after replayed tool-result evidence", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
+    const senderSession = scenario.childSession(ownerRuntime, "sender");
+    const recipientSession = scenario.childSession(ownerRuntime, "recipient");
+    const sender = ownerRuntime.addAgent({ session: senderSession, spawner: owner, name: "Sender" });
+    const recipient = ownerRuntime.addAgent({ session: recipientSession, spawner: owner, name: "Recipient" });
+    const senderRuntime = scenario.startAgent(ownerRuntime.workflow, senderSession);
+    const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
+    const senderRun = ownerRuntime.startAgentRun(ownerRuntime.agent(sender.agentId));
+    const firstRecipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
+    ownerRuntime.beginHumanInterrupt(firstRecipientRun, "ask-1");
+    ownerRuntime.bindHumanResponse(firstRecipientRun, "ask-1", "input-1");
+    ownerRuntime.prepareHumanResponseResult(firstRecipientRun, "ask-1");
+    ownerRuntime.confirmAgentRunExit(firstRecipientRun, { error: "crash before tool-result persistence" });
+
+    const recoveredRecipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
+    const batches: InboxBatch[] = [];
+    const recipientSignals = directSignalRuntime(test, {
+      controlPlane: recipientRuntime.controlPlane,
+      ownership: recoveredRecipientRun.ownership,
+      projectInboxBatch(batch) { batches.push(batch); },
+    });
+    await recipientSignals.start();
+    const senderSignals = directSignalRuntime(test, {
+      controlPlane: senderRuntime.controlPlane,
+      ownership: senderRun.ownership,
+      allocateMessageId: () => scenario.identities.next(),
+    });
+    const sourceEntryId = scenario.transcripts.appendAgentSend(senderSession, {
+      targetAgentId: recipient.agentId, message: "QUEUED_UNTIL_REPLAYED_RESULT",
+    });
+    await senderSignals.sendSignal({
+      target: senderRuntime.agent(recipient.agentId),
+      message: "QUEUED_UNTIL_REPLAYED_RESULT",
+      sourceEntryId,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(batches.length, 0, "recovery must not project before replaying the original result");
+
+    ownerRuntime.resumeHumanResponseResult(recoveredRecipientRun, "ask-1");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(batches.length, 0, "InboxBatch must not precede replayed tool-result evidence");
+
+    assert.equal(ownerRuntime.confirmHumanResponseResult(recoveredRecipientRun, "ask-1")?.status, "consumed");
+    recipientSignals.releaseDeferred();
+    await waitFor(() => batches.length === 1);
+    recipientSignals.releaseDeferred();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(batches.length, 1, "recovery must not duplicate the eligible release");
+
+    await senderSignals.close();
+    await recipientSignals.close();
+    ownerRuntime.confirmAgentRunExit(senderRun, { error: "test cleanup" });
+    ownerRuntime.confirmAgentRunExit(recoveredRecipientRun, { error: "test cleanup" });
     senderRuntime.close();
     recipientRuntime.close();
     ownerRuntime.close();
@@ -1080,7 +1267,7 @@ describe("direct Signal protocol scenarios", () => {
     assert.deepEqual(recipientSignals.listPending(recipientRuntime.agent(recipient.agentId)), []);
     assert.deepEqual(recipientRuntime.inspectActivation(recipientRuntime.agent(recipient.agentId))?.state, {
       kind: "waiting",
-      dependencies: [{ kind: "human", dependencyId: "human" }],
+      dependencies: [{ kind: "undeclared", dependencyId: "undeclared" }],
     });
     database.exec("DROP TRIGGER reject_signal_pointer");
     await senderSignals.close();

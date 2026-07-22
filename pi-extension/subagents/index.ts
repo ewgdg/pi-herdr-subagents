@@ -89,8 +89,10 @@ import {
 import {
   WorkflowBootstrap,
   WORKFLOW_AGENT_SESSION_ID_ENV,
+  WORKFLOW_AGENT_ROLE_ENV,
   WORKFLOW_OWNER_SESSION_ID_ENV,
   WORKFLOW_OWNER_SESSION_PATH_ENV,
+  humanInterruptActorRoleFromMembership,
 } from "./protocol/workflow-bootstrap.ts";
 import {
   ProvisionalSpawnGate,
@@ -1917,6 +1919,7 @@ async function reactivateEndedRecipientForRequest(
       `${WORKFLOW_OWNER_SESSION_ID_ENV}=${shellQuote(workflow.ownerAgentId)}`,
       `${WORKFLOW_OWNER_SESSION_PATH_ENV}=${shellQuote(workflow.ownerSessionPath)}`,
       `${WORKFLOW_AGENT_SESSION_ID_ENV}=${shellQuote(member.agentId)}`,
+      `${WORKFLOW_AGENT_ROLE_ENV}=${shellQuote(humanInterruptActorRoleFromMembership(member))}`,
       `${PROVISIONAL_SPAWN_ENDPOINT_ENV}=${shellQuote(gate.endpoint)}`,
       `PI_WORKFLOW_PROVISIONAL_RUN_KIND=resume`,
     ];

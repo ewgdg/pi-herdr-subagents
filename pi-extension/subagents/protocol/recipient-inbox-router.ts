@@ -236,7 +236,7 @@ export class RecipientInboxRouter {
       }
     }
     const lifecycle = this.#store.recipientLifecycle(this.#options.recipient);
-    if (lifecycle === "ended" || lifecycle === "interrupted") return;
+    if (lifecycle === "ended" || lifecycle === "interrupted" || lifecycle === "waiting-human") return;
     const queued = this.#store.listPending(this.#options.recipient);
     const eligible = (lifecycle === "active"
       ? queued.filter((pointer) => pointer.deliveryTiming === "steer" || pointer.reactivatesRecipient)

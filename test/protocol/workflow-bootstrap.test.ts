@@ -12,11 +12,13 @@ import {
 import {
   WorkflowBootstrap,
   WORKFLOW_AGENT_SESSION_ID_ENV,
+  WORKFLOW_AGENT_ROLE_ENV,
   WORKFLOW_OWNER_SESSION_ID_ENV,
   WORKFLOW_OWNER_SESSION_PATH_ENV,
   type WorkflowBootstrapContext,
 } from "../../pi-extension/subagents/protocol/workflow-bootstrap.ts";
 import { PROVISIONAL_AGENT_RUN_KIND_ENV, PROVISIONAL_SPAWN_ENDPOINT_ENV, ProvisionalSpawnGate } from "../../pi-extension/subagents/protocol/provisional-spawn.ts";
+import { HumanInterruptInputBridge, registerAgentAskUserTool } from "../../pi-extension/subagents/protocol/human-interrupt-extension.ts";
 import { initializeSubagentSessionFile } from "../../pi-extension/subagents/session.ts";
 import { bindNewWorkflowSession } from "../../pi-extension/subagents/protocol/workflow-session-binding.ts";
 import { DeterministicIdentityFactory, ManualClock } from "./scenario-harness.ts";
@@ -392,6 +394,77 @@ describe("production Workflow bootstrap", () => {
     bootstrap.close();
   });
 
+  it("derives Human Interrupt role from durable membership across launch and bootstrap", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: ownerPath, childCwd: root, childSessionId: ownerId });
+    const owner = new WorkflowBootstrap();
+    owner.sessionStarted(context(ownerId, ownerPath));
+
+    const moderatorId = identities.next();
+    const moderatorPath = join(owner.workflow!.sessionsDirectory, "moderator.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: moderatorPath, childCwd: root, childSessionId: moderatorId });
+    const preparedModerator = owner.prepareSpawn({
+      agentId: moderatorId, sessionPath: moderatorPath, runId: "moderator-run", surface: "moderator-surface",
+      name: "Moderator", agentDefinition: "moderator",
+      sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: moderatorId, sessionPath: moderatorPath }),
+    });
+    assert.equal(preparedModerator.environment[WORKFLOW_AGENT_ROLE_ENV], "moderator");
+    owner.runStarted(preparedModerator.ownership);
+
+    const moderator = new WorkflowBootstrap();
+    moderator.sessionStarted(context(moderatorId, moderatorPath), {
+      ...preparedModerator.environment,
+      [WORKFLOW_AGENT_ROLE_ENV]: "ordinary",
+    });
+    assert.equal(moderator.humanInterruptActorRole, "moderator");
+    let moderatorAskUserRegistered = false;
+    registerAgentAskUserTool(
+      { registerTool() { moderatorAskUserRegistered = true; } } as never,
+      moderator,
+      new HumanInterruptInputBridge(),
+      true,
+      moderator.humanInterruptActorRole,
+    );
+    assert.equal(moderatorAskUserRegistered, false);
+    assert.throws(() => moderator.beginHumanInterrupt("ask-moderator"), (error: unknown) =>
+      (error as { code?: string }).code === "HumanInterruptForbidden");
+    moderator.close();
+
+    const workerId = identities.next();
+    const workerPath = join(owner.workflow!.sessionsDirectory, "worker.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: workerPath, childCwd: root, childSessionId: workerId });
+    const preparedWorker = owner.prepareSpawn({
+      agentId: workerId, sessionPath: workerPath, runId: "worker-run", surface: "worker-surface",
+      name: "Worker", agentDefinition: "worker",
+      sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: workerId, sessionPath: workerPath }),
+    });
+    assert.equal(preparedWorker.environment[WORKFLOW_AGENT_ROLE_ENV], "ordinary");
+    owner.runStarted(preparedWorker.ownership);
+
+    const worker = new WorkflowBootstrap();
+    worker.sessionStarted(context(workerId, workerPath), {
+      ...preparedWorker.environment,
+      [WORKFLOW_AGENT_ROLE_ENV]: "moderator",
+    });
+    assert.equal(worker.humanInterruptActorRole, "ordinary");
+    let workerAskUserRegistered = false;
+    registerAgentAskUserTool(
+      { registerTool() { workerAskUserRegistered = true; } } as never,
+      worker,
+      new HumanInterruptInputBridge(),
+      true,
+      worker.humanInterruptActorRole,
+    );
+    assert.equal(workerAskUserRegistered, true);
+    assert.equal(worker.beginHumanInterrupt("ask-worker").status, "pending");
+
+    worker.close();
+    owner.close();
+  });
+
   it("opens a spawned member session as the direct Spawner for nested work", async () => {
     const root = await temporaryDirectory();
     const identities = new DeterministicIdentityFactory();
@@ -464,6 +537,35 @@ describe("production Workflow bootstrap", () => {
     ownerBootstrap.close();
   });
 
+  it("projects durable DECIDE attention through the production bootstrap query", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: ownerPath, childCwd: root, childSessionId: ownerId });
+    const owner = new WorkflowBootstrap();
+    owner.sessionStarted(context(ownerId, ownerPath));
+    const childId = identities.next();
+    const childPath = join(owner.workflow!.sessionsDirectory, "child.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: childPath, childCwd: root, childSessionId: childId });
+    const prepared = owner.prepareSpawn({
+      agentId: childId, sessionPath: childPath, runId: "child-run", surface: "child-surface", name: "Child",
+      sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: childId, sessionPath: childPath }),
+    });
+    owner.runStarted(prepared.ownership);
+    const child = new WorkflowBootstrap();
+    child.sessionStarted(context(childId, childPath), prepared.environment);
+    child.beginHumanInterrupt("ask-1");
+    assert.equal(child.hasHumanAttention(), true);
+    child.bindHumanResponse("ask-1", "input-1");
+    assert.equal(child.hasHumanAttention(), false);
+    child.prepareHumanResponseResult("ask-1");
+    child.confirmHumanResponseResult("ask-1");
+    child.close();
+    owner.runTerminated(prepared.ownership, true);
+    owner.close();
+  });
+
   it("binds Pi turn events to the durable activation lifecycle", async () => {
     const root = await temporaryDirectory();
     const identities = new DeterministicIdentityFactory();
@@ -510,7 +612,7 @@ describe("production Workflow bootstrap", () => {
     if (!("state" in waiting)) assert.fail("Subagent settlement must return an activation");
     assert.deepEqual(waiting.state, {
       kind: "waiting",
-      dependencies: [{ kind: "human", dependencyId: "human" }],
+      dependencies: [{ kind: "undeclared", dependencyId: "undeclared" }],
     });
 
     child.currentTurnStarted();

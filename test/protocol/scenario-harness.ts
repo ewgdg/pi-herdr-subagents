@@ -369,8 +369,20 @@ export class ControllableRuntimeAdapter {
     );
   }
 
-  settleActivation(run: ScenarioAgentRun, expectedRevision?: number): ActivationRecord {
-    return this.#controlPlane.settleActivation(run.ownership, expectedRevision);
+  satisfyActivationDependency(
+    run: ScenarioAgentRun,
+    dependency: Pick<DeclaredActivationDependency, "kind" | "dependencyId">,
+    expectedRevision?: number,
+  ): ActivationRecord {
+    return this.#controlPlane.satisfyActivationDependency(run.ownership, dependency, expectedRevision);
+  }
+
+  settleActivation(
+    run: ScenarioAgentRun,
+    expectedRevision?: number,
+    actorRole: "ordinary" | "moderator" = "ordinary",
+  ): ActivationRecord {
+    return this.#controlPlane.settleActivation(run.ownership, expectedRevision, actorRole);
   }
 
   settleOwnerTurn(): { kind: "owner-turn-settled" } {
@@ -396,6 +408,50 @@ export class ControllableRuntimeAdapter {
     return this.#controlPlane.confirmInterruption(run.ownership, request, expectedRevision);
   }
 
+  beginHumanInterrupt(run: ScenarioAgentRun, toolCallId: string, actorRole: "ordinary" | "moderator" = "ordinary") {
+    return this.#controlPlane.beginHumanInterrupt(run.ownership, toolCallId, actorRole);
+  }
+
+  bindHumanResponse(run: ScenarioAgentRun, toolCallId: string, responseInputId: string) {
+    return this.#controlPlane.bindHumanResponse(run.ownership, toolCallId, responseInputId);
+  }
+
+  prepareHumanResponseResult(run: ScenarioAgentRun, toolCallId: string) {
+    return this.#controlPlane.prepareHumanResponseResult(run.ownership, toolCallId);
+  }
+
+  resumeHumanResponseResult(run: ScenarioAgentRun, toolCallId: string) {
+    return this.#controlPlane.resumeHumanResponseResult(run.ownership, toolCallId);
+  }
+
+  confirmHumanResponseResult(run: ScenarioAgentRun, toolCallId: string) {
+    return this.#controlPlane.confirmHumanResponseResult(run.ownership, toolCallId);
+  }
+
+  inspectHumanInterrupt(reference: AgentReference) {
+    return this.#controlPlane.inspectHumanInterrupt(reference);
+  }
+
+  hasHumanAttention(reference: AgentReference): boolean {
+    return this.#controlPlane.hasHumanAttention(reference);
+  }
+
+  pendingUndeclaredNotice(reference: AgentReference) {
+    return this.#controlPlane.pendingUndeclaredNotice(reference);
+  }
+
+  confirmUndeclaredNotice(reference: AgentReference, episodeId: string): boolean {
+    return this.#controlPlane.confirmUndeclaredNotice(reference, episodeId);
+  }
+
+  queueUndeclaredNotice(reference: AgentReference, episodeId: string) {
+    return this.#controlPlane.queueUndeclaredNotice(reference, episodeId);
+  }
+
+  inspectUndeclaredEpisode(reference: AgentReference) {
+    return this.#controlPlane.inspectUndeclaredEpisode(reference);
+  }
+
   reportUnconfirmedAgentRunExit(_run: ScenarioAgentRun): void {
     // Observation alone is intentionally not lifecycle authority.
   }
@@ -403,6 +459,11 @@ export class ControllableRuntimeAdapter {
   confirmAgentRunExit(run: ScenarioAgentRun, failure: FailedExit): ActivationRecord {
     this.processAdapter.confirmExit(run.processId);
     return this.#controlPlane.failAgentRun(run.ownership, failure);
+  }
+
+  cancelActivation(run: ScenarioAgentRun): ActivationRecord {
+    this.processAdapter.confirmExit(run.processId);
+    return this.#controlPlane.cancelActivation(run.ownership);
   }
 
   checkpoint(run: ScenarioAgentRun, value: string): void {

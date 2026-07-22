@@ -38,6 +38,7 @@ export const WORKFLOW_AGENT_SESSION_ID_ENV = "PI_WORKFLOW_AGENT_SESSION_ID";
 export const WORKFLOW_RUN_ID_ENV = "PI_WORKFLOW_RUN_ID";
 export const WORKFLOW_FENCING_EPOCH_ENV = "PI_WORKFLOW_FENCING_EPOCH";
 export const WORKFLOW_ACTIVATION_ID_ENV = "PI_WORKFLOW_ACTIVATION_ID";
+export const WORKFLOW_AGENT_ROLE_ENV = "PI_WORKFLOW_AGENT_ROLE";
 const SESSION_BOOTSTRAP_RETRY_MS = 25;
 
 export interface WorkflowBootstrapContext {
@@ -82,6 +83,7 @@ export class WorkflowBootstrap {
   #sessionId: string | undefined;
   #sessionPath: string | undefined;
   #selfOwnership: AgentRunOwnership | undefined;
+  #humanInterruptActorRole: "ordinary" | "moderator" = "ordinary";
   #sessionBootstrapTimer: ReturnType<typeof setTimeout> | undefined;
   #directSignals: DirectSignalRuntime | undefined;
   #provisionalBootstrap: Promise<void> | undefined;
@@ -111,6 +113,10 @@ export class WorkflowBootstrap {
 
   get currentAgentId(): string | undefined {
     return this.#controlPlane?.currentAgent.agentId;
+  }
+
+  get humanInterruptActorRole(): "ordinary" | "moderator" {
+    return this.#humanInterruptActorRole;
   }
 
   sessionStarted(
@@ -200,6 +206,9 @@ export class WorkflowBootstrap {
     }
     this.#sessionId = sessionId;
     this.#sessionPath = sessionPath;
+    this.#humanInterruptActorRole = humanInterruptActorRoleFromMembership(
+      this.#controlPlane.inspectAgent(this.#controlPlane.currentAgent),
+    );
     this.#workflowDatabases.set(
       this.#controlPlane.workflow.ownerAgentId,
       this.#controlPlane.workflow.databasePath,
@@ -220,6 +229,17 @@ export class WorkflowBootstrap {
       await new Promise<void>((resolve) => setTimeout(resolve, SESSION_BOOTSTRAP_RETRY_MS));
       this.sessionStarted(context, environment);
     }
+  }
+
+  /** A provisional child has no trusted membership role until RELEASE commits. */
+  async waitUntilHumanInterruptRoleReady(
+    context: WorkflowBootstrapContext,
+    environment: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+  ): Promise<"ordinary" | "moderator" | undefined> {
+    await this.waitUntilReady(context, environment);
+    const provisionalBootstrap = this.#provisionalBootstrap;
+    if (provisionalBootstrap) await provisionalBootstrap;
+    return this.#controlPlane ? this.#humanInterruptActorRole : undefined;
   }
 
   close(): void {
@@ -257,6 +277,7 @@ export class WorkflowBootstrap {
     this.#selfOwnership = undefined;
     this.#sessionId = undefined;
     this.#sessionPath = undefined;
+    this.#humanInterruptActorRole = "ordinary";
   }
 
   inspect(agentId: string): AgentRecord {
@@ -354,6 +375,9 @@ export class WorkflowBootstrap {
     const ownership = this.#requireSelfOwnership();
     const activation = controlPlane.inspectActivation(controlPlane.currentAgent);
     if (!activation) return controlPlane.startActivation(ownership);
+    if (activation.state.kind === "waiting" && activation.state.dependencies.some((dependency) => dependency.kind === "human")) {
+      return activation;
+    }
     return controlPlane.activateTurn(ownership);
   }
 
@@ -365,7 +389,65 @@ export class WorkflowBootstrap {
     const ownership = this.#requireSelfOwnership();
     return interrupted
       ? controlPlane.confirmInterruption(ownership)
-      : controlPlane.settleActivation(ownership);
+      : controlPlane.settleActivation(ownership, undefined, this.#humanInterruptActorRole);
+  }
+
+  beginHumanInterrupt(toolCallId: string) {
+    return this.#requireControlPlane().beginHumanInterrupt(
+      this.#requireSelfOwnership(),
+      toolCallId,
+      this.#humanInterruptActorRole,
+    );
+  }
+
+  bindHumanResponse(toolCallId: string, responseInputId: string) {
+    return this.#requireControlPlane().bindHumanResponse(
+      this.#requireSelfOwnership(),
+      toolCallId,
+      responseInputId,
+    );
+  }
+
+  prepareHumanResponseResult(toolCallId: string) {
+    return this.#requireControlPlane().prepareHumanResponseResult(this.#requireSelfOwnership(), toolCallId);
+  }
+
+  resumeHumanResponseResult(toolCallId: string) {
+    return this.#requireControlPlane().resumeHumanResponseResult(this.#requireSelfOwnership(), toolCallId);
+  }
+
+  confirmHumanResponseResult(toolCallId: string) {
+    return this.#requireControlPlane().confirmHumanResponseResult(this.#requireSelfOwnership(), toolCallId);
+  }
+
+  currentHumanInterrupt() {
+    const controlPlane = this.#requireControlPlane();
+    return controlPlane.currentAgent.agentId === controlPlane.workflow.ownerAgentId
+      ? undefined
+      : controlPlane.inspectHumanInterrupt(controlPlane.currentAgent);
+  }
+
+  hasHumanAttention(): boolean {
+    const controlPlane = this.#requireControlPlane();
+    return controlPlane.currentAgent.agentId !== controlPlane.workflow.ownerAgentId
+      && controlPlane.hasHumanAttention(controlPlane.currentAgent);
+  }
+
+  pendingUndeclaredNotice() {
+    const controlPlane = this.#requireControlPlane();
+    return controlPlane.currentAgent.agentId === controlPlane.workflow.ownerAgentId
+      ? undefined
+      : controlPlane.pendingUndeclaredNotice(controlPlane.currentAgent);
+  }
+
+  confirmUndeclaredNotice(episodeId: string): boolean {
+    const controlPlane = this.#requireControlPlane();
+    return controlPlane.confirmUndeclaredNotice(controlPlane.currentAgent, episodeId);
+  }
+
+  queueUndeclaredNotice(episodeId: string) {
+    const controlPlane = this.#requireControlPlane();
+    return controlPlane.queueUndeclaredNotice(controlPlane.currentAgent, episodeId);
   }
 
   requestInterruption(ownership: AgentRunOwnership): InterruptionRequest {
@@ -408,7 +490,7 @@ export class WorkflowBootstrap {
     }
     return {
       ownership: ownership!,
-      environment: buildEnvironment(controlPlane.workflow, ownership!),
+      environment: buildEnvironment(controlPlane.workflow, ownership!, member),
       sessionPath: member.sessionPath,
     };
   }
@@ -470,7 +552,7 @@ export class WorkflowBootstrap {
     );
     return {
       ownership,
-      environment: buildEnvironment(controlPlane.workflow, ownership),
+      environment: buildEnvironment(controlPlane.workflow, ownership, member),
       sessionPath: member.sessionPath,
     };
   }
@@ -686,6 +768,7 @@ export class WorkflowBootstrap {
 function buildEnvironment(
   workflow: WorkflowRecord,
   ownership: AgentRunOwnership,
+  member: AgentRecord,
 ): Record<string, string> {
   return {
     [WORKFLOW_OWNER_SESSION_ID_ENV]: workflow.ownerAgentId,
@@ -694,6 +777,7 @@ function buildEnvironment(
     [WORKFLOW_RUN_ID_ENV]: ownership.runId,
     [WORKFLOW_FENCING_EPOCH_ENV]: String(ownership.epoch),
     [WORKFLOW_ACTIVATION_ID_ENV]: ownership.runId,
+    [WORKFLOW_AGENT_ROLE_ENV]: humanInterruptActorRoleFromMembership(member),
   };
 }
 
@@ -721,6 +805,12 @@ function ownershipFromEnvironment(
     epoch,
     resourceId: `agent-run:${workflowOwnerId}:${agentId}`,
   };
+}
+
+export function humanInterruptActorRoleFromMembership(
+  member: Pick<AgentRecord, "agentDefinition">,
+): "ordinary" | "moderator" {
+  return member.agentDefinition === "moderator" ? "moderator" : "ordinary";
 }
 
 function serializeRunLocator(locator: AgentRunLocator): string {
