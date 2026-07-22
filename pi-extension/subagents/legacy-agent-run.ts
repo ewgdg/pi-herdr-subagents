@@ -172,11 +172,12 @@ export interface LegacyAgentRunSupervisor<Run, Result> {
 
 export interface LegacyAgentRunResultRelay<Run, Result> {
   completed(run: Run, result: Result): void | Promise<void>;
+  suppressed?(run: Run, result: Result): void | Promise<void>;
   failed(run: Run, error: unknown): void | Promise<void>;
 }
 
 export interface LegacyAgentRunOwnership<Run, Result> {
-  watchCompleted(run: Run, result: Result): void | Promise<void>;
+  watchCompleted(run: Run, result: Result): boolean | void | Promise<boolean | void>;
 }
 
 export interface LegacyAgentRunUi<Run, SessionContext = unknown> {
@@ -221,7 +222,7 @@ export interface LegacyAgentRunAdapterOptions<SpawnParams> {
   sessionStarted(context: ExtensionContext): void;
   sessionShutdown(reason: unknown): void;
   runStarted(run: LegacyRunningSubagent): void;
-  watchCompleted?(run: LegacyRunningSubagent, result: LegacyAgentRunResult): void | Promise<void>;
+  watchCompleted?(run: LegacyRunningSubagent, result: LegacyAgentRunResult): boolean | void | Promise<boolean | void>;
   prepareResume?(
     params: LegacyResumeParams,
     context: LegacyResumeContext,
@@ -254,7 +255,11 @@ export async function superviseLegacyAgentRun<Run extends LegacyRunningAgentRun,
     return;
   }
 
-  await adapters.ownership?.watchCompleted(run, result);
+  const shouldRelay = (await adapters.ownership?.watchCompleted(run, result)) !== false;
+  if (!shouldRelay) {
+    await adapters.resultRelay.suppressed?.(run, result);
+    return;
+  }
   await adapters.resultRelay.completed(run, result);
 }
 
@@ -521,6 +526,7 @@ export function createLegacyAgentRunAdapters<SpawnParams>(
       : {}),
     resultRelay: {
       completed: (running, result) => relayLegacyAgentRunCompletion(running, result, options),
+      suppressed: (running) => removeLegacyAgentRun(running, "suppressed", options),
       failed: (running, error) => relayLegacyAgentRunFailure(running, error, options),
     },
     ui: {

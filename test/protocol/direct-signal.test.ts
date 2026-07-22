@@ -54,6 +54,274 @@ function directSignalRuntime(test: TestContext, options: ConstructorParameters<t
 }
 
 describe("direct Signal protocol scenarios", () => {
+  it("reconciles the acceptance winner after losing conditional safe rejection", async (test) => {
+    for (const onAccepted of ["continue", "complete"] as const) {
+      const rootDirectory = await temporaryDirectory();
+      const scenario = new WorkflowScenario({ rootDirectory });
+      const { runtime: ownerRuntime } = scenario.createOwner();
+      const senderSession = scenario.childSession(ownerRuntime, `delete-race-${onAccepted}`);
+      const sender = ownerRuntime.addAgent({
+        session: senderSession,
+        spawner: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId),
+        name: `Delete Race ${onAccepted}`,
+      });
+      const senderReference = ownerRuntime.agent(sender.agentId);
+      const senderRun = ownerRuntime.startAgentRun(senderReference);
+      const senderRuntime = scenario.startAgent(ownerRuntime.workflow, senderSession);
+      const messageId = `delete-race-${onAccepted}`;
+      const message = `acceptance wins ${onAccepted}`;
+      const sourceEntryId = scenario.transcripts.appendAgentSend(senderSession, {
+        targetAgentId: ownerRuntime.workflow.ownerAgentId,
+        message,
+        onAccepted,
+      });
+      const endpoint = process.platform === "win32"
+        ? `\\\\.\\pipe\\pi-herdr-delete-race-${process.pid}-${onAccepted}-${Date.now()}`
+        : join(rootDirectory, `${onAccepted}.sock`);
+      const store = closeAfter(test, new DirectSignalStore(ownerRuntime.workflow.databasePath));
+      store.bindMessage({
+        messageId,
+        sender: senderReference,
+        recipient: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId),
+        sourceEntryId,
+        payloadDigest: digestPayload(message),
+        deliveryTiming: "steer",
+        responseRequired: false,
+        onAccepted,
+        ownership: senderRun.ownership,
+        createdAtMs: scenario.clock.now(),
+      });
+      ownerRuntime.controlPlane.addActivationDependency(senderRun.ownership, {
+        kind: "operation",
+        dependencyId: `acceptance:${messageId}`,
+      });
+      store.registerRouter({
+        recipient: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId),
+        endpoint,
+        registeredAtMs: scenario.clock.now(),
+      });
+      let acceptanceRequest: import("../../pi-extension/subagents/protocol/direct-signal-types.ts").SignalAcceptRequest | undefined;
+      closeAfter(test, await listenForFramedIpc(endpoint, (connection) => connection.onMessage((frame) => {
+        acceptanceRequest = frame.payload as typeof acceptanceRequest;
+        connection.end();
+      })));
+
+      const originalDiscard = DirectSignalStore.prototype.discardUnacceptedMessage;
+      let forcedRace = false;
+      DirectSignalStore.prototype.discardUnacceptedMessage = function (reference, candidateMessageId) {
+        if (!forcedRace && candidateMessageId === messageId) {
+          forcedRace = true;
+          assert.ok(acceptanceRequest);
+          const acceptanceStore = new DirectSignalStore(ownerRuntime.workflow.databasePath);
+          try {
+            acceptanceStore.acceptSignal({
+              request: acceptanceRequest,
+              recipient: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId),
+              endpoint,
+              acceptedAtMs: scenario.clock.now(),
+            });
+          } finally {
+            acceptanceStore.close();
+          }
+        }
+        return originalDiscard.call(this, reference, candidateMessageId);
+      };
+      try {
+        const senderSignals = directSignalRuntime(test, {
+          controlPlane: senderRuntime.controlPlane,
+          ownership: senderRun.ownership,
+        });
+        assert.deepEqual(await senderSignals.reconcilePendingAcceptances(), {
+          terminalCompletion: onAccepted === "complete",
+        });
+        assert.equal(senderSignals.inspectMessage(messageId)?.deliveryStatus, "queued");
+        assert.deepEqual(ownerRuntime.inspectActivation(senderReference)?.state,
+          onAccepted === "complete"
+            ? { kind: "ended", outcome: "completed" }
+            : { kind: "active" });
+      } finally {
+        DirectSignalStore.prototype.discardUnacceptedMessage = originalDiscard;
+      }
+    }
+  });
+
+  it("automatically retries a bound identity when its recipient Router appears later", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const recipientSession = scenario.childSession(ownerRuntime, "late-router-recipient");
+    const recipient = ownerRuntime.addAgent({ session: recipientSession, spawner: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId), name: "Late Router Recipient" });
+    const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
+    const senderSession = scenario.childSession(ownerRuntime, "late-router-sender");
+    const sender = ownerRuntime.addAgent({ session: senderSession, spawner: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId), name: "Late Router Sender" });
+    const senderRun = ownerRuntime.startAgentRun(ownerRuntime.agent(sender.agentId));
+    const senderRuntime = scenario.startAgent(ownerRuntime.workflow, senderSession);
+    const sourceEntryId = scenario.transcripts.appendAgentSend(senderSession, { targetAgentId: recipient.agentId, message: "wait for router", onAccepted: "continue" });
+    const store = new DirectSignalStore(ownerRuntime.workflow.databasePath);
+    store.bindMessage({ messageId: "late-router-message", sender: ownerRuntime.agent(sender.agentId), recipient: ownerRuntime.agent(recipient.agentId),
+      sourceEntryId, payloadDigest: digestPayload("wait for router"), deliveryTiming: "steer", responseRequired: false,
+      onAccepted: "continue", ownership: senderRun.ownership, createdAtMs: scenario.clock.now() });
+    store.close();
+    const senderSignals = directSignalRuntime(test, { controlPlane: senderRuntime.controlPlane, ownership: senderRun.ownership });
+    const reconciliation = senderSignals.reconcilePendingAcceptances({ waitForResolution: true });
+    let reconciliationFinished = false;
+    void reconciliation.then(() => { reconciliationFinished = true; });
+    await Promise.resolve();
+    assert.equal(reconciliationFinished, false);
+    const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
+    const recipientSignals = directSignalRuntime(test, { controlPlane: recipientRuntime.controlPlane, ownership: recipientRun.ownership, projectInboxBatch() {} });
+    await recipientSignals.start();
+    assert.deepEqual(await reconciliation, { terminalCompletion: false });
+    await waitFor(() => senderSignals.inspectMessage("late-router-message")?.deliveryStatus === "queued");
+    assert.equal(senderSignals.inspectMessage("late-router-message")?.messageId, "late-router-message");
+  });
+
+  it("automatically retries an Owner-bound identity when recipient routing appears later", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { session: ownerSession, runtime: ownerRuntime } = scenario.createOwner();
+    const recipientSession = scenario.childSession(ownerRuntime, "late-owner-router-recipient");
+    const recipient = ownerRuntime.addAgent({
+      session: recipientSession,
+      spawner: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId),
+      name: "Late Owner Router Recipient",
+    });
+    const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
+    const sourceEntryId = scenario.transcripts.appendAgentSend(ownerSession, {
+      targetAgentId: recipient.agentId,
+      message: "owner waits for router",
+      onAccepted: "continue",
+    });
+    const store = new DirectSignalStore(ownerRuntime.workflow.databasePath);
+    store.bindMessage({
+      messageId: "late-owner-router-message",
+      sender: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId),
+      recipient: ownerRuntime.agent(recipient.agentId),
+      sourceEntryId,
+      payloadDigest: digestPayload("owner waits for router"),
+      deliveryTiming: "steer",
+      responseRequired: false,
+      onAccepted: "continue",
+      createdAtMs: scenario.clock.now(),
+    });
+    store.close();
+    const ownerSignals = directSignalRuntime(test, { controlPlane: ownerRuntime.controlPlane });
+    assert.deepEqual(await ownerSignals.reconcilePendingAcceptances(), { terminalCompletion: false });
+    const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
+    const recipientSignals = directSignalRuntime(test, {
+      controlPlane: recipientRuntime.controlPlane,
+      ownership: recipientRun.ownership,
+      projectInboxBatch() {},
+    });
+    await recipientSignals.start();
+    await waitFor(() => ownerSignals.inspectMessage("late-owner-router-message")?.deliveryStatus === "queued");
+  });
+
+  it("automatically reconciles a durable bound acceptance operation with its original identity", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const ownerSignals = directSignalRuntime(test, { controlPlane: ownerRuntime.controlPlane, projectInboxBatch() {} });
+    await ownerSignals.start();
+    const senderSession = scenario.childSession(ownerRuntime, "reconcile-sender");
+    const sender = ownerRuntime.addAgent({ session: senderSession, spawner: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId), name: "Reconcile Sender" });
+    const senderRuntime = scenario.startAgent(ownerRuntime.workflow, senderSession);
+    const run = ownerRuntime.startAgentRun(ownerRuntime.agent(sender.agentId));
+    const sourceEntryId = scenario.transcripts.appendAgentSend(senderSession, { targetAgentId: ownerRuntime.workflow.ownerAgentId, message: "recover me", onAccepted: "continue" });
+    const store = new DirectSignalStore(ownerRuntime.workflow.databasePath);
+    store.bindMessage({ messageId: "reconcile-message", sender: ownerRuntime.agent(sender.agentId), recipient: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId),
+      sourceEntryId, payloadDigest: digestPayload("recover me"), deliveryTiming: "steer", responseRequired: false,
+      onAccepted: "continue", ownership: run.ownership, createdAtMs: scenario.clock.now() });
+    store.close();
+    const senderSignals = directSignalRuntime(test, { controlPlane: senderRuntime.controlPlane, ownership: run.ownership });
+    assert.deepEqual(await senderSignals.reconcilePendingAcceptances(), { terminalCompletion: false });
+    assert.equal(senderSignals.listMessages().find((message) => message.messageId === "reconcile-message")?.deliveryStatus, "queued");
+    assert.deepEqual(ownerRuntime.inspectActivation(ownerRuntime.agent(sender.agentId))?.state, { kind: "active" });
+  });
+
+  it("reconciles recovered terminal acceptance with recovery ownership and completes that run", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const ownerSignals = directSignalRuntime(test, { controlPlane: ownerRuntime.controlPlane, projectInboxBatch() {} });
+    await ownerSignals.start();
+    const senderSession = scenario.childSession(ownerRuntime, "recovered-terminal-sender");
+    const sender = ownerRuntime.addAgent({ session: senderSession, spawner: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId), name: "Recovered Terminal Sender" });
+    const senderReference = ownerRuntime.agent(sender.agentId);
+    const firstRun = ownerRuntime.startAgentRun(senderReference);
+    const sourceEntryId = scenario.transcripts.appendAgentSend(senderSession, { targetAgentId: ownerRuntime.workflow.ownerAgentId, message: "recovered final", onAccepted: "complete" });
+    const store = new DirectSignalStore(ownerRuntime.workflow.databasePath);
+    store.bindMessage({ messageId: "recovered-terminal", sender: senderReference, recipient: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId),
+      sourceEntryId, payloadDigest: digestPayload("recovered final"), deliveryTiming: "steer", responseRequired: false,
+      onAccepted: "complete", ownership: firstRun.ownership, createdAtMs: scenario.clock.now() });
+    store.close();
+    ownerRuntime.confirmAgentRunExit(firstRun, { error: "lost before acceptance classification" });
+    const recovery = ownerRuntime.startAgentRun(senderReference);
+    const senderRuntime = scenario.startAgent(ownerRuntime.workflow, senderSession);
+    const senderSignals = directSignalRuntime(test, { controlPlane: senderRuntime.controlPlane, ownership: recovery.ownership });
+    assert.deepEqual(await senderSignals.reconcilePendingAcceptances(), { terminalCompletion: true });
+    assert.deepEqual(ownerRuntime.inspectActivation(senderReference)?.state, { kind: "ended", outcome: "completed" });
+  });
+
+  it("returns an idempotent receipt after a real sender runtime commits fused terminal Signal completion", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const ownerSignals = directSignalRuntime(test, { controlPlane: ownerRuntime.controlPlane, projectInboxBatch() {} });
+    await ownerSignals.start();
+    const senderSession = scenario.childSession(ownerRuntime, "terminal-sender");
+    const sender = ownerRuntime.addAgent({ session: senderSession, spawner: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId), name: "Terminal Sender" });
+    const senderRuntime = scenario.startAgent(ownerRuntime.workflow, senderSession);
+    const run = ownerRuntime.startAgentRun(ownerRuntime.agent(sender.agentId));
+    const senderSignals = directSignalRuntime(test, { controlPlane: senderRuntime.controlPlane, ownership: run.ownership, allocateMessageId: () => scenario.identities.next() });
+    const sourceEntryId = scenario.transcripts.appendAgentSend(senderSession, { targetAgentId: ownerRuntime.workflow.ownerAgentId, message: "final result", onAccepted: "complete" });
+    const first = await senderSignals.sendMessage({ target: { agentId: ownerRuntime.workflow.ownerAgentId }, message: "final result", sourceEntryId, onAccepted: "complete" });
+    const retry = await senderSignals.sendMessage({ target: { agentId: ownerRuntime.workflow.ownerAgentId }, message: "final result", sourceEntryId, onAccepted: "complete" });
+    assert.deepEqual(retry, first);
+    assert.equal(ownerRuntime.inspectActivation(ownerRuntime.agent(sender.agentId))?.state.kind, "ended");
+  });
+
+  it("returns fused terminal success when the acceptance receipt is lost", async (test) => {
+    const rootDirectory = await temporaryDirectory();
+    const scenario = new WorkflowScenario({ rootDirectory });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const senderSession = scenario.childSession(ownerRuntime, "lost-terminal-sender");
+    const sender = ownerRuntime.addAgent({ session: senderSession, spawner: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId), name: "Lost Terminal Sender" });
+    const senderRuntime = scenario.startAgent(ownerRuntime.workflow, senderSession);
+    const run = ownerRuntime.startAgentRun(ownerRuntime.agent(sender.agentId));
+    const endpoint = process.platform === "win32" ? `\\\\.\\pipe\\pi-herdr-terminal-${process.pid}-${Date.now()}` : join(rootDirectory, "terminal-lost.sock");
+    const store = closeAfter(test, new DirectSignalStore(ownerRuntime.workflow.databasePath));
+    store.registerRouter({ recipient: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId), endpoint, registeredAtMs: scenario.clock.now() });
+    closeAfter(test, await listenForFramedIpc(endpoint, (connection) => connection.onMessage((frame) => {
+      store.acceptSignal({ request: frame.payload as import("../../pi-extension/subagents/protocol/direct-signal-types.ts").SignalAcceptRequest,
+        recipient: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId), endpoint, acceptedAtMs: scenario.clock.now() });
+      connection.end();
+    })));
+    const senderSignals = directSignalRuntime(test, { controlPlane: senderRuntime.controlPlane, ownership: run.ownership, allocateMessageId: () => scenario.identities.next() });
+    const sourceEntryId = scenario.transcripts.appendAgentSend(senderSession, { targetAgentId: ownerRuntime.workflow.ownerAgentId, message: "lost terminal receipt", onAccepted: "complete" });
+    const receipt = await senderSignals.sendMessage({ target: { agentId: ownerRuntime.workflow.ownerAgentId }, message: "lost terminal receipt", sourceEntryId, onAccepted: "complete" });
+    assert.equal(receipt.status, "queued");
+    assert.equal(ownerRuntime.inspectActivation(ownerRuntime.agent(sender.agentId))?.state.kind, "ended");
+  });
+
+  it("commits a fused final Answer through the real sender runtime", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { session: ownerSession, runtime: ownerRuntime } = scenario.createOwner();
+    const workerSession = scenario.childSession(ownerRuntime, "final-answer-worker");
+    const worker = ownerRuntime.addAgent({ session: workerSession, spawner: ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId), name: "Final Answer Worker" });
+    const workerRuntime = scenario.startAgent(ownerRuntime.workflow, workerSession);
+    const run = ownerRuntime.startAgentRun(ownerRuntime.agent(worker.agentId));
+    const delivered: string[] = [];
+    const workerSignals = directSignalRuntime(test, { controlPlane: workerRuntime.controlPlane, ownership: run.ownership,
+      allocateMessageId: () => scenario.identities.next(), projectInboxBatch(batch) { delivered.push(...batch.messages.map((message) => message.messageId)); } });
+    await workerSignals.start();
+    const ownerSignals = directSignalRuntime(test, { controlPlane: ownerRuntime.controlPlane, allocateMessageId: () => scenario.identities.next(), projectInboxBatch() {} });
+    await ownerSignals.start();
+    const requestSource = scenario.transcripts.appendAgentSend(ownerSession, { targetAgentId: worker.agentId, message: "finish", responseRequired: true });
+    const request = await ownerSignals.sendMessage({ target: { agentId: worker.agentId }, message: "finish", sourceEntryId: requestSource, responseRequired: true, onAccepted: "continue" });
+    await waitFor(() => delivered.includes(request.messageId));
+    workerSignals.confirmDelivery(request.messageId);
+    const answerSource = scenario.transcripts.appendAgentSend(workerSession, { targetRequestId: request.messageId, message: "finished", onAccepted: "complete" });
+    const answer = await workerSignals.sendMessage({ target: { requestId: request.messageId }, message: "finished", sourceEntryId: answerSource, onAccepted: "complete" });
+    assert.equal(answer.status, "queued");
+    assert.deepEqual(ownerRuntime.inspectActivation(ownerRuntime.agent(worker.agentId))?.state, { kind: "ended", outcome: "completed" });
+  });
+
   it("accepts a Request atomically, then an Answer resolves only its durable requester dependency on delivery", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
@@ -855,6 +1123,7 @@ describe("direct Signal protocol scenarios", () => {
     });
     const endedRun = runtime.controlPlane.acquireAgentRun(runtime.agent(recipient.agentId), scenario.identities.next());
     runtime.controlPlane.startActivation(endedRun);
+    runtime.controlPlane.addActivationDependency(endedRun, { kind: "operation", dependencyId: "acceptance:pre-reactivation" });
     runtime.controlPlane.failAgentRun(endedRun, { error: "ended before Request" });
     const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
       targetAgentId: recipient.agentId, message: "Resume with this Request.", responseRequired: true,
@@ -886,8 +1155,10 @@ describe("direct Signal protocol scenarios", () => {
 
     assert.equal(preparations, 1);
     assert.equal(receipt.status, "queued");
+    assert.deepEqual(runtime.inspectActivation(runtime.agent(recipient.agentId))?.state, {
+      kind: "waiting", dependencies: [{ kind: "operation", dependencyId: "acceptance:pre-reactivation" }],
+    });
     assert.equal(runtime.inspectActivation(runtime.agent(recipient.agentId))?.sequence, 2);
-    assert.equal(runtime.inspectActivation(runtime.agent(recipient.agentId))?.state.kind, "active");
     assert.equal(senderSignals.listPending(runtime.agent(recipient.agentId)).length, 1);
 
     const retry = await senderSignals.sendMessage({

@@ -32,6 +32,7 @@ import {
 import { resolveCanonicalSpawnedInitialMessage } from "./direct-signal-transcript.ts";
 import { DirectSignalStore } from "./sqlite-message-store.ts";
 import type { InspectionTarget } from "./workflow-inspection.ts";
+import { CompletionGateStore, type CompletionSource } from "./completion-gate.ts";
 
 export const WORKFLOW_OWNER_SESSION_ID_ENV = "PI_WORKFLOW_OWNER_SESSION_ID";
 export const WORKFLOW_OWNER_SESSION_PATH_ENV = "PI_WORKFLOW_OWNER_SESSION_PATH";
@@ -167,6 +168,10 @@ export class WorkflowBootstrap {
       const ownership = ownershipFromEnvironment(environment, ownerSessionId, sessionId);
       if (ownership) {
         this.#controlPlane.assertCurrentAgentRun(ownership);
+        // The child process may reach session_start before the launcher returns
+        // from writing its command. Start/transfer the activation here so
+        // reconciliation never observes ownership without its recovery state.
+        this.#controlPlane.startActivation(ownership);
         this.#selfOwnership = ownership;
       }
     } else {
@@ -301,6 +306,7 @@ export class WorkflowBootstrap {
     wakeRecipient?: () => void;
     projectInitialInboxBatch?(batch: InboxBatch): Promise<void>;
     releaseInitialInboxBatch?(): void;
+    onTerminalCompletion?(): void;
   }): Promise<void> {
     if (this.#provisionalBootstrap) {
       if (input.projectInitialInboxBatch) this.#provisionalInboxProjector = input.projectInitialInboxBatch;
@@ -335,6 +341,7 @@ export class WorkflowBootstrap {
     sourceEntryId: string;
     deliveryTiming?: "steer" | "deferred";
     responseRequired?: boolean;
+    onAccepted: "continue" | "complete";
     prepareEndedRecipient?: Parameters<DirectSignalRuntime["sendMessage"]>[0]["prepareEndedRecipient"];
   }): Promise<QueuedSignalReceipt> {
     return this.#directSignalRuntime().sendMessage(input);
@@ -370,6 +377,23 @@ export class WorkflowBootstrap {
     if (runtime) await runtime.close();
   }
 
+  reconcilePendingDirectSignals(options: { waitForResolution?: boolean } = {}) {
+    return this.#directSignalRuntime().reconcilePendingAcceptances(options);
+  }
+
+  completeCurrentActivation(source: CompletionSource) {
+    const controlPlane = this.#requireControlPlane();
+    if (controlPlane.currentAgent.agentId === controlPlane.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError("OwnerActivationForbidden", "Workflow Owner cannot complete");
+    }
+    const gate = new CompletionGateStore(controlPlane.workflow.databasePath);
+    try {
+      return gate.complete(this.#requireSelfOwnership(), source, this.#now());
+    } finally {
+      gate.close();
+    }
+  }
+
   runStarted(ownership: AgentRunOwnership): ActivationRecord {
     return this.#requireControlPlane().startActivation(ownership);
   }
@@ -392,6 +416,8 @@ export class WorkflowBootstrap {
       return controlPlane.settleOwnerTurn();
     }
     const ownership = this.#requireSelfOwnership();
+    const completed = this.#inspectRun(ownership);
+    if (completed?.state.kind === "ended" && completed.state.outcome === "completed") return completed;
     return interrupted
       ? controlPlane.confirmInterruption(ownership)
       : controlPlane.settleActivation(ownership, undefined, this.#humanInterruptActorRole);
@@ -570,6 +596,8 @@ export class WorkflowBootstrap {
     },
   ): ActivationRecord | undefined {
     if (!confirmed) return;
+    const completed = this.#inspectRun(ownership);
+    if (completed?.state.kind === "ended" && completed.state.outcome === "completed") return undefined;
     if (this.#controlPlane?.workflow.ownerAgentId === ownership.workflowOwnerId) {
       const activation = this.#controlPlane.inspectActivation(
         this.#controlPlane.agent(ownership.agentId),
@@ -601,6 +629,36 @@ export class WorkflowBootstrap {
     } finally {
       activationStore.close();
     }
+  }
+
+  wasProtocolCompleted(ownership: AgentRunOwnership): boolean {
+    const exact = this.#inspectRun(ownership);
+    if (exact?.state.kind === "ended" && exact.state.outcome === "completed") return true;
+    if (this.#controlPlane?.workflow.ownerAgentId === ownership.workflowOwnerId) {
+      const activation = this.#controlPlane.inspectActivation(this.#controlPlane.agent(ownership.agentId));
+      return activation?.runId === ownership.runId
+        && activation.state.kind === "ended"
+        && activation.state.outcome === "completed";
+    }
+    const databasePath = this.#workflowDatabases.get(ownership.workflowOwnerId);
+    if (!databasePath) return false;
+    const store = new ActivationLifecycleStore(databasePath);
+    try {
+      const activation = store.inspect(ownership);
+      return activation?.runId === ownership.runId
+        && activation.state.kind === "ended"
+        && activation.state.outcome === "completed";
+    } finally {
+      store.close();
+    }
+  }
+
+  #inspectRun(ownership: AgentRunOwnership): ActivationRecord | undefined {
+    const databasePath = this.#workflowDatabases.get(ownership.workflowOwnerId)
+      ?? (this.#controlPlane?.workflow.ownerAgentId === ownership.workflowOwnerId ? this.#controlPlane.workflow.databasePath : undefined);
+    if (!databasePath) return undefined;
+    const store = new ActivationLifecycleStore(databasePath);
+    try { return store.inspectRun(ownership); } finally { store.close(); }
   }
 
   #requireControlPlane(): WorkflowControlPlane {

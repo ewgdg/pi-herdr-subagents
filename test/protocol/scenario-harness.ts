@@ -111,6 +111,7 @@ export class ControllableTranscriptAdapter {
       message: string;
       timing?: "steer" | "deferred";
       responseRequired?: boolean;
+      onAccepted?: "continue" | "complete";
     },
   ): string {
     const sourceEntryId = input.sourceEntryId ?? `tool-${this.#identityFactory.next()}`;
@@ -135,6 +136,7 @@ export class ControllableTranscriptAdapter {
             ...(input.responseRequired === undefined
               ? input.targetSpawn ? { responseRequired: true } : {}
               : { responseRequired: input.responseRequired }),
+            ...(input.onAccepted ? { onAccepted: input.onAccepted } : {}),
           },
         }],
       },

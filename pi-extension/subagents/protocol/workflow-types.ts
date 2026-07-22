@@ -64,6 +64,9 @@ export type WorkflowProtocolErrorCode =
   | "RecipientReactivationUnauthorized"
   | "MessageIdentityConflict"
   | "InvalidMessageSource"
+  | "InvalidCompletionMessage"
+  | "CompletionBlocked"
+  | "AcceptanceInDoubt"
   | "AnswerUnauthorized"
   | "AnswerAlreadyClosed"
   | "UnknownRequest";

@@ -4,7 +4,7 @@ import {
   connectFramedIpc,
   type FramedIpcConnection,
 } from "../coordination/framed-ipc.ts";
-import { digestPayload } from "./direct-signal-transcript.ts";
+import { digestPayload, resolveCanonicalSignal } from "./direct-signal-transcript.ts";
 import type { WorkflowControlPlane } from "./workflow-control-plane.ts";
 import { RecipientInboxRouter } from "./recipient-inbox-router.ts";
 import { DirectSignalStore } from "./sqlite-message-store.ts";
@@ -23,6 +23,7 @@ import type {
   SignalDeliveryTiming,
   SignalReceiptReply,
 } from "./direct-signal-types.ts";
+import { CompletionRejectedError } from "./completion-gate.ts";
 
 export type {
   ActionableMessageKind,
@@ -36,6 +37,9 @@ export type {
 } from "./direct-signal-types.ts";
 
 const ACCEPTANCE_TIMEOUT_MS = 5_000;
+const ACCEPTANCE_RETRY_INITIAL_DELAY_MS = 50;
+const ACCEPTANCE_RETRY_MAXIMUM_DELAY_MS = 5_000;
+const ACCEPTANCE_RETRY_BACKOFF_FACTOR = 2;
 const SIGNAL_REQUEST_TYPE = "direct-signal.accept";
 const SIGNAL_RECEIPT_TYPE = "direct-signal.receipt";
 
@@ -52,6 +56,11 @@ export interface DirectSignalRuntimeOptions {
 }
 
 type MessageTarget = { agentId: string; workflowOwnerId?: string } | { requestId: string };
+type AcceptanceReconciliationResult = { terminalCompletion: boolean };
+type AcceptanceResolutionWaiter = {
+  resolve(result: AcceptanceReconciliationResult): void;
+  reject(error: Error): void;
+};
 
 export class DirectSignalRuntime {
   readonly #controlPlane: WorkflowControlPlane;
@@ -68,6 +77,11 @@ export class DirectSignalRuntime {
   #routerStartup: Promise<void> | undefined;
   #closePromise: Promise<void> | undefined;
   #closed = false;
+  readonly #acceptanceReconciliations = new Map<string, Promise<QueuedSignalReceipt | undefined>>();
+  #acceptanceRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  #acceptanceRetryDelayMs = ACCEPTANCE_RETRY_INITIAL_DELAY_MS;
+  readonly #acceptanceResolutionWaiters = new Set<AcceptanceResolutionWaiter>();
+  #onTerminalCompletion: (() => void) | undefined;
 
   constructor(options: DirectSignalRuntimeOptions) {
     this.#controlPlane = options.controlPlane;
@@ -127,11 +141,13 @@ export class DirectSignalRuntime {
     projectInboxBatch(batch: InboxBatch): void;
     hasProjectedMessage?(messageId: string): boolean;
     wakeRecipient?: () => void;
+    onTerminalCompletion?: () => void;
   }): void {
     this.#assertOpen();
     this.#projectInboxBatch = input.projectInboxBatch;
     this.#hasProjectedMessage = input.hasProjectedMessage;
     this.#wakeRecipient = input.wakeRecipient;
+    this.#onTerminalCompletion = input.onTerminalCompletion;
     this.#router?.configureDelivery(input);
   }
 
@@ -142,6 +158,7 @@ export class DirectSignalRuntime {
     sourceEntryId: string;
     deliveryTiming?: SignalDeliveryTiming;
     responseRequired?: boolean;
+    onAccepted: "continue" | "complete";
     prepareEndedRecipient?: (request: SignalAcceptRequest) => Promise<QueuedSignalReceipt>;
   }): Promise<QueuedSignalReceipt> {
     this.#assertOpen();
@@ -149,6 +166,13 @@ export class DirectSignalRuntime {
     assertNonEmpty(input.sourceEntryId, "Message source entry ID");
     const sender = this.#controlPlane.currentAgent;
     const responseRequired = input.responseRequired === true;
+    const onAccepted = input.onAccepted ?? "continue";
+    if (onAccepted === "complete" && responseRequired) {
+      throw new WorkflowProtocolError("InvalidCompletionMessage", "Terminal completion cannot create a Response Requirement");
+    }
+    if (onAccepted === "complete" && !this.#ownership) {
+      throw new WorkflowProtocolError("OwnerActivationForbidden", "Workflow Owner cannot complete");
+    }
     const target = this.#resolveTarget(sender, input.target, input.deliveryTiming);
     const payloadDigest = digestPayload(input.message);
     const existing = this.#store.findMessageBySource({
@@ -159,8 +183,11 @@ export class DirectSignalRuntime {
       deliveryTiming: target.deliveryTiming,
       responseRequired,
       inReplyToRequestId: target.inReplyToRequestId,
+      onAccepted,
     });
-    if (existing && existing.deliveryStatus !== "bound") return receiptFor(existing);
+    if (existing && existing.deliveryStatus !== "bound") {
+      return this.#store.reconcileAcceptedMessage(sender, existing.messageId, this.#ownership) ?? receiptFor(existing);
+    }
     if (target.inReplyToRequestId && this.#store.inspectRequest(sender.workflowOwnerId, target.inReplyToRequestId)?.status !== "open") {
       throw new WorkflowProtocolError("AnswerAlreadyClosed", `Request ${target.inReplyToRequestId} already has a terminal Answer`);
     }
@@ -181,6 +208,7 @@ export class DirectSignalRuntime {
         payloadDigest,
         deliveryTiming: target.deliveryTiming,
         responseRequired: true,
+        onAccepted,
         ...(target.inReplyToRequestId ? { inReplyToRequestId: target.inReplyToRequestId } : {}),
         message: input.message,
       };
@@ -197,9 +225,13 @@ export class DirectSignalRuntime {
       deliveryTiming: target.deliveryTiming,
       responseRequired,
       inReplyToRequestId: target.inReplyToRequestId,
+      onAccepted,
+      ...(this.#ownership ? { ownership: this.#ownership } : {}),
       createdAtMs: this.#now(),
     });
-    if (bound.deliveryStatus !== "bound") return receiptFor(bound);
+    if (bound.deliveryStatus !== "bound") {
+      return this.#store.reconcileAcceptedMessage(sender, bound.messageId, this.#ownership) ?? receiptFor(bound);
+    }
     const request: SignalAcceptRequest = {
       workflowOwnerId: sender.workflowOwnerId,
       messageId: bound.messageId,
@@ -209,8 +241,10 @@ export class DirectSignalRuntime {
       payloadDigest,
       deliveryTiming: target.deliveryTiming,
       responseRequired,
+      onAccepted,
       ...(target.inReplyToRequestId ? { inReplyToRequestId: target.inReplyToRequestId } : {}),
       message: input.message,
+      ...(onAccepted === "complete" ? { completion: { ownership: this.#ownership! } } : {}),
     };
 
     let reply: SignalReceiptReply;
@@ -218,15 +252,132 @@ export class DirectSignalRuntime {
       reply = await this.#requestReceipt(route.endpoint, request);
     } catch (error) {
       const reconciled = this.#store.inspectMessage(sender.workflowOwnerId, bound.messageId);
-      if (reconciled && reconciled.deliveryStatus !== "bound") return receiptFor(reconciled);
-      this.#store.discardUnacceptedMessage(sender, bound.messageId);
+      if (reconciled && reconciled.deliveryStatus !== "bound") {
+        return this.#store.reconcileAcceptedMessage(sender, bound.messageId, this.#ownership) ?? receiptFor(reconciled);
+      }
+      if (!this.#store.discardUnacceptedMessage(sender, bound.messageId)) {
+        const acceptedAfterDiscard = this.#store.inspectMessage(sender.workflowOwnerId, bound.messageId);
+        if (acceptedAfterDiscard && acceptedAfterDiscard.deliveryStatus !== "bound") {
+          return this.#store.reconcileAcceptedMessage(sender, bound.messageId, this.#ownership) ?? receiptFor(acceptedAfterDiscard);
+        }
+        if (this.#ownership) {
+          this.#controlPlane.addActivationDependency(this.#ownership, {
+            kind: "operation", dependencyId: `acceptance:${bound.messageId}`,
+          });
+        }
+        this.#scheduleAcceptanceRetry();
+        throw new WorkflowProtocolError("AcceptanceInDoubt", `Acceptance remains uncertain for Message ${bound.messageId}`);
+      }
       throw recipientUnreachable(target.recipient.agentId, error);
     }
     if (!reply.accepted || !reply.receipt) {
       this.#store.discardUnacceptedMessage(sender, bound.messageId);
       throw replyError(reply.error);
     }
-    return reply.receipt;
+    return this.#store.reconcileAcceptedMessage(sender, bound.messageId, this.#ownership) ?? reply.receipt;
+  }
+
+  async reconcilePendingAcceptances(
+    options: { waitForResolution?: boolean } = {},
+  ): Promise<AcceptanceReconciliationResult> {
+    const initiallyBound = this.#store.listBoundMessages(this.#controlPlane.currentAgent).length;
+    let terminalCompletion = false;
+    for (const bound of this.#store.listBoundMessages(this.#controlPlane.currentAgent)) {
+      const pending = this.#acceptanceReconciliations.get(bound.messageId) ?? this.#reconcileBoundMessage(bound);
+      this.#acceptanceReconciliations.set(bound.messageId, pending);
+      try {
+        const receipt = await pending;
+        if (receipt && bound.onAccepted === "complete") terminalCompletion = true;
+      } finally {
+        if (this.#acceptanceReconciliations.get(bound.messageId) === pending) this.#acceptanceReconciliations.delete(bound.messageId);
+      }
+    }
+    if (terminalCompletion) this.#onTerminalCompletion?.();
+    const remainingBound = this.#store.listBoundMessages(this.#controlPlane.currentAgent).length;
+    const result = { terminalCompletion };
+    if (terminalCompletion || remainingBound === 0) {
+      this.#cancelAcceptanceRetry();
+      this.#resolveAcceptanceWaiters(result);
+    } else {
+      if (remainingBound < initiallyBound) this.#acceptanceRetryDelayMs = ACCEPTANCE_RETRY_INITIAL_DELAY_MS;
+      this.#scheduleAcceptanceRetry();
+      if (options.waitForResolution) return this.#waitForAcceptanceResolution();
+    }
+    return result;
+  }
+
+  async #reconcileBoundMessage(bound: DirectSignalRecord): Promise<QueuedSignalReceipt | undefined> {
+    const sender = this.#controlPlane.currentAgent;
+    const observed = this.#store.inspectMessage(sender.workflowOwnerId, bound.messageId);
+    if (observed?.deliveryStatus !== "bound") {
+      if (bound.onAccepted === "complete" && this.#store.terminalMessageCompleted(sender, bound.messageId)) return receiptFor(observed);
+      return this.#store.reconcileAcceptedMessage(sender, bound.messageId, this.#ownership) ?? receiptFor(observed!);
+    }
+    const route = this.#store.readRouter({ workflowOwnerId: sender.workflowOwnerId, agentId: bound.recipientAgentId });
+    if (!route) return undefined;
+    const completion = bound.onAccepted === "complete" ? { ownership: this.#ownership! } : undefined;
+    const canonical = {
+      messageId: bound.messageId, sourceEntryId: bound.sourceEntryId, recipientAgentId: bound.recipientAgentId,
+      payloadDigest: bound.payloadDigest, deliveryTiming: bound.deliveryTiming, responseRequired: bound.responseRequired,
+      onAccepted: bound.onAccepted, ...(bound.inReplyToRequestId ? { inReplyToRequestId: bound.inReplyToRequestId } : {}),
+      ...(completion ? { completion } : {}),
+    };
+    const message = resolveCanonicalSignal(this.#store.senderSessionPath(sender.workflowOwnerId, sender.agentId), canonical);
+    const request: SignalAcceptRequest = {
+      workflowOwnerId: sender.workflowOwnerId, messageId: bound.messageId, senderAgentId: sender.agentId,
+      recipientAgentId: bound.recipientAgentId, sourceEntryId: bound.sourceEntryId, payloadDigest: bound.payloadDigest,
+      deliveryTiming: bound.deliveryTiming, responseRequired: bound.responseRequired, onAccepted: bound.onAccepted,
+      ...(bound.inReplyToRequestId ? { inReplyToRequestId: bound.inReplyToRequestId } : {}), message,
+      ...(completion ? { completion } : {}),
+    };
+    try { await this.#requestReceipt(route.endpoint, request); } catch { /* Probe durable acceptance below. */ }
+    const accepted = this.#store.inspectMessage(sender.workflowOwnerId, bound.messageId);
+    if (accepted?.deliveryStatus !== "bound") {
+      if (bound.onAccepted === "complete" && this.#store.terminalMessageCompleted(sender, bound.messageId)) return receiptFor(accepted);
+      return this.#store.reconcileAcceptedMessage(sender, bound.messageId, this.#ownership) ?? receiptFor(accepted!);
+    }
+    if (this.#store.discardUnacceptedMessage(sender, bound.messageId)) return undefined;
+    const raced = this.#store.inspectMessage(sender.workflowOwnerId, bound.messageId);
+    if (raced?.deliveryStatus !== "bound") {
+      if (bound.onAccepted === "complete" && this.#store.terminalMessageCompleted(sender, bound.messageId)) return receiptFor(raced);
+      return this.#store.reconcileAcceptedMessage(sender, bound.messageId, this.#ownership) ?? receiptFor(raced!);
+    }
+    return undefined;
+  }
+
+  #scheduleAcceptanceRetry(): void {
+    if (this.#closed || this.#acceptanceRetryTimer) return;
+    const delayMs = this.#acceptanceRetryDelayMs;
+    this.#acceptanceRetryDelayMs = Math.min(
+      ACCEPTANCE_RETRY_MAXIMUM_DELAY_MS,
+      delayMs * ACCEPTANCE_RETRY_BACKOFF_FACTOR,
+    );
+    this.#acceptanceRetryTimer = setTimeout(() => {
+      this.#acceptanceRetryTimer = undefined;
+      if (this.#closed) return;
+      void this.reconcilePendingAcceptances().catch(() => {
+        if (this.#closed) return;
+        if (this.#store.listBoundMessages(this.#controlPlane.currentAgent).length > 0) this.#scheduleAcceptanceRetry();
+      });
+    }, delayMs);
+    this.#acceptanceRetryTimer.unref?.();
+  }
+
+  #cancelAcceptanceRetry(): void {
+    if (this.#acceptanceRetryTimer) clearTimeout(this.#acceptanceRetryTimer);
+    this.#acceptanceRetryTimer = undefined;
+    this.#acceptanceRetryDelayMs = ACCEPTANCE_RETRY_INITIAL_DELAY_MS;
+  }
+
+  #waitForAcceptanceResolution(): Promise<AcceptanceReconciliationResult> {
+    return new Promise((resolve, reject) => {
+      this.#acceptanceResolutionWaiters.add({ resolve, reject });
+    });
+  }
+
+  #resolveAcceptanceWaiters(result: AcceptanceReconciliationResult): void {
+    for (const waiter of this.#acceptanceResolutionWaiters) waiter.resolve(result);
+    this.#acceptanceResolutionWaiters.clear();
   }
 
   /** Compatibility-shaped convenience for ordinary Signals. */
@@ -241,6 +392,7 @@ export class DirectSignalRuntime {
       message: input.message,
       sourceEntryId: input.sourceEntryId,
       deliveryTiming: input.deliveryTiming,
+      onAccepted: "continue",
     });
   }
 
@@ -282,6 +434,9 @@ export class DirectSignalRuntime {
   close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     this.#closed = true;
+    this.#cancelAcceptanceRetry();
+    for (const waiter of this.#acceptanceResolutionWaiters) waiter.reject(new Error("Direct Signal runtime closed before acceptance reconciliation completed"));
+    this.#acceptanceResolutionWaiters.clear();
     this.#closePromise = this.#close();
     return this.#closePromise;
   }
@@ -400,6 +555,7 @@ function receiptFor(record: DirectSignalRecord): QueuedSignalReceipt {
 
 function replyError(error: SignalReceiptReply["error"]): Error {
   if (!error) return new Error("Recipient Inbox Router rejected message acceptance");
+  if (error.code === "CompletionBlocked" && error.blockers) return new CompletionRejectedError(error.blockers);
   if (isWorkflowProtocolErrorCode(error.code)) return new WorkflowProtocolError(error.code, error.message);
   return new Error(error.message);
 }
@@ -408,6 +564,7 @@ function isWorkflowProtocolErrorCode(code: string | undefined): code is Construc
   return code === "WorkflowMismatch" || code === "UnknownAgent" || code === "OwnershipLost"
     || code === "RecipientUnreachable" || code === "RecipientEnded" || code === "MessageIdentityConflict"
     || code === "RecipientReactivationUnauthorized"
+    || code === "InvalidCompletionMessage" || code === "CompletionBlocked" || code === "AcceptanceInDoubt"
     || code === "InvalidMessageSource" || code === "AnswerUnauthorized" || code === "AnswerAlreadyClosed" || code === "UnknownRequest";
 }
 

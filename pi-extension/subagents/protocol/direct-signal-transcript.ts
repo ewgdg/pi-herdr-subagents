@@ -10,6 +10,7 @@ export interface CanonicalAgentSendToolCall {
     message?: unknown;
     timing?: unknown;
     responseRequired?: unknown;
+    onAccepted?: unknown;
   };
 }
 
@@ -31,6 +32,21 @@ export function findAgentSendToolCall(entries: unknown[], sourceEntryId: string)
   }
 }
 
+export function assertSoleToolCall(entries: unknown[], sourceEntryId: string): void {
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    const record = entry as { message?: unknown };
+    const message = record.message && typeof record.message === "object" ? record.message as { content?: unknown } : record;
+    if (!Array.isArray(message.content)) continue;
+    const calls = message.content.filter((block): block is { type: "toolCall"; id?: unknown } => Boolean(block && typeof block === "object" && (block as { type?: unknown }).type === "toolCall"));
+    if (calls.some((call) => call.id === sourceEntryId)) {
+      if (calls.length !== 1) throw new WorkflowProtocolError("InvalidCompletionMessage", "A terminal completion call must be the sole tool call in its assistant turn");
+      return;
+    }
+  }
+  throw new WorkflowProtocolError("InvalidCompletionMessage", `Terminal tool call ${sourceEntryId} is absent from the canonical assistant turn`);
+}
+
 function senderToolCall(sessionPath: string, sourceEntryId: string): CanonicalAgentSendToolCall | undefined {
   const entries = readFileSync(sessionPath, "utf8").split("\n").flatMap((line) => line ? [JSON.parse(line)] : []);
   return findAgentSendToolCall(entries, sourceEntryId);
@@ -39,7 +55,7 @@ function senderToolCall(sessionPath: string, sourceEntryId: string): CanonicalAg
 /** Resolve the source tool call rather than persisting actionable payloads in coordination state. */
 export function resolveCanonicalSignal(
   sessionPath: string,
-  input: Pick<SignalAcceptRequest, "messageId" | "sourceEntryId" | "recipientAgentId" | "payloadDigest" | "deliveryTiming" | "responseRequired" | "inReplyToRequestId">,
+  input: Pick<SignalAcceptRequest, "messageId" | "sourceEntryId" | "recipientAgentId" | "payloadDigest" | "deliveryTiming" | "responseRequired" | "inReplyToRequestId" | "onAccepted" | "completion">,
 ): string {
   const toolCall = senderToolCall(sessionPath, input.sourceEntryId);
   const target = toolCall?.arguments.target;
@@ -48,6 +64,8 @@ export function resolveCanonicalSignal(
     : target?.agent === input.recipientAgentId && (toolCall?.arguments.timing ?? "steer") === input.deliveryTiming;
   if (typeof toolCall?.arguments.message === "string" && matchesTarget
     && (toolCall.arguments.responseRequired === true) === input.responseRequired
+    && (input.onAccepted === undefined || (toolCall.arguments.onAccepted ?? "continue") === input.onAccepted)
+    && (!("completion" in input) || (input.onAccepted === "complete") === Boolean(input.completion))
     && digestPayload(toolCall.arguments.message) === input.payloadDigest) return toolCall.arguments.message;
   throw new WorkflowProtocolError("InvalidMessageSource", `Message ${input.messageId} does not match its canonical sender transcript entry`);
 }

@@ -16,6 +16,7 @@ import {
   startDirectSignalRouter,
 } from "./protocol/direct-signal-extension.ts";
 import { registerAgentInspectTool } from "./protocol/agent-inspect-extension.ts";
+import { registerAgentCompleteTool } from "./protocol/completion-extension.ts";
 import {
   HumanInterruptInputBridge,
   registerAgentAskUserTool,
@@ -237,6 +238,7 @@ export default function (pi: ExtensionAPI) {
   let userTookOver = false;
   let agentStarted = false;
   let latestAgentRunWasAborted = false;
+  let legacyCompletionRequested = false;
   const workflowBootstrap = getReloadSafeWorkflowBootstrap();
   const humanInterruptBridge = new HumanInterruptInputBridge();
   const undeclaredNoticeDeliveries = new Set<string>();
@@ -255,23 +257,27 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Show widget + status bar on session start
-  pi.on("session_start", (_event, ctx) => {
-    workflowBootstrap.sessionStarted(ctx);
-    if (workflowBootstrap.workflow) {
-      registerHumanInterruptTool();
-    } else {
-      void workflowBootstrap.waitUntilHumanInterruptRoleReady(ctx).then((role) => {
-        if (role) registerHumanInterruptTool();
-      }).catch(() => undefined);
-    }
-    void humanInterruptBridge.reconcile(ctx, workflowBootstrap).catch(() => undefined);
-    if (workflowBootstrap.workflow) {
-      emitUndeclaredSettlementNotice(pi, workflowBootstrap, ctx.sessionManager.getEntries(), undeclaredNoticeDeliveries);
-    }
-    if (ctx.sessionManager.getSessionFile()) {
-      void startDirectSignalRouter(pi, workflowBootstrap, ctx).catch((error) => {
-        ctx.ui.notify(`Direct Signal Router failed to start: ${(error as Error).message}`, "error");
-      });
+  pi.on("session_start", async (_event, ctx) => {
+    try {
+      workflowBootstrap.sessionStarted(ctx);
+      if (workflowBootstrap.workflow) {
+        registerHumanInterruptTool();
+      } else {
+        void workflowBootstrap.waitUntilHumanInterruptRoleReady(ctx).then((role) => {
+          if (role) registerHumanInterruptTool();
+        }).catch(() => undefined);
+      }
+      void humanInterruptBridge.reconcile(ctx, workflowBootstrap).catch(() => undefined);
+      if (workflowBootstrap.workflow) {
+        emitUndeclaredSettlementNotice(pi, workflowBootstrap, ctx.sessionManager.getEntries(), undeclaredNoticeDeliveries);
+      }
+      if (ctx.sessionManager.getSessionFile()) {
+        await startDirectSignalRouter(pi, workflowBootstrap, ctx);
+      }
+    } catch (error) {
+      ctx.ui.notify(`Workflow startup failed: ${(error as Error).message}`, "error");
+      ctx.shutdown();
+      throw error;
     }
     recorder.sessionStart();
     const tools = pi.getAllTools();
@@ -292,10 +298,19 @@ export default function (pi: ExtensionAPI) {
   humanInterruptBridge.install(pi, workflowBootstrap);
 
   pi.on("before_agent_start", async (_event, ctx) => {
-    if (workflowBootstrap.workflow) {
-      await humanInterruptBridge.reconcile(ctx, workflowBootstrap);
-      confirmProjectedInboxBatches(workflowBootstrap, ctx.sessionManager.getEntries());
-      emitUndeclaredSettlementNotice(pi, workflowBootstrap, ctx.sessionManager.getEntries(), undeclaredNoticeDeliveries);
+    try {
+      if (ctx.sessionManager.getSessionFile()) {
+        await startDirectSignalRouter(pi, workflowBootstrap, ctx);
+      }
+      if (workflowBootstrap.workflow) {
+        await humanInterruptBridge.reconcile(ctx, workflowBootstrap);
+        confirmProjectedInboxBatches(workflowBootstrap, ctx.sessionManager.getEntries());
+        emitUndeclaredSettlementNotice(pi, workflowBootstrap, ctx.sessionManager.getEntries(), undeclaredNoticeDeliveries);
+      }
+    } catch (error) {
+      ctx.ui.notify(`Workflow turn preparation failed: ${(error as Error).message}`, "error");
+      ctx.shutdown();
+      throw error;
     }
     recorder.beforeAgentStart();
   });
@@ -357,9 +372,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     if (workflowBootstrap.workflow) {
       await humanInterruptBridge.reconcile(ctx, workflowBootstrap);
-      workflowBootstrap.currentTurnSettled(latestAgentRunWasAborted);
-      workflowBootstrap.releaseDeferredSignals();
-      emitUndeclaredSettlementNotice(pi, workflowBootstrap, ctx.sessionManager.getEntries(), undeclaredNoticeDeliveries);
+      if (!legacyCompletionRequested) {
+        workflowBootstrap.currentTurnSettled(latestAgentRunWasAborted);
+        workflowBootstrap.releaseDeferredSignals();
+        emitUndeclaredSettlementNotice(pi, workflowBootstrap, ctx.sessionManager.getEntries(), undeclaredNoticeDeliveries);
+      }
     }
     latestAgentRunWasAborted = false;
   });
@@ -424,6 +441,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   registerAgentInspectTool(pi, workflowBootstrap, !parseDeniedTools(deniedToolsValue).includes("agent_inspect"));
+  registerAgentCompleteTool(pi, workflowBootstrap, !parseDeniedTools(deniedToolsValue).includes("agent_complete"));
   registerAgentSendTool(
     pi,
     workflowBootstrap,
@@ -475,6 +493,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
+      legacyCompletionRequested = true;
       if (sessionFile) {
         writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
       }

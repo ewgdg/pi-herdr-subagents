@@ -251,14 +251,25 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 
 ```typescript
 // A Signal: no reply obligation.
-agent_send({ target: { agent: agentId }, message: "Status update" });
+agent_send({ target: { agent: agentId }, message: "Status update", onAccepted: "continue" });
 
 // A Request: creates one durable Answer obligation using this message ID.
-agent_send({ target: { agent: agentId }, message: "Review this", responseRequired: true });
+agent_send({ target: { agent: agentId }, message: "Review this", responseRequired: true, onAccepted: "continue" });
 
 // An Answer: destination and delivery timing come from the Request.
-agent_send({ target: { request: requestId }, message: "Review complete" });
+agent_send({ target: { request: requestId }, message: "Review complete", onAccepted: "continue" });
 ```
+
+Subagents may finish through the shared mechanical Completion Gate either with
+`agent_complete()` after prior messages are accepted, or by adding
+`onAccepted: "complete"` to a final Signal or Answer. Terminal sends cannot
+create a new Response Requirement. Completion is atomic with final-message
+acceptance and is rejected with structured blockers while durable obligations
+remain. The Workflow Owner cannot complete.
+
+`subagent_done` temporarily remains available for the legacy parent-result
+relay until its dedicated migration. Protocol-completed activations shut down
+gracefully without selecting or relaying a second legacy result.
 
 Only the Agent addressed by a Request may answer it. The first queued Answer closes the Request; retrying that same Answer is idempotent. An Answer can also set `responseRequired: true` to create its own Request atomically. A Request becomes resolved only when its Answer is committed to the requester’s inbox; unresolved Requests remain durable Agent dependencies.
 

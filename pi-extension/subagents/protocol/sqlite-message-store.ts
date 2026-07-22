@@ -13,6 +13,7 @@ import type {
   SignalAcceptRequest,
   SignalDeliveryTiming,
 } from "./direct-signal-types.ts";
+import { commitMechanicalCompletion, initializeCompletionSchema } from "./completion-gate.ts";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 const SCHEMA_INITIALIZATION_MAX_ATTEMPTS = 5;
@@ -22,6 +23,7 @@ interface RouterRow { endpoint: string; run_id: string | null; fencing_epoch: nu
 interface MessageRow {
   message_id: string; sender_agent_id: string; recipient_agent_id: string; source_entry_id: string;
   payload_digest: string; delivery_timing: SignalDeliveryTiming; response_required: number;
+  on_accepted: "continue" | "complete";
   reactivates_recipient: number;
   in_reply_to_request_id: string | null; acceptance_sequence: number | null;
   delivery_status: "bound" | "queued" | "delivered"; created_at_ms: number;
@@ -194,6 +196,7 @@ export class DirectSignalStore {
   findMessageBySource(input: {
     sender: AgentReference; recipient: AgentReference; sourceEntryId: string; payloadDigest: string;
     deliveryTiming: SignalDeliveryTiming; responseRequired: boolean; inReplyToRequestId?: string;
+    onAccepted?: "continue" | "complete";
   }): DirectSignalRecord | undefined {
     this.#assertWorkflow(input.sender.workflowOwnerId);
     const row = this.#readMessageBySource(input.sender.agentId, input.sourceEntryId);
@@ -205,12 +208,15 @@ export class DirectSignalStore {
   bindMessage(input: {
     messageId: string; sender: AgentReference; recipient: AgentReference; sourceEntryId: string; payloadDigest: string;
     deliveryTiming: SignalDeliveryTiming; responseRequired: boolean; inReplyToRequestId?: string; createdAtMs: number;
+    onAccepted?: "continue" | "complete";
+    ownership?: AgentRunOwnership;
   }): DirectSignalRecord {
     return this.#withTransaction(() => {
       this.#assertWorkflow(input.sender.workflowOwnerId);
       if (input.recipient.workflowOwnerId !== input.sender.workflowOwnerId) throw new WorkflowProtocolError("WorkflowMismatch", `Message target ${input.recipient.agentId} belongs to another Workflow`);
       this.#requireAgent(input.sender.agentId);
       this.#requireAgent(input.recipient.agentId);
+      if (input.ownership) this.#assertRouterOwnership(input.sender, input.ownership);
       const sameIdentity = this.#readMessage(input.messageId);
       if (sameIdentity) { assertSameBinding(sameIdentity, input); return mapMessage(sameIdentity); }
       const prior = this.#readMessageBySource(input.sender.agentId, input.sourceEntryId);
@@ -219,16 +225,71 @@ export class DirectSignalStore {
         INSERT INTO direct_signal_messages (
           message_id, sender_agent_id, recipient_agent_id, source_entry_id, payload_digest, delivery_timing,
           response_required, in_reply_to_request_id, acceptance_sequence, delivery_status, created_at_ms, accepted_at_ms, delivered_at_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'bound', ?, NULL, NULL)
+          , on_accepted
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'bound', ?, NULL, NULL, ?)
       `).run(input.messageId, input.sender.agentId, input.recipient.agentId, input.sourceEntryId, input.payloadDigest,
-        input.deliveryTiming, input.responseRequired ? 1 : 0, input.inReplyToRequestId ?? null, input.createdAtMs);
+        input.deliveryTiming, input.responseRequired ? 1 : 0, input.inReplyToRequestId ?? null, input.createdAtMs, input.onAccepted ?? "continue");
+      if (input.ownership) {
+        this.#database.prepare(`INSERT INTO activation_dependencies
+          (activation_id, dependency_kind, dependency_id, dependency_agent_id, created_at_ms)
+          VALUES (?, 'operation', ?, NULL, ?)`
+        ).run(input.ownership.runId, `acceptance:${input.messageId}`, input.createdAtMs);
+      }
       return mapMessage(this.#readMessage(input.messageId)!);
     });
   }
 
   discardUnacceptedMessage(sender: AgentReference, messageId: string): boolean {
-    this.#assertWorkflow(sender.workflowOwnerId);
-    return Number(this.#database.prepare("DELETE FROM direct_signal_messages WHERE message_id = ? AND sender_agent_id = ? AND delivery_status = 'bound'").run(messageId, sender.agentId).changes) === 1;
+    return this.#withTransaction(() => {
+      this.#assertWorkflow(sender.workflowOwnerId);
+      const removed = Number(this.#database.prepare("DELETE FROM direct_signal_messages WHERE message_id = ? AND sender_agent_id = ? AND delivery_status = 'bound'").run(messageId, sender.agentId).changes) === 1;
+      if (removed) this.#database.prepare(`DELETE FROM activation_dependencies WHERE dependency_kind = 'operation'
+        AND dependency_id = ? AND activation_id IN (SELECT activation_id FROM agent_activations WHERE agent_id = ?)`
+      ).run(`acceptance:${messageId}`, sender.agentId);
+      return removed;
+    });
+  }
+
+  reconcileAcceptedMessage(sender: AgentReference, messageId: string, ownership?: AgentRunOwnership): QueuedSignalReceipt | undefined {
+    return this.#withTransaction(() => {
+      this.#assertWorkflow(sender.workflowOwnerId);
+      const message = this.#readMessage(messageId);
+      if (!message || message.sender_agent_id !== sender.agentId || message.delivery_status === "bound") return undefined;
+      if (ownership) {
+        if (message.on_accepted === "complete") {
+          commitMechanicalCompletion(this.#database, ownership, {
+            kind: "terminal-message", messageId: message.message_id, sourceEntryId: message.source_entry_id,
+          }, Number(message.accepted_at_ms));
+          return receiptFor(message);
+        }
+        this.#assertRouterOwnership(sender, ownership);
+        this.#database.prepare(`
+          DELETE FROM activation_dependencies
+          WHERE activation_id = (
+            SELECT activation_id FROM agent_activations
+            WHERE agent_id = ? AND phase = 'open'
+            ORDER BY activation_sequence DESC LIMIT 1
+          ) AND dependency_kind = 'operation' AND dependency_id = ?
+        `).run(sender.agentId, `acceptance:${messageId}`);
+        this.#database.prepare(`
+          UPDATE agent_activations SET open_state = 'active', revision = revision + 1
+          WHERE agent_id = ? AND phase = 'open' AND open_state = 'waiting'
+            AND NOT EXISTS (
+              SELECT 1 FROM activation_dependencies
+              WHERE activation_id = agent_activations.activation_id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM human_interrupts
+              WHERE agent_id = ? AND status IN ('pending', 'response-bound', 'result-pending')
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM workflow_requests
+              WHERE requester_agent_id = ? AND status != 'resolved'
+            )
+        `).run(sender.agentId, sender.agentId, sender.agentId);
+      }
+      return receiptFor(message);
+    });
   }
 
   /** The ready Router endpoint is an external-process prepare barrier. */
@@ -335,10 +396,16 @@ export class DirectSignalStore {
       this.#database.prepare("INSERT INTO ownership_epochs (resource_id, last_epoch) VALUES (?, ?) ON CONFLICT (resource_id) DO UPDATE SET last_epoch = excluded.last_epoch").run(resourceId, epoch);
       this.#database.prepare("INSERT INTO ownership (resource_id, owner_id, fencing_epoch) VALUES (?, ?, ?)").run(resourceId, input.runId, epoch);
       this.#database.prepare("INSERT INTO fenced_state (resource_id, state_key, value, fencing_epoch) VALUES (?, 'agent-run-checkpoint', ?, ?) ON CONFLICT (resource_id, state_key) DO UPDATE SET value = excluded.value, fencing_epoch = excluded.fencing_epoch").run(resourceId, input.checkpoint, epoch);
-      const prior = this.#database.prepare("SELECT activation_sequence FROM agent_activations WHERE agent_id = ? ORDER BY activation_sequence DESC LIMIT 1").get(input.recipient.agentId) as { activation_sequence: number } | undefined;
+      const prior = this.#database.prepare("SELECT activation_id, activation_sequence FROM agent_activations WHERE agent_id = ? ORDER BY activation_sequence DESC LIMIT 1").get(input.recipient.agentId) as { activation_id: string; activation_sequence: number } | undefined;
       if (!prior) throw new WorkflowProtocolError("RecipientEnded", `Agent ${input.recipient.agentId} has no activation to reactivate`);
       this.#database.prepare(`INSERT INTO agent_activations (activation_id, agent_id, run_id, fencing_epoch, activation_sequence, revision, turn_sequence, phase, open_state, ended_outcome, failure_error, failure_exit_code, interrupt_turn_sequence, interrupt_requested_at_ms, created_at_ms, updated_at_ms)
-        VALUES (?, ?, ?, ?, ?, 1, 1, 'open', 'active', NULL, NULL, NULL, NULL, NULL, ?, ?)`).run(input.runId, input.recipient.agentId, input.runId, epoch, Number(prior.activation_sequence) + 1, input.acceptedAtMs, input.acceptedAtMs);
+        VALUES (?, ?, ?, ?, ?, 1, 1, 'open', ?, NULL, NULL, NULL, NULL, NULL, ?, ?)`).run(input.runId, input.recipient.agentId, input.runId, epoch, Number(prior.activation_sequence) + 1,
+          this.#database.prepare("SELECT 1 FROM activation_dependencies WHERE activation_id = ? AND dependency_kind = 'operation' LIMIT 1").get(prior.activation_id) ? "waiting" : "active",
+          input.acceptedAtMs, input.acceptedAtMs);
+      this.#database.prepare(`INSERT INTO activation_dependencies (activation_id, dependency_kind, dependency_id, dependency_agent_id, created_at_ms)
+        SELECT ?, dependency_kind, dependency_id, dependency_agent_id, ? FROM activation_dependencies
+        WHERE activation_id = ? AND dependency_kind = 'operation'`).run(input.runId, input.acceptedAtMs, prior.activation_id);
+      this.#database.prepare("DELETE FROM activation_dependencies WHERE activation_id = ? AND dependency_kind = 'operation'").run(prior.activation_id);
       this.#database.prepare(`INSERT INTO recipient_inbox_routers (agent_id, endpoint, run_id, fencing_epoch, registered_at_ms)
         VALUES (?, ?, ?, ?, ?) ON CONFLICT (agent_id) DO UPDATE SET endpoint = excluded.endpoint, run_id = excluded.run_id, fencing_epoch = excluded.fencing_epoch, registered_at_ms = excluded.registered_at_ms`).run(input.recipient.agentId, input.endpoint, input.runId, epoch, input.acceptedAtMs);
       const sequence = this.#nextAcceptanceSequence(input.recipient.agentId);
@@ -378,7 +445,7 @@ export class DirectSignalStore {
       throw new WorkflowProtocolError("AgentRunAlreadyOwned", `Prepared Router for Agent ${input.recipient.agentId} conflicts with durable ownership`);
     }
     const activation = this.#database.prepare("SELECT run_id, fencing_epoch, phase, open_state FROM agent_activations WHERE agent_id = ? ORDER BY activation_sequence DESC LIMIT 1").get(input.recipient.agentId) as { run_id: string; fencing_epoch: number; phase: string; open_state: string | null } | undefined;
-    if (!activation || activation.run_id !== ownership.owner_id || Number(activation.fencing_epoch) !== Number(ownership.fencing_epoch) || activation.phase !== "open" || activation.open_state !== "active") {
+    if (!activation || activation.run_id !== ownership.owner_id || Number(activation.fencing_epoch) !== Number(ownership.fencing_epoch) || activation.phase !== "open" || !["active", "waiting"].includes(activation.open_state ?? "")) {
       throw new WorkflowProtocolError("AgentRunAlreadyOwned", `Prepared Router for Agent ${input.recipient.agentId} has no matching active activation`);
     }
     return { ...input.recipient, runId: ownership.owner_id, epoch: Number(ownership.fencing_epoch), resourceId };
@@ -414,6 +481,9 @@ export class DirectSignalStore {
       if (input.request.inReplyToRequestId) this.#claimAnswerSlot(input.request);
       const sequence = this.#nextAcceptanceSequence(input.recipient.agentId);
       this.#database.prepare(`UPDATE direct_signal_messages SET acceptance_sequence = ?, delivery_status = 'queued', accepted_at_ms = ?, reactivates_recipient = ? WHERE message_id = ? AND delivery_status = 'bound'`).run(sequence, input.acceptedAtMs, reactivatesRecipient ? 1 : 0, input.request.messageId);
+      this.#database.prepare(`DELETE FROM activation_dependencies WHERE dependency_kind = 'operation'
+        AND dependency_id = ? AND activation_id IN (SELECT activation_id FROM agent_activations WHERE agent_id = ?)`
+      ).run(`acceptance:${input.request.messageId}`, input.request.senderAgentId);
       if (input.request.responseRequired) this.#createRequest(input.request);
       this.#database.prepare(`
         INSERT INTO pending_message_pointers (
@@ -423,6 +493,17 @@ export class DirectSignalStore {
       `).run(input.request.messageId, input.request.senderAgentId, input.request.recipientAgentId, input.request.sourceEntryId,
         input.request.payloadDigest, input.request.deliveryTiming, input.request.responseRequired ? 1 : 0,
         reactivatesRecipient ? 1 : 0, input.request.inReplyToRequestId ?? null, sequence, input.acceptedAtMs);
+      if (input.request.completion) {
+        if (input.request.responseRequired) throw new WorkflowProtocolError("InvalidCompletionMessage", "Terminal completion cannot create a Response Requirement");
+        if (input.request.onAccepted !== "complete") throw new WorkflowProtocolError("InvalidCompletionMessage", "Completion marker requires onAccepted complete");
+        if (input.request.completion.ownership.agentId !== input.request.senderAgentId
+          || input.request.completion.ownership.workflowOwnerId !== input.request.workflowOwnerId) {
+          throw new WorkflowProtocolError("InvalidCompletionMessage", "Completion ownership does not match the message sender");
+        }
+        commitMechanicalCompletion(this.#database, input.request.completion.ownership, {
+          kind: "terminal-message", messageId: input.request.messageId, sourceEntryId: input.request.sourceEntryId,
+        }, input.acceptedAtMs);
+      }
       return { receipt: { status: "queued", messageId: input.request.messageId, recipientAgentId: input.request.recipientAgentId, acceptanceSequence: sequence }, delivery: "schedule" };
     });
   }
@@ -466,6 +547,15 @@ export class DirectSignalStore {
   recipientLifecycle(recipient: AgentReference): "owner" | "active" | "waiting" | "waiting-human" | "interrupted" | "ended" { this.#assertWorkflow(recipient.workflowOwnerId); return this.#recipientLifecycle(recipient); }
   inspectMessage(owner: string, messageId: string): DirectSignalRecord | undefined { this.#assertWorkflow(owner); const row = this.#readMessage(messageId); return row ? mapMessage(row) : undefined; }
   listMessages(owner: string): DirectSignalRecord[] { this.#assertWorkflow(owner); return (this.#database.prepare("SELECT * FROM direct_signal_messages ORDER BY created_at_ms, message_id").all() as unknown as MessageRow[]).map(mapMessage); }
+  listBoundMessages(sender: AgentReference): DirectSignalRecord[] {
+    this.#assertWorkflow(sender.workflowOwnerId);
+    return (this.#database.prepare("SELECT * FROM direct_signal_messages WHERE sender_agent_id = ? AND delivery_status = 'bound' ORDER BY created_at_ms, message_id").all(sender.agentId) as unknown as MessageRow[]).map(mapMessage);
+  }
+  terminalMessageCompleted(sender: AgentReference, messageId: string): boolean {
+    this.#assertWorkflow(sender.workflowOwnerId);
+    return Boolean(this.#database.prepare(`SELECT 1 FROM activation_completions
+      WHERE agent_id = ? AND source_kind = 'terminal-message' AND source_identity = ?`).get(sender.agentId, messageId));
+  }
   inspectRequest(owner: string, requestId: string): RequestRecord | undefined { this.#assertWorkflow(owner); const row = this.#readRequest(requestId); return row ? mapRequest(row) : undefined; }
   listRequests(requester: AgentReference): RequestRecord[] { this.#assertWorkflow(requester.workflowOwnerId); return (this.#database.prepare("SELECT * FROM workflow_requests WHERE requester_agent_id = ? ORDER BY request_id").all(requester.agentId) as unknown as RequestRow[]).map(mapRequest); }
   listPending(recipient: AgentReference): PendingMessagePointer[] { this.#assertWorkflow(recipient.workflowOwnerId); this.#requireAgent(recipient.agentId); return (this.#database.prepare("SELECT * FROM pending_message_pointers WHERE recipient_agent_id = ? ORDER BY acceptance_sequence").all(recipient.agentId) as unknown as PointerRow[]).map(mapPointer); }
@@ -503,6 +593,7 @@ export class DirectSignalStore {
         recipient_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id), source_entry_id TEXT NOT NULL,
         payload_digest TEXT NOT NULL, delivery_timing TEXT NOT NULL CHECK (delivery_timing IN ('steer', 'deferred')),
         response_required INTEGER NOT NULL CHECK (response_required IN (0, 1)),
+        on_accepted TEXT NOT NULL DEFAULT 'continue' CHECK (on_accepted IN ('continue', 'complete')),
         reactivates_recipient INTEGER NOT NULL DEFAULT 0 CHECK (reactivates_recipient IN (0, 1)), in_reply_to_request_id TEXT,
         acceptance_sequence INTEGER, delivery_status TEXT NOT NULL CHECK (delivery_status IN ('bound', 'queued', 'delivered')),
         created_at_ms INTEGER NOT NULL, accepted_at_ms INTEGER, delivered_at_ms INTEGER,
@@ -520,9 +611,12 @@ export class DirectSignalStore {
         UNIQUE (recipient_agent_id, acceptance_sequence)
       ) STRICT;
       CREATE INDEX IF NOT EXISTS pending_message_recipient_order ON pending_message_pointers (recipient_agent_id, acceptance_sequence);
+      CREATE INDEX IF NOT EXISTS bound_message_sender_order ON direct_signal_messages (sender_agent_id, created_at_ms, message_id) WHERE delivery_status = 'bound';
     `);
     this.#ensureColumn("direct_signal_messages", "reactivates_recipient", "INTEGER NOT NULL DEFAULT 0 CHECK (reactivates_recipient IN (0, 1))");
+    this.#ensureColumn("direct_signal_messages", "on_accepted", "TEXT NOT NULL DEFAULT 'continue' CHECK (on_accepted IN ('continue', 'complete'))");
     this.#ensureColumn("pending_message_pointers", "reactivates_recipient", "INTEGER NOT NULL DEFAULT 0 CHECK (reactivates_recipient IN (0, 1))");
+    initializeCompletionSchema(this.#database);
   }
 
   #ensureColumn(table: string, column: string, definition: string): void {
@@ -675,14 +769,14 @@ export class DirectSignalStore {
 
 function mapMessage(row: MessageRow): DirectSignalRecord {
   const answer = row.in_reply_to_request_id ? { kind: "answer" as const, inReplyToRequestId: row.in_reply_to_request_id } : row.response_required ? { kind: "request" as const } : { kind: "signal" as const };
-  return { messageId: row.message_id, ...answer, senderAgentId: row.sender_agent_id, recipientAgentId: row.recipient_agent_id, sourceEntryId: row.source_entry_id, payloadDigest: row.payload_digest, deliveryTiming: row.delivery_timing, responseRequired: Number(row.response_required) === 1, ...(row.acceptance_sequence == null ? {} : { acceptanceSequence: Number(row.acceptance_sequence) }), deliveryStatus: row.delivery_status, createdAtMs: Number(row.created_at_ms), ...(row.accepted_at_ms == null ? {} : { acceptedAtMs: Number(row.accepted_at_ms) }), ...(row.delivered_at_ms == null ? {} : { deliveredAtMs: Number(row.delivered_at_ms) }) };
+  return { messageId: row.message_id, ...answer, senderAgentId: row.sender_agent_id, recipientAgentId: row.recipient_agent_id, sourceEntryId: row.source_entry_id, payloadDigest: row.payload_digest, deliveryTiming: row.delivery_timing, responseRequired: Number(row.response_required) === 1, onAccepted: row.on_accepted, ...(row.acceptance_sequence == null ? {} : { acceptanceSequence: Number(row.acceptance_sequence) }), deliveryStatus: row.delivery_status, createdAtMs: Number(row.created_at_ms), ...(row.accepted_at_ms == null ? {} : { acceptedAtMs: Number(row.accepted_at_ms) }), ...(row.delivered_at_ms == null ? {} : { deliveredAtMs: Number(row.delivered_at_ms) }) };
 }
 function mapPointer(row: PointerRow): PendingMessagePointer { return { messageId: row.message_id, senderAgentId: row.sender_agent_id, recipientAgentId: row.recipient_agent_id, sourceEntryId: row.source_entry_id, payloadDigest: row.payload_digest, deliveryTiming: row.delivery_timing, responseRequired: Number(row.response_required) === 1, reactivatesRecipient: Number(row.reactivates_recipient) === 1, ...(row.in_reply_to_request_id ? { inReplyToRequestId: row.in_reply_to_request_id } : {}), acceptanceSequence: Number(row.acceptance_sequence), acceptedAtMs: Number(row.accepted_at_ms) }; }
 function mapRequest(row: RequestRow): RequestRecord { return { requestId: row.request_id, requesterAgentId: row.requester_agent_id, responderAgentId: row.responder_agent_id, answerDeliveryTiming: row.answer_delivery_timing, status: row.status, ...(row.answer_message_id ? { answerMessageId: row.answer_message_id } : {}) }; }
 function receiptFor(row: MessageRow) { if (row.acceptance_sequence == null) throw new Error(`Unaccepted Message ${row.message_id} has no receipt`); return { status: row.delivery_status === "delivered" ? "delivered" as const : "queued" as const, messageId: row.message_id, recipientAgentId: row.recipient_agent_id, acceptanceSequence: Number(row.acceptance_sequence) }; }
-function assertSameBinding(row: MessageRow, request: { sender: AgentReference; recipient: AgentReference; sourceEntryId: string; payloadDigest: string; deliveryTiming: SignalDeliveryTiming; responseRequired: boolean; inReplyToRequestId?: string } | SignalAcceptRequest): void {
+function assertSameBinding(row: MessageRow, request: { sender: AgentReference; recipient: AgentReference; sourceEntryId: string; payloadDigest: string; deliveryTiming: SignalDeliveryTiming; responseRequired: boolean; inReplyToRequestId?: string; onAccepted?: "continue" | "complete" } | SignalAcceptRequest): void {
   const sender = "sender" in request ? request.sender.agentId : request.senderAgentId; const recipient = "recipient" in request ? request.recipient.agentId : request.recipientAgentId;
-  const matches = row.sender_agent_id === sender && row.recipient_agent_id === recipient && row.source_entry_id === request.sourceEntryId && row.payload_digest === request.payloadDigest && row.delivery_timing === request.deliveryTiming && Number(row.response_required) === (request.responseRequired ? 1 : 0) && row.in_reply_to_request_id === (request.inReplyToRequestId ?? null);
+  const matches = row.sender_agent_id === sender && row.recipient_agent_id === recipient && row.source_entry_id === request.sourceEntryId && row.payload_digest === request.payloadDigest && row.delivery_timing === request.deliveryTiming && Number(row.response_required) === (request.responseRequired ? 1 : 0) && row.in_reply_to_request_id === (request.inReplyToRequestId ?? null) && row.on_accepted === (request.onAccepted ?? "continue");
   if (!matches) throw new WorkflowProtocolError("MessageIdentityConflict", `Message Identity ${"messageId" in request ? request.messageId : row.message_id} is already bound to different routing or source metadata`);
 }
 

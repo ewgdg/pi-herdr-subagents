@@ -10,6 +10,7 @@ import {
   type FramedIpcServer,
 } from "../coordination/framed-ipc.ts";
 import { resolveCanonicalSignal, signalDeliveryTiming } from "./direct-signal-transcript.ts";
+import { CompletionRejectedError, type CompletionBlocker } from "./completion-gate.ts";
 import { DirectSignalStore } from "./sqlite-message-store.ts";
 import {
   WorkflowProtocolError,
@@ -324,6 +325,12 @@ function parseSignalRequest(value: unknown): SignalAcceptRequest {
   if (candidate.inReplyToRequestId !== undefined && (typeof candidate.inReplyToRequestId !== "string" || !candidate.inReplyToRequestId)) {
     throw new TypeError("Signal acceptance inReplyToRequestId must be a non-empty string");
   }
+  if (candidate.onAccepted !== "continue" && candidate.onAccepted !== "complete") {
+    throw new TypeError("Signal acceptance onAccepted must be continue or complete");
+  }
+  if ((candidate.onAccepted === "complete") !== Boolean(candidate.completion)) {
+    throw new TypeError("Signal acceptance completion marker must match onAccepted");
+  }
   return {
     ...candidate,
     deliveryTiming: signalDeliveryTiming(candidate.deliveryTiming),
@@ -344,7 +351,8 @@ async function sendRejected(
   connection.end();
 }
 
-function normalizeReplyError(error: unknown): { code?: string; message: string } {
+function normalizeReplyError(error: unknown): { code?: string; message: string; blockers?: CompletionBlocker[] } {
+  if (error instanceof CompletionRejectedError) return { code: error.code, message: error.message, blockers: error.blockers };
   if (error instanceof WorkflowProtocolError) return { code: error.code, message: error.message };
   return { message: error instanceof Error ? error.message : String(error) };
 }

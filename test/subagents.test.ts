@@ -1298,7 +1298,7 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_done",
+      "read,bash,web_search,caller_ping,subagent_done,agent_complete",
     );
   });
 
@@ -1310,7 +1310,7 @@ describe("subagent discovery", () => {
   it("preserves explicitly requested agent_inspect without widening other allowlists", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,agent_inspect"),
-      "read,agent_inspect,caller_ping,subagent_done",
+      "read,agent_inspect,caller_ping,subagent_done,agent_complete",
     );
   });
 
@@ -1591,6 +1591,62 @@ describe("subagent-done.ts", () => {
           role,
         );
       }
+    } finally {
+      if (prior === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key];
+      else (globalThis as Record<PropertyKey, unknown>)[key] = prior;
+    }
+  });
+
+  it("awaits child startup reconciliation and suppresses the first provider turn after terminal recovery", async () => {
+    const key = Symbol.for("pi-herdr-subagents.child-workflow-bootstrap");
+    const prior = (globalThis as Record<PropertyKey, unknown>)[key];
+    let releaseReconciliation!: () => void;
+    const reconciliation = new Promise<void>((resolve) => { releaseReconciliation = resolve; });
+    let terminalCompletion: (() => void) | undefined;
+    let shutdown = false;
+    try {
+      (globalThis as Record<PropertyKey, unknown>)[key] = {
+        workflow: {},
+        humanInterruptActorRole: "ordinary",
+        sessionStarted() {},
+        async waitUntilReady() {},
+        async waitUntilHumanInterruptRoleReady() { return "ordinary"; },
+        async startDirectSignalRouter(input: { onTerminalCompletion(): void }) {
+          terminalCompletion = input.onTerminalCompletion;
+        },
+        async reconcilePendingDirectSignals(options: { waitForResolution?: boolean }) {
+          assert.deepEqual(options, { waitForResolution: true });
+          await reconciliation;
+          terminalCompletion?.();
+          return { terminalCompletion: true };
+        },
+        currentHumanInterrupt() { return undefined; },
+        bindHumanResponse() { return undefined; },
+        confirmHumanResponseResult() { return undefined; },
+        releaseDeferredSignals() {},
+        confirmDirectSignalDelivery() { return false; },
+        pendingUndeclaredNotice() { return undefined; },
+      };
+      const { api, eventHandlers } = createMockExtensionApi();
+      subagentDoneExtension(api);
+      const sessionStart = eventHandlers.get("session_start")?.[0];
+      assert.ok(sessionStart);
+      const startup = sessionStart({}, {
+        sessionManager: { getEntries: () => [], getSessionFile: () => "/tmp/recovered.jsonl" },
+        ui: { setWidget() {}, notify() {} },
+        shutdown() { shutdown = true; },
+      });
+      let startupResolved = false;
+      void Promise.resolve(startup).then(() => { startupResolved = true; });
+      await Promise.resolve();
+      assert.equal(startupResolved, false);
+      assert.equal(shutdown, false);
+
+      releaseReconciliation();
+      await startup;
+      assert.equal(shutdown, true, "terminal recovery must request shutdown before startup releases");
+      const providerRequests = shutdown ? 0 : 1;
+      assert.equal(providerRequests, 0);
     } finally {
       if (prior === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key];
       else (globalThis as Record<PropertyKey, unknown>)[key] = prior;
@@ -2554,6 +2610,22 @@ describe("subagent parent lifecycle", () => {
 
     assert.ok(running.abortController);
     assert.deepEqual(events, ["started", "watched", "completed"]);
+  });
+
+  it("cleans up a protocol-completed legacy run without relaying a duplicate result", async () => {
+    const events: string[] = [];
+    const running = { id: "protocol-child", abortController: undefined as AbortController | undefined };
+    await superviseLegacyAgentRun(running, {
+      supervisor: { async watch() { return { summary: "legacy result" }; } },
+      ownership: { watchCompleted() { events.push("checked"); return false; } },
+      resultRelay: {
+        completed() { assert.fail("protocol completion must suppress legacy result relay"); },
+        suppressed(relayedRun) { assert.equal(relayedRun, running); events.push("removed"); },
+        failed() { assert.fail("protocol completion must not fail"); },
+      },
+      ui: { runStarted() { events.push("started"); } },
+    });
+    assert.deepEqual(events, ["started", "checked", "removed"]);
   });
 
   it("relays legacy Agent Run supervision failures once", async () => {

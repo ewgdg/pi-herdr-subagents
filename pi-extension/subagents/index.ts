@@ -815,7 +815,7 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
+const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done", "agent_complete"] as const;
 
 /**
  * Build the child --tools allowlist.
@@ -2068,6 +2068,7 @@ function createDefaultLegacyAgentRunAdapters(pi: ExtensionAPI): ConfiguredLegacy
     },
     watchCompleted(running, result) {
       if (running.workflowOwnership) {
+        if (runtime.workflowBootstrap.wasProtocolCompleted(running.workflowOwnership)) return false;
         runtime.workflowBootstrap.runTerminated(
           running.workflowOwnership,
           hasConfirmedAgentRunTermination(result),
@@ -2092,21 +2093,38 @@ function subagentsExtensionWithOptions(
 
   // Capture the UI context for widget updates and restore presentation for
   // subagents whose watchers survived a reload.
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     legacyAgentRunAdapters.ui.sessionStarted(ctx);
-    if (ctx.sessionManager?.getSessionFile?.()) {
-      void startDirectSignalRouter(pi, runtime.workflowBootstrap, ctx).catch((error) => {
-        ctx.ui.notify(`Direct Signal Router failed to start: ${(error as Error).message}`, "error");
-      });
+    try {
+      runtime.workflowBootstrap.sessionStarted(ctx);
+      const sessionFile = ctx.sessionManager?.getSessionFile?.();
+      if (sessionFile && existsSync(sessionFile)) {
+        await startDirectSignalRouter(pi, runtime.workflowBootstrap, ctx);
+      }
+    } catch (error) {
+      ctx.ui.notify(`Workflow startup failed: ${(error as Error).message}`, "error");
+      ctx.shutdown();
+      throw error;
     }
   });
 
-  pi.on("before_agent_start", (_event, ctx) => {
-    if (runtime.workflowBootstrap.workflow) {
-      confirmProjectedInboxBatches(
-        runtime.workflowBootstrap,
-        ctx.sessionManager.getEntries(),
-      );
+  pi.on("before_agent_start", async (_event, ctx) => {
+    try {
+      runtime.workflowBootstrap.sessionStarted(ctx);
+      const sessionFile = ctx.sessionManager?.getSessionFile?.();
+      if (sessionFile && existsSync(sessionFile)) {
+        await startDirectSignalRouter(pi, runtime.workflowBootstrap, ctx);
+      }
+      if (runtime.workflowBootstrap.workflow) {
+        confirmProjectedInboxBatches(
+          runtime.workflowBootstrap,
+          ctx.sessionManager.getEntries(),
+        );
+      }
+    } catch (error) {
+      ctx.ui.notify(`Workflow turn preparation failed: ${(error as Error).message}`, "error");
+      ctx.shutdown();
+      throw error;
     }
   });
 

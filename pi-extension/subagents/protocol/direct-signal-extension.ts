@@ -7,7 +7,9 @@ import { randomUUID } from "node:crypto";
 import type { InboxBatch } from "./direct-signal.ts";
 import { WorkflowBootstrap } from "./workflow-bootstrap.ts";
 import { WorkflowProtocolError } from "./workflow-types.ts";
-import { findAgentSendToolCall } from "./direct-signal-transcript.ts";
+import { assertSoleToolCall, findAgentSendToolCall } from "./direct-signal-transcript.ts";
+import { CompletionRejectedError } from "./completion-gate.ts";
+import { completionBlockedResult } from "./completion-extension.ts";
 
 const INBOX_BATCH_CUSTOM_TYPE = "agent_inbox_batch";
 
@@ -24,14 +26,16 @@ const SpawnSpec = Type.Object({
 const SpawnTarget = Type.Object({ spawn: SpawnSpec }, { additionalProperties: false });
 const Message = Type.String({ minLength: 1, description: "Plain actionable message content" });
 const Timing = Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("deferred")]));
+const Continue = Type.Literal("continue");
+const TerminalDisposition = Type.Union([Continue, Type.Literal("complete")]);
 
 /** Complete legal send forms; Request targets derive timing from their Request. */
 export const AgentSendParams = Type.Union([
-  Type.Object({ target: AgentTarget, message: Message, timing: Timing, responseRequired: Type.Optional(Type.Literal(false)) }, { additionalProperties: false }),
-  Type.Object({ target: AgentTarget, message: Message, timing: Timing, responseRequired: Type.Literal(true) }, { additionalProperties: false }),
-  Type.Object({ target: RequestTarget, message: Message, responseRequired: Type.Optional(Type.Literal(false)) }, { additionalProperties: false }),
-  Type.Object({ target: RequestTarget, message: Message, responseRequired: Type.Literal(true) }, { additionalProperties: false }),
-  Type.Object({ target: SpawnTarget, message: Message, responseRequired: Type.Literal(true) }, { additionalProperties: false }),
+  Type.Object({ target: AgentTarget, message: Message, timing: Timing, responseRequired: Type.Optional(Type.Literal(false)), onAccepted: TerminalDisposition }, { additionalProperties: false }),
+  Type.Object({ target: AgentTarget, message: Message, timing: Timing, responseRequired: Type.Literal(true), onAccepted: Continue }, { additionalProperties: false }),
+  Type.Object({ target: RequestTarget, message: Message, responseRequired: Type.Optional(Type.Literal(false)), onAccepted: TerminalDisposition }, { additionalProperties: false }),
+  Type.Object({ target: RequestTarget, message: Message, responseRequired: Type.Literal(true), onAccepted: Continue }, { additionalProperties: false }),
+  Type.Object({ target: SpawnTarget, message: Message, responseRequired: Type.Literal(true), onAccepted: Continue }, { additionalProperties: false }),
 ]);
 
 export async function startDirectSignalRouter(
@@ -74,7 +78,9 @@ export async function startDirectSignalRouter(
         details: {},
       }, { triggerTurn: true, deliverAs: "steer" });
     },
+    onTerminalCompletion() { context.shutdown(); },
   });
+  await workflowBootstrap.reconcilePendingDirectSignals?.({ waitForResolution: true });
 }
 
 async function waitForProjectedInboxMessage(context: ExtensionContext, messageId: string): Promise<void> {
@@ -150,6 +156,7 @@ export function registerAgentSendTool(
           params.message,
           undefined,
           true,
+          params.onAccepted,
         );
         if (!options.spawnInitialRequest) {
           throw new WorkflowProtocolError("RecipientUnreachable", "Spawned Initial Request launcher is unavailable");
@@ -194,19 +201,36 @@ export function registerAgentSendTool(
         params.message,
         "agent" in params.target ? params.timing : undefined,
         params.responseRequired === true,
+        params.onAccepted,
       );
-      const receipt = await workflowBootstrap.sendDirectMessage({
-        target: "agent" in params.target
-          ? { agentId: params.target.agent }
-          : { requestId: params.target.request },
-        message: params.message,
-        sourceEntryId: toolCallId,
-        deliveryTiming: "agent" in params.target ? params.timing : undefined,
-        responseRequired: params.responseRequired,
-        ...(options.prepareEndedRecipient && "agent" in params.target
-          ? { prepareEndedRecipient: (request) => options.prepareEndedRecipient!({ request, context }) }
-          : {}),
-      });
+      if (params.onAccepted === "complete") assertSoleToolCall(context.sessionManager.getEntries(), toolCallId);
+      let receipt;
+      try {
+        receipt = await workflowBootstrap.sendDirectMessage({
+          target: "agent" in params.target
+            ? { agentId: params.target.agent }
+            : { requestId: params.target.request },
+          message: params.message,
+          sourceEntryId: toolCallId,
+          deliveryTiming: "agent" in params.target ? params.timing : undefined,
+          responseRequired: params.responseRequired,
+          onAccepted: params.onAccepted,
+          ...(options.prepareEndedRecipient && "agent" in params.target
+            ? { prepareEndedRecipient: (request) => options.prepareEndedRecipient!({ request, context }) }
+            : {}),
+        });
+      } catch (error) {
+        if (error instanceof CompletionRejectedError) return completionBlockedResult(error);
+        throw error;
+      }
+      if (params.onAccepted === "complete") {
+        try {
+          await workflowBootstrap.closeDirectSignalRouter();
+        } catch (error) {
+          console.warn("Activation completed, but local Router cleanup failed", error);
+        }
+        queueMicrotask(() => context.shutdown());
+      }
       return {
         content: [{
           type: "text",
@@ -215,6 +239,7 @@ export function registerAgentSendTool(
             `(acceptance sequence ${receipt.acceptanceSequence}).`,
         }],
         details: receipt,
+        ...(params.onAccepted === "complete" ? { terminate: true } : {}),
       };
     },
   });
@@ -312,6 +337,7 @@ function assertCanonicalAgentSendSource(
   message: string,
   deliveryTiming: "steer" | "deferred" | undefined,
   responseRequired: boolean,
+  onAccepted: "continue" | "complete",
 ): void {
   const toolCall = findAgentSendToolCall(entries, toolCallId);
   const found = toolCall?.arguments.target?.agent === target.agent
@@ -320,7 +346,8 @@ function assertCanonicalAgentSendSource(
     && toolCall.arguments.target?.spawn?.name === target.spawn?.name
     && toolCall.arguments.message === message
     && toolCall.arguments.timing === deliveryTiming
-    && (toolCall.arguments.responseRequired === true) === responseRequired;
+    && (toolCall.arguments.responseRequired === true) === responseRequired
+    && toolCall.arguments.onAccepted === onAccepted;
   if (!found) {
     throw new Error(`agent_send tool call ${toolCallId} is not durable in the sender transcript`);
   }

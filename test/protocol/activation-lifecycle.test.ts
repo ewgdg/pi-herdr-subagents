@@ -471,7 +471,7 @@ describe("canonical activation lifecycle scenarios", () => {
     runtime.close();
   });
 
-  it("does not leak dependencies from a failed activation into unrelated later work", async () => {
+  it("carries unresolved operation dependencies into recovery work", async () => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime } = scenario.createOwner();
     const session = scenario.childSession(runtime, "worker");
@@ -489,9 +489,9 @@ describe("canonical activation lifecycle scenarios", () => {
     runtime.confirmAgentRunExit(firstRun, { error: "first activation failed" });
 
     const replacement = runtime.startAgentRun(reference);
-    assert.deepEqual(runtime.settleActivation(replacement).state, {
+    assert.deepEqual(runtime.inspectActivation(reference)?.state, {
       kind: "waiting",
-      dependencies: [{ kind: "undeclared", dependencyId: "undeclared" }],
+      dependencies: [{ kind: "operation", dependencyId: "old-operation" }],
     });
 
     runtime.confirmAgentRunExit(replacement, { error: "test cleanup" });

@@ -10,8 +10,68 @@ import {
   sessionContainsInboxMessage,
   startDirectSignalRouter,
 } from "../../pi-extension/subagents/protocol/direct-signal-extension.ts";
+import { CompletionRejectedError } from "../../pi-extension/subagents/protocol/completion-gate.ts";
 
 describe("direct Signal Pi transcript projection", () => {
+  it("returns terminating fused-completion results and structured blocker details", async () => {
+    for (const blocked of [false, true]) {
+      let tool: any;
+      const params = { target: { agent: "recipient" }, message: "final", onAccepted: "complete" as const };
+      registerAgentSendTool({ registerTool(value: unknown) { tool = value; }, sendMessage() {} } as never, {
+        async waitUntilReady() {}, async startDirectSignalRouter() {},
+        async sendDirectMessage() {
+          if (blocked) throw new CompletionRejectedError([{ kind: "operation-dependency", dependencyId: "tool-1" }]);
+          return { status: "queued", messageId: "message-1", recipientAgentId: "recipient", acceptanceSequence: 1 };
+        },
+        async closeDirectSignalRouter() {},
+      } as never);
+      const result = await tool.execute("send-1", params, undefined, undefined, {
+        sessionManager: { getSessionFile: () => "session.jsonl", getEntries: () => [{ message: { content: [{ type: "toolCall", id: "send-1", name: "agent_send", arguments: params }] } }] },
+        shutdown() {},
+      });
+      if (blocked) assert.deepEqual(result.details, { code: "CompletionBlocked", blockers: [{ kind: "operation-dependency", dependencyId: "tool-1" }] });
+      else assert.equal(result.terminate, true);
+    }
+  });
+
+  it("rejects fused completion with a sibling tool before sending", async () => {
+    let tool: any;
+    let sends = 0;
+    const params = { target: { agent: "recipient" }, message: "final", onAccepted: "complete" as const };
+    registerAgentSendTool({ registerTool(value: unknown) { tool = value; }, sendMessage() {} } as never, {
+      async waitUntilReady() {}, async startDirectSignalRouter() {}, async sendDirectMessage() { sends += 1; },
+    } as never);
+    await assert.rejects(() => tool.execute("send-1", params, undefined, undefined, {
+      sessionManager: { getSessionFile: () => "session.jsonl", getEntries: () => [{ message: { content: [
+        { type: "toolCall", id: "send-1", name: "agent_send", arguments: params },
+        { type: "toolCall", id: "other-1", name: "read", arguments: {} },
+      ] } }] }, shutdown() {},
+    }), /sole tool call/);
+    assert.equal(sends, 0);
+  });
+
+  it("returns terminal fused success when post-commit Router cleanup fails", async () => {
+    let tool: any;
+    let shutdown = 0;
+    const params = { target: { agent: "recipient" }, message: "final", onAccepted: "complete" as const };
+    registerAgentSendTool({ registerTool(value: unknown) { tool = value; }, sendMessage() {} } as never, {
+      async waitUntilReady() {}, async startDirectSignalRouter() {},
+      async sendDirectMessage() { return { status: "queued", messageId: "message-1", recipientAgentId: "recipient", acceptanceSequence: 1 }; },
+      async closeDirectSignalRouter() { throw new Error("cleanup failed"); },
+    } as never);
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const result = await tool.execute("send-1", params, undefined, undefined, {
+        sessionManager: { getSessionFile: () => "session.jsonl", getEntries: () => [{ message: { content: [{ type: "toolCall", id: "send-1", name: "agent_send", arguments: params }] } }] },
+        shutdown() { shutdown += 1; },
+      });
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+      assert.equal(result.terminate, true);
+      assert.equal(shutdown, 1);
+    } finally { console.warn = originalWarn; }
+  });
+
   it("bridges a released Deferred batch through Pi as a non-aborting Steer", async () => {
     let projector: ((batch: Parameters<typeof projectInboxBatch>[0]) => void) | undefined;
     const workflowBootstrap = {
@@ -45,6 +105,36 @@ describe("direct Signal Pi transcript projection", () => {
       }),
       options: { triggerTurn: true, deliverAs: "steer" },
     }]);
+  });
+
+  it("keeps startup behind reconciliation and shuts down terminal recovery while idle", async () => {
+    let finishReconciliation!: () => void;
+    const reconciliation = new Promise<void>((resolve) => { finishReconciliation = resolve; });
+    let shutdown = 0;
+    let terminalCompletion: (() => void) | undefined;
+    const bootstrap = {
+      async waitUntilReady() {},
+      async startDirectSignalRouter(input: { onTerminalCompletion(): void }) {
+        terminalCompletion = input.onTerminalCompletion;
+      },
+      async reconcilePendingDirectSignals(options: { waitForResolution?: boolean }) {
+        assert.deepEqual(options, { waitForResolution: true });
+        await reconciliation;
+        terminalCompletion?.();
+        return { terminalCompletion: true };
+      },
+    };
+    const pending = startDirectSignalRouter({ sendMessage() {} } as never, bootstrap as never, {
+      sessionManager: { getEntries: () => [] }, shutdown() { shutdown += 1; },
+    } as never);
+    let resolved = false;
+    void pending.then(() => { resolved = true; });
+    await Promise.resolve();
+    assert.equal(resolved, false);
+    assert.equal(shutdown, 0);
+    finishReconciliation();
+    await pending;
+    assert.equal(shutdown, 1);
   });
 
   it("projects payload once while keeping identity and routing metadata structured", () => {
@@ -114,14 +204,14 @@ describe("direct Signal Pi transcript projection", () => {
 
   it("validates only the agent_send variants legal at runtime", () => {
     for (const params of [
-      { target: { agent: "agent" }, message: "signal" },
-      { target: { agent: "agent" }, message: "signal", timing: "deferred", responseRequired: false },
-      { target: { agent: "agent" }, message: "request", timing: "steer", responseRequired: true },
-      { target: { request: "request" }, message: "answer" },
-      { target: { request: "request" }, message: "answer", responseRequired: false },
-      { target: { request: "request" }, message: "answer and request", responseRequired: true },
-      { target: { spawn: { agent: "worker" } }, message: "initial request", responseRequired: true },
-      { target: { spawn: { agent: "worker", name: "Research helper" } }, message: "initial request", responseRequired: true },
+      { target: { agent: "agent" }, message: "signal", onAccepted: "continue" },
+      { target: { agent: "agent" }, message: "signal", timing: "deferred", responseRequired: false, onAccepted: "complete" },
+      { target: { agent: "agent" }, message: "request", timing: "steer", responseRequired: true, onAccepted: "continue" },
+      { target: { request: "request" }, message: "answer", onAccepted: "complete" },
+      { target: { request: "request" }, message: "answer", responseRequired: false, onAccepted: "continue" },
+      { target: { request: "request" }, message: "answer and request", responseRequired: true, onAccepted: "continue" },
+      { target: { spawn: { agent: "worker" } }, message: "initial request", responseRequired: true, onAccepted: "continue" },
+      { target: { spawn: { agent: "worker", name: "Research helper" } }, message: "initial request", responseRequired: true, onAccepted: "continue" },
     ]) assert.equal(Value.Check(AgentSendParams, params), true, JSON.stringify(params));
 
     assert.equal(Value.Check(AgentSendParams, {
@@ -133,6 +223,12 @@ describe("direct Signal Pi transcript projection", () => {
     assert.equal(Value.Check(AgentSendParams, {
       target: { spawn: { agent: "worker" } }, message: "illegal spawn timing", timing: "steer", responseRequired: true,
     }), false, "Spawn-target timing must be rejected by the registered schema");
+    assert.equal(Value.Check(AgentSendParams, {
+      target: { agent: "agent" }, message: "ignored settlement", onAccepted: "settle",
+    }), false, "Settle must not be silently accepted");
+    assert.equal(Value.Check(AgentSendParams, {
+      target: { agent: "agent" }, message: "request", responseRequired: true, onAccepted: "complete",
+    }), false, "A terminal message cannot create a Response Requirement");
   });
 
   it("routes a legal spawn form through the prepared Spawned Initial Request launcher", async () => {
@@ -150,6 +246,7 @@ describe("direct Signal Pi transcript projection", () => {
       target: { spawn: { agent: "worker", name: "Worker" } },
       message: "Initial work.",
       responseRequired: true,
+      onAccepted: "continue" as const,
     };
     const result = await registered.execute("tool-1", spawnParams, undefined, undefined, {
       sessionManager: {
@@ -189,6 +286,7 @@ describe("direct Signal Pi transcript projection", () => {
       target: { spawn: { agent: "worker", name: "Worker" } },
       message: "Initial work.",
       responseRequired: true,
+      onAccepted: "continue" as const,
     };
     const result = await registered.execute("tool-1", spawnParams, undefined, undefined, {
       sessionManager: {

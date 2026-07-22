@@ -34,6 +34,7 @@ export interface DirectSignalRecord {
   payloadDigest: string;
   deliveryTiming: SignalDeliveryTiming;
   responseRequired: boolean;
+  onAccepted: "continue" | "complete";
   inReplyToRequestId?: string;
   acceptanceSequence?: number;
   deliveryStatus: "bound" | "queued" | "delivered";
@@ -75,14 +76,18 @@ export interface SignalAcceptRequest {
   payloadDigest: string;
   deliveryTiming: SignalDeliveryTiming;
   responseRequired: boolean;
+  onAccepted?: "continue" | "complete";
   inReplyToRequestId?: string;
   message: string;
+  completion?: {
+    ownership: import("./workflow-types.ts").AgentRunOwnership;
+  };
 }
 
 export interface SignalReceiptReply {
   accepted: boolean;
   receipt?: QueuedSignalReceipt;
-  error?: { code?: string; message: string };
+  error?: { code?: string; message: string; blockers?: import("./completion-gate.ts").CompletionBlocker[] };
 }
 
 export interface AcceptedSignal {

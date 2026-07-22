@@ -278,6 +278,13 @@ export class ActivationLifecycleStore {
       }
       const sequence = Number(current?.activation_sequence ?? 0) + 1;
       const recoveredHuman = this.#unresolvedHumanInterrupt(ownership.agentId);
+      const recoveredOperations = current?.ended_outcome === "failed"
+        ? this.#database.prepare(`
+            SELECT dependency_id FROM activation_dependencies
+            WHERE activation_id = ? AND dependency_kind = 'operation'
+            ORDER BY dependency_id
+          `).all(current.activation_id) as Array<{ dependency_id: string }>
+        : [];
       this.#database.prepare(`
         INSERT INTO agent_activations (
           activation_id, agent_id, run_id, fencing_epoch, activation_sequence,
@@ -291,7 +298,7 @@ export class ActivationLifecycleStore {
         ownership.runId,
         ownership.epoch,
         sequence,
-        recoveredHuman ? "waiting" : "active",
+        recoveredHuman || recoveredOperations.length > 0 ? "waiting" : "active",
         now,
         now,
       );
@@ -300,6 +307,16 @@ export class ActivationLifecycleStore {
           UPDATE human_interrupts SET activation_id = ?, updated_at_ms = ?
           WHERE agent_id = ? AND tool_call_id = ?
         `).run(ownership.runId, now, ownership.agentId, recoveredHuman.tool_call_id);
+      }
+      for (const operation of recoveredOperations) {
+        this.#database.prepare(`
+          INSERT INTO activation_dependencies (
+            activation_id, dependency_kind, dependency_id, dependency_agent_id, created_at_ms
+          ) VALUES (?, 'operation', ?, NULL, ?)
+        `).run(ownership.runId, operation.dependency_id, now);
+      }
+      if (recoveredOperations.length > 0) {
+        this.#database.prepare("DELETE FROM activation_dependencies WHERE activation_id = ? AND dependency_kind = 'operation'").run(current!.activation_id);
       }
       return this.#requireCurrent(ownership.agentId, ownership.workflowOwnerId);
     });
@@ -317,6 +334,14 @@ export class ActivationLifecycleStore {
     if (reference.agentId === owner) return undefined;
     const row = this.#readCurrentRow(reference.agentId);
     return row ? this.#mapRow(row, owner) : undefined;
+  }
+
+  inspectRun(ownership: AgentRunOwnership): ActivationRecord | undefined {
+    const row = this.#database.prepare(`SELECT * FROM agent_activations
+      WHERE agent_id = ? AND run_id = ? AND fencing_epoch = ? LIMIT 1`).get(
+        ownership.agentId, ownership.runId, ownership.epoch,
+      ) as ActivationRow | undefined;
+    return row ? this.#mapRow(row, ownership.workflowOwnerId) : undefined;
   }
 
   addDependency(

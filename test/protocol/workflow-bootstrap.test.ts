@@ -48,6 +48,50 @@ function context(sessionId: string, sessionPath: string): WorkflowBootstrapConte
 }
 
 describe("production Workflow bootstrap", () => {
+  it("starts recovery activation and transfers operation dependencies before launcher acknowledgement", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: ownerPath, childCwd: root, childSessionId: ownerId });
+    const owner = new WorkflowBootstrap();
+    owner.sessionStarted(context(ownerId, ownerPath));
+    const childId = identities.next();
+    const childPath = join(owner.workflow!.sessionsDirectory, "child.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: childPath, childCwd: root, childSessionId: childId });
+    const first = owner.prepareSpawn({
+      agentId: childId,
+      sessionPath: childPath,
+      runId: "first-run",
+      surface: "first-surface",
+      name: "Child",
+      sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: childId, sessionPath: childPath }),
+    });
+    owner.runStarted(first.ownership);
+    const database = new DatabaseSync(owner.workflow!.databasePath);
+    database.prepare(`INSERT INTO activation_dependencies
+      (activation_id, dependency_kind, dependency_id, dependency_agent_id, created_at_ms)
+      VALUES (?, 'operation', 'acceptance:recovery-message', NULL, ?)`
+    ).run(first.ownership.runId, Date.now());
+    database.close();
+    owner.runTerminated(first.ownership, true, { error: "first run failed" });
+    const recovery = await owner.prepareResume({ sessionPath: childPath, runId: "recovery-run", surface: "recovery-surface" });
+
+    const child = new WorkflowBootstrap();
+    try {
+      child.sessionStarted(context(childId, childPath), recovery.environment);
+      assert.deepEqual(child.inspectActivation(childId)?.state, {
+        kind: "waiting",
+        dependencies: [{ kind: "operation", dependencyId: "acceptance:recovery-message" }],
+      });
+      assert.equal(owner.runStarted(recovery.ownership).runId, recovery.ownership.runId);
+    } finally {
+      child.close();
+      owner.runTerminated(recovery.ownership, true, { error: "test cleanup" });
+      owner.close();
+    }
+  });
+
   it("cleans up an uncommitted provisional Router after a startup disconnect", async () => {
     const root = await temporaryDirectory();
     const identities = new DeterministicIdentityFactory();
