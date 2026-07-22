@@ -14,13 +14,8 @@
   "type": "module",
   "scripts": {
     "lint": "oxlint pi-extension test",
-    "test": "node --test test/test.ts test/runtime-routing.test.ts test/release-workflow.test.ts test/cross-process-coordination.test.ts test/protocol/workflow-foundation.test.ts test/protocol/workflow-bootstrap.test.ts test/protocol/activation-lifecycle.test.ts test/protocol/direct-signal.test.ts test/protocol/direct-signal-extension.test.ts test/protocol/human-interrupt-extension.test.ts test/protocol/spawned-initial-request.test.ts test/protocol/provisional-spawn.test.ts",
-    "test:coordination": "node --test test/cross-process-coordination.test.ts",
-    "test:lifecycle": "node --test test/protocol/activation-lifecycle.test.ts test/protocol/workflow-bootstrap.test.ts",
-    "test:protocol": "node --test test/protocol/workflow-foundation.test.ts test/protocol/workflow-bootstrap.test.ts test/protocol/activation-lifecycle.test.ts test/protocol/direct-signal.test.ts test/protocol/direct-signal-extension.test.ts test/protocol/human-interrupt-extension.test.ts test/protocol/spawned-initial-request.test.ts test/protocol/provisional-spawn.test.ts",
-    "test:signal": "node --test test/protocol/direct-signal.test.ts test/protocol/direct-signal-extension.test.ts",
-    "test:scenario": "node --test test/protocol/workflow-foundation.test.ts test/protocol/activation-lifecycle.test.ts test/protocol/direct-signal.test.ts test/protocol/direct-signal-extension.test.ts test/protocol/human-interrupt-extension.test.ts test/protocol/spawned-initial-request.test.ts test/protocol/provisional-spawn.test.ts",
-    "test:smoke": "node --test test/smoke/smoke.test.ts"
+    "test": "node --test \"test/**/*.test.ts\"",
+    "test:smoke": "node --test test/smoke/smoke.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

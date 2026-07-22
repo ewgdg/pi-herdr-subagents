@@ -1199,26 +1199,28 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled agents inherit the parent runtime and preserve interaction modes", () => {
-    const expectedInteraction = {
-      scout: false,
-      worker: false,
-      reviewer: false,
-      planner: true,
-      "visual-tester": false,
-    } as const;
+  it("bundled agents inherit the parent runtime and preserve interaction modes", async () => {
+    await withIsolatedAgentEnv(() => {
+      const expectedInteraction = {
+        scout: false,
+        worker: false,
+        reviewer: false,
+        planner: true,
+        "visual-tester": false,
+      } as const;
 
-    for (const [name, interactive] of Object.entries(expectedInteraction)) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(defs.model, undefined, `${name} should inherit the parent model`);
-      assert.equal(defs.thinking, undefined, `${name} should inherit the parent thinking level`);
-      assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        interactive,
-        `${name} should preserve its interaction mode`,
-      );
-    }
+      for (const [name, interactive] of Object.entries(expectedInteraction)) {
+        const defs = testApi.loadAgentDefaults(name);
+        assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+        assert.equal(defs.model, undefined, `${name} should inherit the parent model`);
+        assert.equal(defs.thinking, undefined, `${name} should inherit the parent thinking level`);
+        assert.equal(
+          testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
+          interactive,
+          `${name} should preserve its interaction mode`,
+        );
+      }
+    });
   });
 
   it("ignores invalid session-mode values", async () => {

@@ -34,4 +34,4 @@ jobs:
         run: npm ci
 
       - name: Test SQLite coordination and local IPC
-        run: npm run test:coordination
+        run: node --test test/cross-process-coordination.test.ts

@@ -23,7 +23,7 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 
 ## Development
 
-Run unit tests and lint locally:
+Run the normal test suite and lint locally:
 
 ```bash
 npm test
