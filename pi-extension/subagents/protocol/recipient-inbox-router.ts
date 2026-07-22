@@ -28,6 +28,8 @@ import type {
 
 const SIGNAL_REQUEST_TYPE = "direct-signal.accept";
 const SIGNAL_RECEIPT_TYPE = "direct-signal.receipt";
+const INBOX_SCHEDULE_TYPE = "recipient-inbox.schedule";
+const DURABLE_INBOX_DRAIN_INTERVAL_MS = 100;
 
 export interface RecipientInboxRouterOptions {
   workflowOwnerId: string;
@@ -48,6 +50,8 @@ export class RecipientInboxRouter {
   #closed = false;
   #prepared = false;
   #scheduling = false;
+  #scheduleRequested = false;
+  #durableDrainTimer: ReturnType<typeof setInterval> | undefined;
   readonly #projectedMessageIds = new Set<string>();
 
   constructor(options: RecipientInboxRouterOptions) {
@@ -72,6 +76,7 @@ export class RecipientInboxRouter {
       this.#store.registerRouter({ recipient: this.#options.recipient, ownership, endpoint: this.#endpoint, registeredAtMs: this.#options.now() });
     }
     this.#prepared = false;
+    this.#startDurableDrain();
     this.#schedule();
   }
 
@@ -96,7 +101,10 @@ export class RecipientInboxRouter {
         registeredAtMs: this.#options.now(),
       });
       this.#server = server;
-      if (register) this.#schedule();
+      if (register) {
+        this.#startDurableDrain();
+        this.#schedule();
+      }
     } catch (error) {
       await this.#cleanupFailedStart(server, error);
     }
@@ -105,6 +113,8 @@ export class RecipientInboxRouter {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    if (this.#durableDrainTimer) clearInterval(this.#durableDrainTimer);
+    this.#durableDrainTimer = undefined;
     const errors: unknown[] = [];
     try {
       this.#store.unregisterRouter(this.#options.recipient, this.#endpoint);
@@ -165,6 +175,15 @@ export class RecipientInboxRouter {
   }
 
   async #handle(connection: FramedIpcConnection, frame: FramedIpcMessage): Promise<void> {
+    if (frame.type === INBOX_SCHEDULE_TYPE) {
+      const candidate = frame.payload as { workflowOwnerId?: unknown; recipientAgentId?: unknown };
+      if (candidate.workflowOwnerId === this.#options.workflowOwnerId
+        && candidate.recipientAgentId === this.#options.recipient.agentId) {
+        this.#schedule();
+      }
+      connection.end();
+      return;
+    }
     if (frame.type !== SIGNAL_REQUEST_TYPE) {
       await sendRejected(connection, { message: `Unsupported Inbox Router request: ${frame.type}` });
       return;
@@ -217,13 +236,21 @@ export class RecipientInboxRouter {
   }
 
   #schedule(): void {
-    if (this.#closed || this.#scheduling || !this.#server) return;
+    if (this.#closed || !this.#server) return;
+    if (this.#scheduling) {
+      this.#scheduleRequested = true;
+      return;
+    }
     this.#scheduling = true;
     queueMicrotask(() => {
       try {
         this.#deliverEligible();
       } finally {
         this.#scheduling = false;
+        if (this.#scheduleRequested) {
+          this.#scheduleRequested = false;
+          this.#schedule();
+        }
       }
     });
   }
@@ -236,6 +263,15 @@ export class RecipientInboxRouter {
         this.confirmDelivery(pointer.messageId);
       }
     }
+    const recoverableClaims = this.#store.listPending(this.#options.recipient)
+      .filter((pointer) => pointer.projectionClaimed && !this.#projectedMessageIds.has(pointer.messageId))
+      .map((pointer) => pointer.messageId);
+    this.#store.releaseInboxProjectionClaims({
+      recipient: this.#options.recipient,
+      ownership: this.#options.ownership,
+      endpoint: this.#endpoint,
+      messageIds: recoverableClaims,
+    });
     const lifecycle = this.#store.recipientLifecycle(this.#options.recipient);
     if (lifecycle === "ended" || lifecycle === "interrupted" || lifecycle === "waiting-human") return;
     const queued = this.#store.listPending(this.#options.recipient);
@@ -244,24 +280,51 @@ export class RecipientInboxRouter {
       : queued).filter((pointer) => !this.#projectedMessageIds.has(pointer.messageId));
     if (eligible.length === 0) return;
 
-    const messages = eligible.map((pointer) => this.#resolve(pointer));
-    const batch: InboxBatch = {
-      // A mixed batch can only be released while idle. Mark it deferred so the
-      // Pi bridge never treats it as permission to interrupt active work.
-      deliveryTiming: messages.some((message) => message.deliveryTiming === "deferred") ? "deferred" : "steer",
-      messages,
-    };
+    const pointers = new Map(eligible.map((pointer) => [pointer.messageId, pointer]));
+    let projected: string[];
     try {
-      this.#options.projectInboxBatch(batch);
+      projected = this.#store.commitInboxProjection({
+        recipient: this.#options.recipient,
+        ownership: this.#options.ownership,
+        endpoint: this.#endpoint,
+        messageIds: eligible.map((pointer) => pointer.messageId),
+        project: (messageIds) => {
+          const messages = messageIds.map((messageId) => this.#resolve(pointers.get(messageId)!));
+          this.#options.projectInboxBatch({
+            // A mixed batch can only be released while idle. Mark it deferred
+            // so Pi never treats it as permission to interrupt active work.
+            deliveryTiming: messages.some((message) => message.deliveryTiming === "deferred") ? "deferred" : "steer",
+            messages,
+          });
+        },
+      });
     } catch {
-      // Projection is the durability boundary. Keep every pointer until a
-      // later Router startup or delivery point can safely project the batch.
+      // Keep the durable pre-projection claim: the callback may have appended
+      // transcript evidence before throwing. Recovery will confirm or release it.
       return;
     }
-    for (const message of messages) this.#projectedMessageIds.add(message.messageId);
+    for (const messageId of projected) this.#projectedMessageIds.add(messageId);
+  }
+
+  #startDurableDrain(): void {
+    if (this.#durableDrainTimer || this.#closed) return;
+    this.#durableDrainTimer = setInterval(() => this.#schedule(), DURABLE_INBOX_DRAIN_INTERVAL_MS);
+    this.#durableDrainTimer.unref?.();
   }
 
   #resolve(pointer: PendingMessagePointer): DirectSignalMessage {
+    if (pointer.protocolNoticeKind === "request-cancelled") {
+      const canonical = this.#store.resolveProtocolNotice(this.#options.workflowOwnerId, pointer.messageId);
+      return {
+        kind: "protocol-notice",
+        noticeKind: "request-cancelled",
+        messageId: pointer.messageId,
+        requestId: canonical.requestId,
+        recipientAgentId: pointer.recipientAgentId,
+        deliveryTiming: "steer",
+        message: canonical.message,
+      };
+    }
     const sessionPath = this.#store.senderSessionPath(
       this.#options.workflowOwnerId,
       pointer.senderAgentId,

@@ -115,7 +115,11 @@ export class WorkflowInspection {
         request: requestDeliveryStatus ?? "unknown",
         answer: answerDeliveryStatus ?? (request.answerMessageId ? "unknown" : "not-created"),
       },
-      requesterDependency: request.status === "resolved" ? "satisfied" : "unresolved",
+      ...(request.cancellationNotice ? { cancellation: {
+        noticeMessageId: request.cancellationNotice.messageId,
+        delivery: request.cancellationNotice.deliveryStatus,
+      } } : {}),
+      requesterDependency: request.status === "resolved" || request.status === "cancelled" ? "satisfied" : "unresolved",
       requesterLifecycleDependency: dependency ? "waiting" : "not-waiting",
       callerAuthority: {
         inspect: true,
@@ -125,6 +129,7 @@ export class WorkflowInspection {
         workflowOwner: callerId === this.#sources.workflow.ownerAgentId,
         requester: callerId === request.requesterAgentId,
         responder: callerId === request.responderAgentId,
+        cancelRequest: callerId === request.requesterAgentId && request.status === "open",
       },
     };
   }

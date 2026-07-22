@@ -96,10 +96,24 @@ export class SQLiteWorkflowStore {
         requester_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
         responder_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
         answer_delivery_timing TEXT NOT NULL CHECK (answer_delivery_timing IN ('steer', 'deferred')),
-        status TEXT NOT NULL CHECK (status IN ('open', 'answered', 'resolved')),
+        status TEXT NOT NULL CHECK (status IN ('open', 'answered', 'resolved', 'cancelled')),
         answer_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
-        CHECK ((status = 'open' AND answer_message_id IS NULL)
-          OR (status IN ('answered', 'resolved') AND answer_message_id IS NOT NULL))
+        cancelled_at_ms INTEGER,
+        cancellation_notice_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
+        cancellation_notice_payload TEXT,
+        cancellation_notice_delivery_status TEXT CHECK (cancellation_notice_delivery_status IN ('queued', 'delivered')),
+        cancellation_notice_delivered_at_ms INTEGER,
+        CHECK ((status IN ('open', 'cancelled') AND answer_message_id IS NULL)
+          OR (status IN ('answered', 'resolved') AND answer_message_id IS NOT NULL)),
+        CHECK ((status != 'cancelled' AND cancelled_at_ms IS NULL
+            AND cancellation_notice_message_id IS NULL AND cancellation_notice_payload IS NULL
+            AND cancellation_notice_delivery_status IS NULL AND cancellation_notice_delivered_at_ms IS NULL)
+          OR (status = 'cancelled' AND answer_message_id IS NULL AND cancelled_at_ms IS NOT NULL
+            AND ((cancellation_notice_message_id IS NULL AND cancellation_notice_payload IS NULL
+                AND cancellation_notice_delivery_status IS NULL AND cancellation_notice_delivered_at_ms IS NULL)
+              OR (cancellation_notice_message_id IS NOT NULL AND cancellation_notice_payload IS NOT NULL
+                AND ((cancellation_notice_delivery_status = 'queued' AND cancellation_notice_delivered_at_ms IS NULL)
+                  OR (cancellation_notice_delivery_status = 'delivered' AND cancellation_notice_delivered_at_ms IS NOT NULL))))))
       ) STRICT;
 
       CREATE INDEX IF NOT EXISTS workflow_requests_requester_open

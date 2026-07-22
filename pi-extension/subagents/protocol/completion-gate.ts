@@ -120,7 +120,7 @@ function collectCompletionBlockers(database: DatabaseSync, agentId: string): Com
   for (const row of database.prepare("SELECT request_id FROM workflow_requests WHERE responder_agent_id = ? AND status = 'open' ORDER BY request_id").all(agentId) as Array<{ request_id: string }>) {
     blockers.push({ kind: recoveryPending ? "recovery-pending-request" : "incoming-request", requestId: row.request_id });
   }
-  for (const row of database.prepare("SELECT request_id FROM workflow_requests WHERE requester_agent_id = ? AND status != 'resolved' ORDER BY request_id").all(agentId) as Array<{ request_id: string }>) blockers.push({ kind: "outgoing-request", requestId: row.request_id });
+  for (const row of database.prepare("SELECT request_id FROM workflow_requests WHERE requester_agent_id = ? AND status IN ('open', 'answered') ORDER BY request_id").all(agentId) as Array<{ request_id: string }>) blockers.push({ kind: "outgoing-request", requestId: row.request_id });
   for (const row of database.prepare("SELECT message_id FROM pending_message_pointers WHERE recipient_agent_id = ? ORDER BY acceptance_sequence").all(agentId) as Array<{ message_id: string }>) blockers.push({ kind: "accepted-undelivered-input", messageId: row.message_id });
   for (const row of database.prepare("SELECT tool_call_id, status FROM human_interrupts WHERE agent_id = ? AND status IN ('pending','response-bound','result-pending') ORDER BY tool_call_id").all(agentId) as Array<{ tool_call_id: string; status: string }>) blockers.push({ kind: "human-interrupt", toolCallId: row.tool_call_id, status: row.status });
   for (const row of database.prepare(`SELECT DISTINCT dependency_id FROM activation_dependencies

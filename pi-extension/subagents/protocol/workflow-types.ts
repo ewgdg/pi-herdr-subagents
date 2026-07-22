@@ -69,6 +69,8 @@ export type WorkflowProtocolErrorCode =
   | "AcceptanceInDoubt"
   | "AnswerUnauthorized"
   | "AnswerAlreadyClosed"
+  | "RequestCancellationUnauthorized"
+  | "RequestAlreadyClosed"
   | "UnknownRequest";
 
 export class WorkflowProtocolError extends Error {

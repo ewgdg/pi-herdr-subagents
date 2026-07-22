@@ -16,6 +16,7 @@ import {
   startDirectSignalRouter,
 } from "./protocol/direct-signal-extension.ts";
 import { registerAgentInspectTool } from "./protocol/agent-inspect-extension.ts";
+import { registerAgentCancelTool } from "./protocol/agent-cancel-extension.ts";
 import { registerAgentCompleteTool } from "./protocol/completion-extension.ts";
 import {
   HumanInterruptInputBridge,
@@ -441,6 +442,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   registerAgentInspectTool(pi, workflowBootstrap, !parseDeniedTools(deniedToolsValue).includes("agent_inspect"));
+  registerAgentCancelTool(pi, workflowBootstrap, !parseDeniedTools(deniedToolsValue).includes("agent_cancel"));
   registerAgentCompleteTool(pi, workflowBootstrap, !parseDeniedTools(deniedToolsValue).includes("agent_complete"));
   registerAgentSendTool(
     pi,

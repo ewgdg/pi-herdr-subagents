@@ -18,6 +18,7 @@ import type {
   InboxBatch,
   PendingMessagePointer,
   QueuedSignalReceipt,
+  RequestCancellationReceipt,
   RequestRecord,
   SignalAcceptRequest,
   SignalDeliveryTiming,
@@ -33,6 +34,7 @@ export type {
   PendingMessagePointer,
   QueuedSignalReceipt,
   RequestRecord,
+  RequestCancellationReceipt,
   SignalDeliveryTiming,
 } from "./direct-signal-types.ts";
 
@@ -42,6 +44,7 @@ const ACCEPTANCE_RETRY_MAXIMUM_DELAY_MS = 5_000;
 const ACCEPTANCE_RETRY_BACKOFF_FACTOR = 2;
 const SIGNAL_REQUEST_TYPE = "direct-signal.accept";
 const SIGNAL_RECEIPT_TYPE = "direct-signal.receipt";
+const INBOX_SCHEDULE_TYPE = "recipient-inbox.schedule";
 
 export interface DirectSignalRuntimeOptions {
   controlPlane: WorkflowControlPlane;
@@ -189,7 +192,7 @@ export class DirectSignalRuntime {
       return this.#store.reconcileAcceptedMessage(sender, existing.messageId, this.#ownership) ?? receiptFor(existing);
     }
     if (target.inReplyToRequestId && this.#store.inspectRequest(sender.workflowOwnerId, target.inReplyToRequestId)?.status !== "open") {
-      throw new WorkflowProtocolError("AnswerAlreadyClosed", `Request ${target.inReplyToRequestId} already has a terminal Answer`);
+      throw new WorkflowProtocolError("AnswerAlreadyClosed", `Request ${target.inReplyToRequestId} already has a terminal outcome`);
     }
 
     const route = this.#store.readRouter(target.recipient);
@@ -421,6 +424,40 @@ export class DirectSignalRuntime {
     return this.#store.listPending(recipient);
   }
 
+  async cancelRequest(requestId: string): Promise<RequestCancellationReceipt> {
+    this.#assertOpen();
+    assertNonEmpty(requestId, "Request ID");
+    const requester = this.#controlPlane.currentAgent;
+    const receipt = this.#store.cancelRequest({
+      requester,
+      requestId,
+      noticeMessageId: this.#allocateMessageId(),
+      cancelledAtMs: this.#now(),
+    });
+    if (receipt.delivery === "notice-queued") {
+      const request = this.#store.inspectRequest(requester.workflowOwnerId, requestId)!;
+      const route = this.#store.readRouter(this.#controlPlane.agent(request.responderAgentId));
+      if (route) {
+        try {
+          const connection = await connectFramedIpc(route.endpoint);
+          try {
+            await connection.send({
+              version: CURRENT_IPC_VERSION,
+              type: INBOX_SCHEDULE_TYPE,
+              payload: { workflowOwnerId: requester.workflowOwnerId, recipientAgentId: request.responderAgentId },
+            });
+          } finally {
+            connection.end();
+          }
+        } catch {
+          // The notice is already durable. Router restart/reconciliation will
+          // deliver it even when this best-effort scheduling hint is lost.
+        }
+      }
+    }
+    return receipt;
+  }
+
   confirmDelivery(messageId: string): boolean {
     this.#assertOpen();
     return this.#router?.confirmDelivery(messageId) ?? false;
@@ -565,7 +602,8 @@ function isWorkflowProtocolErrorCode(code: string | undefined): code is Construc
     || code === "RecipientUnreachable" || code === "RecipientEnded" || code === "MessageIdentityConflict"
     || code === "RecipientReactivationUnauthorized"
     || code === "InvalidCompletionMessage" || code === "CompletionBlocked" || code === "AcceptanceInDoubt"
-    || code === "InvalidMessageSource" || code === "AnswerUnauthorized" || code === "AnswerAlreadyClosed" || code === "UnknownRequest";
+    || code === "InvalidMessageSource" || code === "AnswerUnauthorized" || code === "AnswerAlreadyClosed" || code === "UnknownRequest"
+    || code === "RequestCancellationUnauthorized" || code === "RequestAlreadyClosed";
 }
 
 function recipientUnreachable(agentId: string, cause?: unknown): WorkflowProtocolError {

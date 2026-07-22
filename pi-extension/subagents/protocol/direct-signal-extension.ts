@@ -250,7 +250,7 @@ export function projectInboxBatch(batch: InboxBatch): {
   content: string;
   display: true;
   details: {
-    messages: Array<{
+    messages: Array<({
       kind: "signal" | "request" | "answer";
       messageId: string;
       senderAgentId: string;
@@ -258,7 +258,14 @@ export function projectInboxBatch(batch: InboxBatch): {
       deliveryTiming: "steer" | "deferred";
       responseRequired?: true;
       inReplyToRequestId?: string;
-    }>;
+    } | {
+      kind: "protocol-notice";
+      noticeKind: "request-cancelled";
+      messageId: string;
+      requestId: string;
+      recipientAgentId: string;
+      deliveryTiming: "steer";
+    })>;
   };
 } {
   const content = batch.messages.map(projectInboxMessage).join("\n\n---\n\n");
@@ -270,11 +277,15 @@ export function projectInboxBatch(batch: InboxBatch): {
       messages: batch.messages.map((signal) => ({
         kind: signal.kind,
         messageId: signal.messageId,
-        senderAgentId: signal.senderAgentId,
         recipientAgentId: signal.recipientAgentId,
         deliveryTiming: signal.deliveryTiming,
-        ...(signal.responseRequired ? { responseRequired: true as const } : {}),
-        ...(signal.inReplyToRequestId ? { inReplyToRequestId: signal.inReplyToRequestId } : {}),
+        ...(signal.kind === "protocol-notice"
+          ? { noticeKind: signal.noticeKind, requestId: signal.requestId }
+          : {
+              senderAgentId: signal.senderAgentId,
+              ...(signal.responseRequired ? { responseRequired: true as const } : {}),
+              ...(signal.inReplyToRequestId ? { inReplyToRequestId: signal.inReplyToRequestId } : {}),
+            }),
       })),
     },
   };
@@ -285,6 +296,14 @@ export function sessionContainsInboxMessage(entries: unknown[], messageId: strin
 }
 
 function projectInboxMessage(message: InboxBatch["messages"][number]): string {
+  if (message.kind === "protocol-notice") {
+    return [
+      `Protocol Notice [Notice ID: ${message.messageId}]`,
+      `Request ID: ${message.requestId}`,
+      "",
+      message.message,
+    ].join("\n");
+  }
   const identity = message.kind === "answer"
     ? `Answer ID: ${message.messageId}`
     : message.kind === "request" ? `Request ID: ${message.messageId}` : `Message ID: ${message.messageId}`;

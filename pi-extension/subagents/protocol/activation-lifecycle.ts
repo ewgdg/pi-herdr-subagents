@@ -1002,7 +1002,7 @@ export class ActivationLifecycleStore {
       FROM workflow_requests
       WHERE requester_agent_id = (
         SELECT agent_id FROM agent_activations WHERE activation_id = ?
-      ) AND status <> 'resolved'
+      ) AND status IN ('open', 'answered')
       ORDER BY dependency_kind, dependency_id
     `).all(activationId, activationId) as unknown as DependencyRow[];
     if (rows.length === 0) return [{ kind: "undeclared", dependencyId: UNDECLARED_DEPENDENCY_ID }];
@@ -1019,7 +1019,7 @@ export class ActivationLifecycleStore {
       SELECT 'agent' AS dependency_kind, request_id AS dependency_id,
              responder_agent_id AS agent_id
       FROM workflow_requests
-      WHERE requester_agent_id = ? AND status <> 'resolved'
+      WHERE requester_agent_id = ? AND status IN ('open', 'answered')
     `).all(activationId, agentId) as unknown as DependencyRow[];
   }
 

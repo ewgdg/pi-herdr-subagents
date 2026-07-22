@@ -202,6 +202,35 @@ describe("direct Signal Pi transcript projection", () => {
     assert.equal(llmVisibleContent(projected), projected.content);
   });
 
+  it("projects a runtime-authored Request cancellation notice without fabricating an Agent sender", () => {
+    const projected = projectInboxBatch({
+      deliveryTiming: "steer",
+      messages: [{
+        kind: "protocol-notice",
+        noticeKind: "request-cancelled",
+        messageId: "notice-1",
+        requestId: "request-1",
+        recipientAgentId: "responder",
+        deliveryTiming: "steer",
+        message: "CANONICAL CANCELLATION PAYLOAD",
+      }],
+    });
+
+    assert.match(projected.content, /Protocol Notice/);
+    assert.match(projected.content, /Request ID: request-1/);
+    assert.equal(projected.content.split("CANONICAL CANCELLATION PAYLOAD").length - 1, 1);
+    assert.deepEqual(projected.details.messages, [{
+      kind: "protocol-notice",
+      noticeKind: "request-cancelled",
+      messageId: "notice-1",
+      requestId: "request-1",
+      recipientAgentId: "responder",
+      deliveryTiming: "steer",
+    }]);
+    assert.equal("senderAgentId" in projected.details.messages[0], false);
+    assert.equal(llmVisibleContent(projected), projected.content);
+  });
+
   it("validates only the agent_send variants legal at runtime", () => {
     for (const params of [
       { target: { agent: "agent" }, message: "signal", onAccepted: "continue" },

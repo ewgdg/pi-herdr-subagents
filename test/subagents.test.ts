@@ -1440,6 +1440,25 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  it("registers agent_cancel for child requesters and honors the child deny list", () => {
+    const key = Symbol.for("pi-herdr-subagents.child-workflow-bootstrap");
+    const priorBootstrap = (globalThis as Record<PropertyKey, unknown>)[key];
+    const priorDenied = process.env.PI_DENY_TOOLS;
+    try {
+      (globalThis as Record<PropertyKey, unknown>)[key] = {};
+      for (const [deniedValue, expected] of [[undefined, true], ["agent_cancel", false]] as const) {
+        restoreEnvVar("PI_DENY_TOOLS", deniedValue);
+        const { api, registeredTools } = createMockExtensionApi();
+        subagentDoneExtension(api);
+        assert.equal(registeredTools.some((tool) => tool.name === "agent_cancel"), expected, deniedValue);
+      }
+    } finally {
+      restoreEnvVar("PI_DENY_TOOLS", priorDenied);
+      if (priorBootstrap === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key];
+      else (globalThis as Record<PropertyKey, unknown>)[key] = priorBootstrap;
+    }
+  });
+
   it("retries a non-projected undeclared notice and confirms exactly one durable projection", async () => {
     const sent: Array<{ message: any; options: unknown }> = [];
     const confirmed: string[] = [];
@@ -2180,13 +2199,13 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
-  it("preserves the legacy public tool surface", () => {
+  it("registers the public tool surface", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
     assert.deepEqual(
       registeredTools.map((tool) => tool.name).sort(),
-      ["agent_inspect", "agent_send", "subagent", "subagent_interrupt", "subagent_resume", "subagents_list"],
+      ["agent_cancel", "agent_inspect", "agent_send", "subagent", "subagent_interrupt", "subagent_resume", "subagents_list"],
     );
     const spawn = registeredTools.find((tool) => tool.name === "subagent");
     const resume = registeredTools.find((tool) => tool.name === "subagent_resume");
@@ -2356,6 +2375,20 @@ describe("tool registration", () => {
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
       assert.equal(registeredTools.some((tool) => tool.name === "agent_inspect"), false);
+      assert.equal(registeredTools.some((tool) => tool.name === "agent_send"), true);
+    } finally {
+      delete process.env.PI_SUBAGENT_ID;
+      delete process.env.PI_DENY_TOOLS;
+    }
+  });
+
+  it("allows a restricted child to explicitly deny agent_cancel", () => {
+    process.env.PI_SUBAGENT_ID = "child-test";
+    process.env.PI_DENY_TOOLS = "agent_cancel";
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      assert.equal(registeredTools.some((tool) => tool.name === "agent_cancel"), false);
       assert.equal(registeredTools.some((tool) => tool.name === "agent_send"), true);
     } finally {
       delete process.env.PI_SUBAGENT_ID;

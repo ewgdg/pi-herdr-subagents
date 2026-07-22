@@ -71,7 +71,7 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 4 primary orchestration tools, 3 durable collaboration tools, 3 commands, plus subagent-only lifecycle tools:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -79,6 +79,12 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
+
+| Collaboration tool | Description |
+| ------------------ | ----------- |
+| `agent_send`       | Send Signals and Requests, or Answer a Request |
+| `agent_cancel`     | Cancel an unresolved Request created by the current Agent |
+| `agent_inspect`    | Inspect capability-filtered durable Agent and Request state |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -273,6 +279,20 @@ gracefully without selecting or relaying a second legacy result.
 
 Only the Agent addressed by a Request may answer it. The first queued Answer closes the Request; retrying that same Answer is idempotent. An Answer can also set `responseRequired: true` to create its own Request atomically. A Request becomes resolved only when its Answer is committed to the requester’s inbox; unresolved Requests remain durable Agent dependencies.
 
+## agent_cancel — Request Cancellation
+
+`agent_cancel` cancels one unresolved Request created by the current Agent:
+
+```typescript
+agent_cancel({ request: requestId });
+```
+
+Only the original requester has cancellation authority. Cancellation and Answer acceptance arbitrate through one durable commit: whichever commits first wins, and the losing operation has no Request-state effects. Retrying a successful cancellation is idempotent and cannot create another notice.
+
+If the responder has not durably received the Request, cancellation suppresses its inbox pointer without waking the responder. If the Request was delivered, the runtime queues one correlated Steer Protocol Notice, using ordinary inbox ordering and delivery confirmation, so a waiting responder wakes with actionable cancellation context. The notice is runtime-authored; its canonical payload and delivery state live on the Request rather than in an Agent transcript.
+
+Cancellation removes the requester's dependency and permits completion when no other blockers remain. It does not fabricate an Answer, undo completed work, or claim to roll back external side effects. This tool cancels Requests only; it does not cancel Agent activations.
+
 ## agent_inspect — Read-only Workflow State
 
 `agent_inspect` reads capability-filtered durable state without waking Agents, creating activations, reserving ownership, changing protocol state, or writing transcript content:
@@ -286,9 +306,9 @@ agent_inspect({ target: { workflow: true } }); // Workflow Owner only
 
 A caller may inspect a known Agent ID, but that does not grant control, ownership, or enumeration. Non-owner Agents can enumerate only their direct children; the Workflow Owner can enumerate the complete Workflow. Human Interrupt and undeclared-settlement state is redacted so canonical question, response, notice payloads, and model-facing identities are not duplicated.
 
-This bounded implementation reports only state already persisted by the current protocol: Agent activation/waiting state, Human Interrupt state, undeclared-settlement correction state, and Request `open`, `answered`, or `resolved` state. Request cancellation/orphan state, Operation Review details, and Incident Visibility remain deferred to their producer work and are not represented by placeholders.
+Inspection reports Agent activation/waiting state, Human Interrupt state, undeclared-settlement correction state, and Request `open`, `answered`, `resolved`, or `cancelled` state. Cancelled Request projections show the satisfied requester dependency and cancellation-notice delivery metadata without duplicating the canonical notice payload. Orphan state, Operation Review details, and Incident Visibility remain deferred to their producer work and are not represented by placeholders.
 
-An explicit child `tools` allowlist remains exact: include `agent_inspect` when that restricted child needs inspection. Without an explicit allowlist it is available by default, and `deny-tools: agent_inspect` removes it.
+An explicit child `tools` allowlist remains exact: include `agent_inspect` or `agent_cancel` when that restricted child needs the corresponding operation. Without an explicit allowlist both are available by default; `deny-tools` removes either tool by name.
 
 ## caller_ping — Child-to-Parent Help Request
 

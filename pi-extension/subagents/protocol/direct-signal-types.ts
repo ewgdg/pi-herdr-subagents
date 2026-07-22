@@ -1,8 +1,9 @@
 export type SignalDeliveryTiming = "steer" | "deferred";
-export type ActionableMessageKind = "signal" | "request" | "answer";
+export type AgentMessageKind = "signal" | "request" | "answer";
+export type ActionableMessageKind = AgentMessageKind | "protocol-notice";
 
-export interface DirectSignalMessage {
-  kind: ActionableMessageKind;
+export interface AgentDirectSignalMessage {
+  kind: AgentMessageKind;
   messageId: string;
   senderAgentId: string;
   recipientAgentId: string;
@@ -11,6 +12,18 @@ export interface DirectSignalMessage {
   responseRequired?: true;
   inReplyToRequestId?: string;
 }
+
+export interface ProtocolNoticeMessage {
+  kind: "protocol-notice";
+  noticeKind: "request-cancelled";
+  messageId: string;
+  requestId: string;
+  recipientAgentId: string;
+  deliveryTiming: "steer";
+  message: string;
+}
+
+export type DirectSignalMessage = AgentDirectSignalMessage | ProtocolNoticeMessage;
 
 export interface InboxBatch {
   deliveryTiming: SignalDeliveryTiming;
@@ -37,7 +50,9 @@ export interface DirectSignalRecord {
   onAccepted: "continue" | "complete";
   inReplyToRequestId?: string;
   acceptanceSequence?: number;
-  deliveryStatus: "bound" | "queued" | "delivered";
+  deliveryStatus: "bound" | "queued" | "delivered" | "suppressed";
+  protocolNoticeKind?: "request-cancelled";
+  canonicalRequestId?: string;
   createdAtMs: number;
   acceptedAtMs?: number;
   deliveredAtMs?: number;
@@ -48,8 +63,22 @@ export interface RequestRecord {
   requesterAgentId: string;
   responderAgentId: string;
   answerDeliveryTiming: SignalDeliveryTiming;
-  status: "open" | "answered" | "resolved";
+  status: "open" | "answered" | "resolved" | "cancelled";
   answerMessageId?: string;
+  cancelledAtMs?: number;
+  cancellationNotice?: {
+    messageId: string;
+    message: string;
+    deliveryStatus: "queued" | "delivered";
+    deliveredAtMs?: number;
+  };
+}
+
+export interface RequestCancellationReceipt {
+  requestId: string;
+  status: "cancelled";
+  delivery: "suppressed" | "notice-queued" | "notice-delivered";
+  noticeMessageId?: string;
 }
 
 export interface PendingMessagePointer {
@@ -65,6 +94,11 @@ export interface PendingMessagePointer {
   inReplyToRequestId?: string;
   acceptanceSequence: number;
   acceptedAtMs: number;
+  protocolNoticeKind?: "request-cancelled";
+  canonicalRequestId?: string;
+  /** Durable evidence that transcript projection may already have occurred. */
+  projectionClaimed: boolean;
+  projectionCommitted: boolean;
 }
 
 export interface SignalAcceptRequest {

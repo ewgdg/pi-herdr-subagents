@@ -63,6 +63,27 @@ test("completion reports independent blockers and rolls back every completion mu
   } finally { f.gate.close(); f.signals.close(); f.owner.close(); }
 });
 
+test("cancelled outgoing Requests no longer block dependency settlement or completion", () => {
+  const f = fixture();
+  try {
+    const worker = f.owner.agent(f.worker.agentId);
+    const message = "outgoing work no longer needed";
+    f.signals.bindMessage({ messageId: "cancelled-outgoing", sender: worker, recipient: f.owner.currentAgent,
+      sourceEntryId: "cancelled-outgoing-source", payloadDigest: digestPayload(message), deliveryTiming: "steer",
+      responseRequired: true, createdAtMs: 2 });
+    f.signals.acceptSignal({ recipient: f.owner.currentAgent, endpoint: "owner://router", acceptedAtMs: 3,
+      request: { workflowOwnerId: f.owner.workflow.ownerAgentId, messageId: "cancelled-outgoing", senderAgentId: worker.agentId,
+        recipientAgentId: f.owner.currentAgent.agentId, sourceEntryId: "cancelled-outgoing-source", payloadDigest: digestPayload(message),
+        deliveryTiming: "steer", responseRequired: true, onAccepted: "continue", message } });
+    f.signals.cancelRequest({ requester: worker, requestId: "cancelled-outgoing", noticeMessageId: "unused-notice", cancelledAtMs: 4 });
+    f.owner.settleActivation(f.ownership);
+    assert.deepEqual(f.owner.inspectActivation(worker)?.state, { kind: "waiting", dependencies: [{ kind: "undeclared", dependencyId: "undeclared" }] });
+    f.owner.activateTurn(f.ownership);
+    const completed = f.gate.complete(f.ownership, { kind: "standalone", toolCallId: "complete-after-cancel" }, 5);
+    assert.equal(completed.agentId, worker.agentId);
+  } finally { f.gate.close(); f.signals.close(); f.owner.close(); }
+});
+
 test("Workflow Owner completion is rejected", () => {
   const f = fixture();
   try {

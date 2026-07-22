@@ -197,6 +197,36 @@ describe("Workflow inspection", () => {
     assert.equal(projection.requesterDependency, "satisfied");
   });
 
+  it("projects cancelled Requests as satisfied with notice delivery and requester-only cancellation authority", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await mkdtemp(join(tmpdir(), "inspection-request-cancelled-")) });
+    const { runtime } = scenario.createOwner(); test.after(() => runtime.close());
+    const responderSession = scenario.childSession(runtime, "responder");
+    const unrelatedSession = scenario.childSession(runtime, "unrelated");
+    const responder = runtime.addAgent({ session: responderSession, spawner: runtime.owner(), name: "Responder" });
+    runtime.addAgent({ session: unrelatedSession, spawner: runtime.owner(), name: "Unrelated" });
+    const responderRun = runtime.startAgentRun(runtime.agent(responder.agentId));
+    const store = new DirectSignalStore(runtime.workflow.databasePath); test.after(() => store.close());
+    store.registerRouter({ recipient: runtime.agent(responder.agentId), ownership: responderRun.ownership, endpoint: "cancel-inspection-router", registeredAtMs: 0 });
+    const message = { workflowOwnerId: runtime.workflow.ownerAgentId, messageId: "cancelled-request", senderAgentId: runtime.workflow.ownerAgentId, recipientAgentId: responder.agentId, sourceEntryId: "cancelled-source", payloadDigest: "cancelled-digest", deliveryTiming: "steer" as const, responseRequired: true, onAccepted: "continue" as const, message: "SECRET REQUEST" };
+    store.bindMessage({ messageId: message.messageId, sender: runtime.owner(), recipient: runtime.agent(responder.agentId), sourceEntryId: message.sourceEntryId, payloadDigest: message.payloadDigest, deliveryTiming: "steer", responseRequired: true, createdAtMs: 0 });
+    store.acceptSignal({ request: message, recipient: runtime.agent(responder.agentId), ownership: responderRun.ownership, endpoint: "cancel-inspection-router", acceptedAtMs: 0 });
+    store.commitDelivery({ recipient: runtime.agent(responder.agentId), ownership: responderRun.ownership, endpoint: "cancel-inspection-router", messageId: message.messageId, deliveredAtMs: 1 });
+    store.cancelRequest({ requester: runtime.owner(), requestId: message.messageId, noticeMessageId: "cancellation-notice", cancelledAtMs: 2 });
+
+    let projection = runtime.inspectTarget({ request: message.messageId }) as any;
+    assert.equal(projection.status, "cancelled");
+    assert.equal(projection.answer, null);
+    assert.equal(projection.requesterDependency, "satisfied");
+    assert.equal(projection.requesterLifecycleDependency, "not-waiting");
+    assert.deepEqual(projection.cancellation, { noticeMessageId: "cancellation-notice", delivery: "queued" });
+    assert.equal(projection.callerAuthority.cancelRequest, false, "terminal Requests cannot be cancelled again through projected authority");
+    assert.equal(JSON.stringify(projection).includes("SECRET"), false);
+
+    const unrelated = scenario.startAgent(runtime.workflow, unrelatedSession); test.after(() => unrelated.close());
+    projection = unrelated.inspectTarget({ request: message.messageId }) as any;
+    assert.equal(projection.callerAuthority.cancelRequest, false);
+  });
+
   it("does not alter schema or block a concurrent WAL writer while inspecting Requests", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await mkdtemp(join(tmpdir(), "inspection-purity-")) });
     const { runtime } = scenario.createOwner(); test.after(() => runtime.close());
@@ -271,6 +301,6 @@ describe("Workflow inspection", () => {
     store.acceptSignal({ request, recipient: owner.agent(responder.agentId), ownership: responderRun.ownership, endpoint: "known-router", acceptedAtMs: 0 });
     const unrelated = scenario.startAgent(owner.workflow, unrelatedSession); test.after(() => unrelated.close());
     const projection = unrelated.inspectTarget({ request: request.messageId }) as any;
-    assert.deepEqual(projection.callerAuthority, { inspect: true, relationship: "known-request", workflowOwner: false, requester: false, responder: false });
+    assert.deepEqual(projection.callerAuthority, { inspect: true, relationship: "known-request", workflowOwner: false, requester: false, responder: false, cancelRequest: false });
   });
 });

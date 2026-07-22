@@ -347,6 +347,10 @@ export class WorkflowBootstrap {
     return this.#directSignalRuntime().sendMessage(input);
   }
 
+  cancelRequest(requestId: string) {
+    return this.#directSignalRuntime().cancelRequest(requestId);
+  }
+
   spawnInitialRequest(input: Omit<import("./workflow-control-plane.ts").SpawnedInitialRequestInput, "capabilities"> & {
     capabilities?: AgentCapabilityConfiguration;
   }) {

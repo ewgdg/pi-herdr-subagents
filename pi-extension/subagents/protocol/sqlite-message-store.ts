@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 import {
   WorkflowProtocolError,
   type AgentCapabilityConfiguration,
@@ -9,6 +10,7 @@ import type {
   AcceptedSignal,
   DirectSignalRecord,
   PendingMessagePointer,
+  RequestCancellationReceipt,
   RequestRecord,
   SignalAcceptRequest,
   SignalDeliveryTiming,
@@ -26,19 +28,30 @@ interface MessageRow {
   on_accepted: "continue" | "complete";
   reactivates_recipient: number;
   in_reply_to_request_id: string | null; acceptance_sequence: number | null;
-  delivery_status: "bound" | "queued" | "delivered"; created_at_ms: number;
+  delivery_status: "bound" | "queued" | "delivered" | "suppressed"; created_at_ms: number;
   accepted_at_ms: number | null; delivered_at_ms: number | null;
+  protocol_notice_kind: "request-cancelled" | null; canonical_request_id: string | null;
+  projection_claimed: number;
+  projection_committed: number;
 }
 interface PointerRow {
   message_id: string; sender_agent_id: string; recipient_agent_id: string; source_entry_id: string;
   payload_digest: string; delivery_timing: SignalDeliveryTiming; response_required: number;
   reactivates_recipient: number;
   in_reply_to_request_id: string | null; acceptance_sequence: number; accepted_at_ms: number;
+  protocol_notice_kind: "request-cancelled" | null; canonical_request_id: string | null;
+  projection_claimed: number;
+  projection_committed: number;
 }
 interface RequestRow {
   request_id: string; requester_agent_id: string; responder_agent_id: string;
-  answer_delivery_timing: SignalDeliveryTiming; status: "open" | "answered" | "resolved";
+  answer_delivery_timing: SignalDeliveryTiming; status: "open" | "answered" | "resolved" | "cancelled";
   answer_message_id: string | null;
+  cancelled_at_ms: number | null;
+  cancellation_notice_message_id: string | null;
+  cancellation_notice_payload: string | null;
+  cancellation_notice_delivery_status: "queued" | "delivered" | null;
+  cancellation_notice_delivered_at_ms: number | null;
 }
 
 export interface SpawnedInitialRequestInput {
@@ -284,7 +297,7 @@ export class DirectSignalStore {
             )
             AND NOT EXISTS (
               SELECT 1 FROM workflow_requests
-              WHERE requester_agent_id = ? AND status != 'resolved'
+              WHERE requester_agent_id = ? AND status IN ('open', 'answered')
             )
         `).run(sender.agentId, sender.agentId, sender.agentId);
       }
@@ -457,7 +470,7 @@ export class DirectSignalStore {
     const request = this.#readRequest(requestId);
     if (!request) throw new WorkflowProtocolError("UnknownRequest", `Unknown Request ${requestId}`);
     if (request.responder_agent_id !== sender.agentId) throw new WorkflowProtocolError("AnswerUnauthorized", `Agent ${sender.agentId} is not addressed by Request ${requestId}`);
-    if (!allowClosed && request.status !== "open") throw new WorkflowProtocolError("AnswerAlreadyClosed", `Request ${requestId} already has a terminal Answer`);
+    if (!allowClosed && request.status !== "open") throw new WorkflowProtocolError("AnswerAlreadyClosed", `Request ${requestId} already has a terminal outcome`);
     return mapRequest(request);
   }
 
@@ -512,12 +525,26 @@ export class DirectSignalStore {
     return this.#withTransaction(() => {
       this.#assertCurrentRouter(input.recipient, input.ownership, input.endpoint);
       const message = this.#readMessage(input.messageId);
-      if (!message || message.recipient_agent_id !== input.recipient.agentId || message.delivery_status === "bound") return "not-deliverable";
+      if (!message || message.recipient_agent_id !== input.recipient.agentId
+        || message.delivery_status === "bound" || message.delivery_status === "suppressed") return "not-deliverable";
       if (message.delivery_status === "delivered") return "already-delivered";
       const removed = this.#database.prepare("DELETE FROM pending_message_pointers WHERE message_id = ? AND recipient_agent_id = ?").run(input.messageId, input.recipient.agentId);
       if (Number(removed.changes) !== 1) throw new Error(`Pending pointer is missing for Message ${input.messageId}`);
-      const delivered = this.#database.prepare("UPDATE direct_signal_messages SET delivery_status = 'delivered', delivered_at_ms = ? WHERE message_id = ? AND delivery_status = 'queued'").run(input.deliveredAtMs, input.messageId);
+      const delivered = this.#database.prepare(`UPDATE direct_signal_messages
+        SET delivery_status = 'delivered', delivered_at_ms = ?, projection_claimed = 1, projection_committed = 1
+        WHERE message_id = ? AND delivery_status = 'queued'`
+      ).run(input.deliveredAtMs, input.messageId);
       if (Number(delivered.changes) !== 1) throw new Error(`Message ${input.messageId} could not transition from queued to delivered`);
+      if (message.protocol_notice_kind === "request-cancelled") {
+        const updated = this.#database.prepare(`UPDATE workflow_requests
+          SET cancellation_notice_delivery_status = 'delivered', cancellation_notice_delivered_at_ms = ?
+          WHERE request_id = ? AND status = 'cancelled' AND cancellation_notice_message_id = ?
+            AND cancellation_notice_delivery_status = 'queued'`
+        ).run(input.deliveredAtMs, message.canonical_request_id, message.message_id);
+        if (Number(updated.changes) !== 1) {
+          throw new Error(`Cancellation notice ${message.message_id} no longer belongs to Request ${message.canonical_request_id}`);
+        }
+      }
       if (message.in_reply_to_request_id) {
         const updated = this.#database.prepare(`UPDATE workflow_requests SET status = 'resolved' WHERE request_id = ? AND answer_message_id = ? AND status = 'answered'`).run(message.in_reply_to_request_id, message.message_id);
         if (Number(updated.changes) !== 1) throw new Error(`Answer ${message.message_id} no longer owns Request ${message.in_reply_to_request_id}`);
@@ -544,6 +571,18 @@ export class DirectSignalStore {
     return row.session_path;
   }
 
+  resolveProtocolNotice(owner: string, messageId: string): { requestId: string; message: string } {
+    this.#assertWorkflow(owner);
+    const row = this.#database.prepare(`SELECT r.request_id, r.cancellation_notice_payload
+      FROM workflow_requests r JOIN direct_signal_messages m
+        ON m.message_id = r.cancellation_notice_message_id
+      WHERE m.message_id = ? AND m.protocol_notice_kind = 'request-cancelled'
+        AND m.canonical_request_id = r.request_id`
+    ).get(messageId) as { request_id: string; cancellation_notice_payload: string } | undefined;
+    if (!row) throw new Error(`Canonical cancellation notice ${messageId} is missing`);
+    return { requestId: row.request_id, message: row.cancellation_notice_payload };
+  }
+
   recipientLifecycle(recipient: AgentReference): "owner" | "active" | "waiting" | "waiting-human" | "interrupted" | "ended" { this.#assertWorkflow(recipient.workflowOwnerId); return this.#recipientLifecycle(recipient); }
   inspectMessage(owner: string, messageId: string): DirectSignalRecord | undefined { this.#assertWorkflow(owner); const row = this.#readMessage(messageId); return row ? mapMessage(row) : undefined; }
   listMessages(owner: string): DirectSignalRecord[] { this.#assertWorkflow(owner); return (this.#database.prepare("SELECT * FROM direct_signal_messages ORDER BY created_at_ms, message_id").all() as unknown as MessageRow[]).map(mapMessage); }
@@ -558,7 +597,172 @@ export class DirectSignalStore {
   }
   inspectRequest(owner: string, requestId: string): RequestRecord | undefined { this.#assertWorkflow(owner); const row = this.#readRequest(requestId); return row ? mapRequest(row) : undefined; }
   listRequests(requester: AgentReference): RequestRecord[] { this.#assertWorkflow(requester.workflowOwnerId); return (this.#database.prepare("SELECT * FROM workflow_requests WHERE requester_agent_id = ? ORDER BY request_id").all(requester.agentId) as unknown as RequestRow[]).map(mapRequest); }
-  listPending(recipient: AgentReference): PendingMessagePointer[] { this.#assertWorkflow(recipient.workflowOwnerId); this.#requireAgent(recipient.agentId); return (this.#database.prepare("SELECT * FROM pending_message_pointers WHERE recipient_agent_id = ? ORDER BY acceptance_sequence").all(recipient.agentId) as unknown as PointerRow[]).map(mapPointer); }
+  listPending(recipient: AgentReference): PendingMessagePointer[] {
+    this.#assertWorkflow(recipient.workflowOwnerId);
+    this.#requireAgent(recipient.agentId);
+    return (this.#database.prepare(`SELECT p.*, m.projection_claimed, m.projection_committed
+      FROM pending_message_pointers p JOIN direct_signal_messages m ON m.message_id = p.message_id
+      WHERE p.recipient_agent_id = ? ORDER BY p.acceptance_sequence`
+    ).all(recipient.agentId) as unknown as PointerRow[]).map(mapPointer);
+  }
+
+  releaseInboxProjectionClaims(input: {
+    recipient: AgentReference;
+    ownership?: AgentRunOwnership;
+    endpoint: string;
+    messageIds: string[];
+  }): void {
+    if (input.messageIds.length === 0) return;
+    this.#withTransaction(() => {
+      this.#assertCurrentRouter(input.recipient, input.ownership, input.endpoint);
+      for (const messageId of input.messageIds) {
+        this.#database.prepare(`UPDATE direct_signal_messages
+          SET projection_claimed = 0, projection_committed = 0
+          WHERE message_id = ? AND recipient_agent_id = ? AND delivery_status = 'queued'
+            AND projection_claimed = 1 AND EXISTS (
+              SELECT 1 FROM pending_message_pointers WHERE pending_message_pointers.message_id = direct_signal_messages.message_id
+            )`
+        ).run(messageId, input.recipient.agentId);
+      }
+    });
+  }
+
+  /** Claim before external projection, then serialize the callback with cancellation. */
+  commitInboxProjection(input: {
+    recipient: AgentReference;
+    ownership?: AgentRunOwnership;
+    endpoint: string;
+    messageIds: string[];
+    project(messageIds: string[]): void;
+  }): string[] {
+    const claimed = this.#withTransaction(() => {
+      this.#assertCurrentRouter(input.recipient, input.ownership, input.endpoint);
+      const selected = input.messageIds.filter((messageId) => Boolean(this.#database.prepare(`
+        SELECT 1 FROM direct_signal_messages m
+        JOIN pending_message_pointers p ON p.message_id = m.message_id
+        WHERE m.message_id = ? AND m.recipient_agent_id = ?
+          AND m.delivery_status = 'queued' AND m.projection_claimed = 0
+      `).get(messageId, input.recipient.agentId)));
+      if (selected.length === 0) return [];
+
+      for (const messageId of selected) {
+        const projectionClaim = this.#database.prepare(`UPDATE direct_signal_messages
+          SET projection_claimed = 1
+          WHERE message_id = ? AND recipient_agent_id = ?
+            AND delivery_status = 'queued' AND projection_claimed = 0`
+        ).run(messageId, input.recipient.agentId);
+        if (Number(projectionClaim.changes) !== 1) throw new Error(`Message ${messageId} lost its Inbox projection claim`);
+      }
+      return selected;
+    });
+    if (claimed.length === 0) return [];
+
+    return this.#withTransaction(() => {
+      this.#assertCurrentRouter(input.recipient, input.ownership, input.endpoint);
+      const selected = claimed.filter((messageId) => Boolean(this.#database.prepare(`
+        SELECT 1 FROM direct_signal_messages m
+        JOIN pending_message_pointers p ON p.message_id = m.message_id
+        WHERE m.message_id = ? AND m.recipient_agent_id = ?
+          AND m.delivery_status = 'queued' AND m.projection_claimed = 1 AND m.projection_committed = 0
+      `).get(messageId, input.recipient.agentId)));
+      if (selected.length === 0) return [];
+
+      // A crash can roll this transaction back after the transcript append.
+      // The separately committed claim makes cancellation choose a notice in
+      // that ambiguous state, while this write lock fences Router replacement.
+      input.project(selected);
+      for (const messageId of selected) {
+        const projected = this.#database.prepare(`UPDATE direct_signal_messages
+          SET projection_committed = 1
+          WHERE message_id = ? AND recipient_agent_id = ?
+            AND delivery_status = 'queued' AND projection_claimed = 1 AND projection_committed = 0`
+        ).run(messageId, input.recipient.agentId);
+        if (Number(projected.changes) !== 1) throw new Error(`Message ${messageId} lost its Inbox projection commit`);
+      }
+      return selected;
+    });
+  }
+
+  cancelRequest(input: {
+    requester: AgentReference;
+    requestId: string;
+    noticeMessageId: string;
+    cancelledAtMs: number;
+  }): RequestCancellationReceipt {
+    return this.#withTransaction(() => {
+      this.#assertWorkflow(input.requester.workflowOwnerId);
+      this.#requireAgent(input.requester.agentId);
+      const request = this.#readRequest(input.requestId);
+      if (!request) throw new WorkflowProtocolError("UnknownRequest", `Unknown Request ${input.requestId}`);
+      if (request.requester_agent_id !== input.requester.agentId) {
+        throw new WorkflowProtocolError(
+          "RequestCancellationUnauthorized",
+          `Agent ${input.requester.agentId} is not the requester for Request ${input.requestId}`,
+        );
+      }
+      if (request.status === "cancelled") return cancellationReceipt(request);
+      if (request.status !== "open") {
+        throw new WorkflowProtocolError("RequestAlreadyClosed", `Request ${input.requestId} already has a terminal outcome`);
+      }
+      const requestMessage = this.#readMessage(input.requestId);
+      if (!requestMessage || requestMessage.delivery_status === "bound") {
+        throw new Error(`Open Request ${input.requestId} has no accepted Request message`);
+      }
+
+      if (requestMessage.delivery_status === "queued"
+        && Number(requestMessage.projection_claimed) === 0
+        && Number(requestMessage.projection_committed) === 0) {
+        const removed = this.#database.prepare(
+          "DELETE FROM pending_message_pointers WHERE message_id = ? AND recipient_agent_id = ?",
+        ).run(input.requestId, request.responder_agent_id);
+        if (Number(removed.changes) !== 1) throw new Error(`Pending pointer is missing for Request ${input.requestId}`);
+        const suppressed = this.#database.prepare(
+          `UPDATE direct_signal_messages SET delivery_status = 'suppressed'
+            WHERE message_id = ? AND delivery_status = 'queued'
+              AND projection_claimed = 0 AND projection_committed = 0`,
+        ).run(input.requestId);
+        if (Number(suppressed.changes) !== 1) throw new Error(`Request ${input.requestId} could not be suppressed`);
+        const cancelled = this.#database.prepare(`UPDATE workflow_requests
+          SET status = 'cancelled', cancelled_at_ms = ? WHERE request_id = ? AND status = 'open'`
+        ).run(input.cancelledAtMs, input.requestId);
+        if (Number(cancelled.changes) !== 1) throw new Error(`Request ${input.requestId} cancellation lost arbitration`);
+        return { requestId: input.requestId, status: "cancelled", delivery: "suppressed" };
+      }
+
+      if (requestMessage.delivery_status !== "delivered"
+        && !(requestMessage.delivery_status === "queued" && Number(requestMessage.projection_claimed) === 1)) {
+        throw new Error(`Open Request ${input.requestId} has invalid delivery state ${requestMessage.delivery_status}`);
+      }
+      const noticePayload = cancellationNoticePayload(request);
+      const noticeDigest = createHash("sha256").update(noticePayload, "utf8").digest("hex");
+      const sequence = this.#nextAcceptanceSequence(request.responder_agent_id);
+      // The Request owns canonical notice content. These rows provide only
+      // shared ordering/delivery; requester identity is routing provenance and
+      // is deliberately omitted from the runtime-authored Inbox projection.
+      this.#database.prepare(`
+        INSERT INTO direct_signal_messages (
+          message_id, sender_agent_id, recipient_agent_id, source_entry_id, payload_digest, delivery_timing,
+          response_required, in_reply_to_request_id, acceptance_sequence, delivery_status, created_at_ms,
+          accepted_at_ms, delivered_at_ms, protocol_notice_kind, canonical_request_id
+        ) VALUES (?, ?, ?, ?, ?, 'steer', 0, NULL, ?, 'queued', ?, ?, NULL, 'request-cancelled', ?)
+      `).run(input.noticeMessageId, request.requester_agent_id, request.responder_agent_id, input.noticeMessageId,
+        noticeDigest, sequence, input.cancelledAtMs, input.cancelledAtMs, request.request_id);
+      this.#database.prepare(`
+        INSERT INTO pending_message_pointers (
+          message_id, sender_agent_id, recipient_agent_id, source_entry_id, payload_digest, delivery_timing,
+          response_required, reactivates_recipient, in_reply_to_request_id, acceptance_sequence, accepted_at_ms,
+          protocol_notice_kind, canonical_request_id
+        ) VALUES (?, ?, ?, ?, ?, 'steer', 0, 0, NULL, ?, ?, 'request-cancelled', ?)
+      `).run(input.noticeMessageId, request.requester_agent_id, request.responder_agent_id, input.noticeMessageId,
+        noticeDigest, sequence, input.cancelledAtMs, request.request_id);
+      const cancelled = this.#database.prepare(`UPDATE workflow_requests SET status = 'cancelled', cancelled_at_ms = ?,
+        cancellation_notice_message_id = ?, cancellation_notice_payload = ?, cancellation_notice_delivery_status = 'queued'
+        WHERE request_id = ? AND status = 'open'`
+      ).run(input.cancelledAtMs, input.noticeMessageId, noticePayload, input.requestId);
+      if (Number(cancelled.changes) !== 1) throw new Error(`Request ${input.requestId} cancellation lost arbitration`);
+      return { requestId: input.requestId, status: "cancelled", delivery: "notice-queued", noticeMessageId: input.noticeMessageId };
+    });
+  }
 
   #claimAnswerSlot(request: SignalAcceptRequest): void {
     const target = this.#readRequest(request.inReplyToRequestId!);
@@ -571,7 +775,7 @@ export class DirectSignalStore {
       if (Number(result.changes) === 1) return;
     }
     if (target.answer_message_id === request.messageId) return;
-    throw new WorkflowProtocolError("AnswerAlreadyClosed", `Request ${target.request_id} already has a terminal Answer`);
+    throw new WorkflowProtocolError("AnswerAlreadyClosed", `Request ${target.request_id} already has a terminal outcome`);
   }
 
   #createRequest(request: SignalAcceptRequest): void {
@@ -595,12 +799,20 @@ export class DirectSignalStore {
         response_required INTEGER NOT NULL CHECK (response_required IN (0, 1)),
         on_accepted TEXT NOT NULL DEFAULT 'continue' CHECK (on_accepted IN ('continue', 'complete')),
         reactivates_recipient INTEGER NOT NULL DEFAULT 0 CHECK (reactivates_recipient IN (0, 1)), in_reply_to_request_id TEXT,
-        acceptance_sequence INTEGER, delivery_status TEXT NOT NULL CHECK (delivery_status IN ('bound', 'queued', 'delivered')),
+        acceptance_sequence INTEGER, delivery_status TEXT NOT NULL CHECK (delivery_status IN ('bound', 'queued', 'delivered', 'suppressed')),
         created_at_ms INTEGER NOT NULL, accepted_at_ms INTEGER, delivered_at_ms INTEGER,
+        protocol_notice_kind TEXT CHECK (protocol_notice_kind IN ('request-cancelled')),
+        canonical_request_id TEXT REFERENCES workflow_requests(request_id),
+        projection_claimed INTEGER NOT NULL DEFAULT 0 CHECK (projection_claimed IN (0, 1)),
+        projection_committed INTEGER NOT NULL DEFAULT 0 CHECK (projection_committed IN (0, 1)),
         UNIQUE (sender_agent_id, source_entry_id),
         CHECK ((delivery_status = 'bound' AND acceptance_sequence IS NULL AND accepted_at_ms IS NULL AND delivered_at_ms IS NULL)
           OR (delivery_status = 'queued' AND acceptance_sequence IS NOT NULL AND accepted_at_ms IS NOT NULL AND delivered_at_ms IS NULL)
-          OR (delivery_status = 'delivered' AND acceptance_sequence IS NOT NULL AND accepted_at_ms IS NOT NULL AND delivered_at_ms IS NOT NULL))
+          OR (delivery_status = 'delivered' AND acceptance_sequence IS NOT NULL AND accepted_at_ms IS NOT NULL AND delivered_at_ms IS NOT NULL)
+          OR (delivery_status = 'suppressed' AND acceptance_sequence IS NOT NULL AND accepted_at_ms IS NOT NULL AND delivered_at_ms IS NULL)),
+        CHECK ((protocol_notice_kind IS NULL AND canonical_request_id IS NULL)
+          OR (protocol_notice_kind IS NOT NULL AND canonical_request_id IS NOT NULL)),
+        CHECK (projection_committed = 0 OR projection_claimed = 1)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS recipient_acceptance_counters (agent_id TEXT PRIMARY KEY REFERENCES workflow_agents(agent_id), last_sequence INTEGER NOT NULL CHECK (last_sequence > 0)) STRICT;
       CREATE TABLE IF NOT EXISTS pending_message_pointers (
@@ -608,6 +820,10 @@ export class DirectSignalStore {
         recipient_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id), source_entry_id TEXT NOT NULL, payload_digest TEXT NOT NULL,
         delivery_timing TEXT NOT NULL CHECK (delivery_timing IN ('steer', 'deferred')), response_required INTEGER NOT NULL CHECK (response_required IN (0, 1)),
         reactivates_recipient INTEGER NOT NULL DEFAULT 0 CHECK (reactivates_recipient IN (0, 1)), in_reply_to_request_id TEXT, acceptance_sequence INTEGER NOT NULL CHECK (acceptance_sequence > 0), accepted_at_ms INTEGER NOT NULL,
+        protocol_notice_kind TEXT CHECK (protocol_notice_kind IN ('request-cancelled')),
+        canonical_request_id TEXT REFERENCES workflow_requests(request_id),
+        CHECK ((protocol_notice_kind IS NULL AND canonical_request_id IS NULL)
+          OR (protocol_notice_kind IS NOT NULL AND canonical_request_id IS NOT NULL)),
         UNIQUE (recipient_agent_id, acceptance_sequence)
       ) STRICT;
       CREATE INDEX IF NOT EXISTS pending_message_recipient_order ON pending_message_pointers (recipient_agent_id, acceptance_sequence);
@@ -768,11 +984,51 @@ export class DirectSignalStore {
 }
 
 function mapMessage(row: MessageRow): DirectSignalRecord {
-  const answer = row.in_reply_to_request_id ? { kind: "answer" as const, inReplyToRequestId: row.in_reply_to_request_id } : row.response_required ? { kind: "request" as const } : { kind: "signal" as const };
+  const answer = row.protocol_notice_kind
+    ? { kind: "protocol-notice" as const, protocolNoticeKind: row.protocol_notice_kind, canonicalRequestId: row.canonical_request_id! }
+    : row.in_reply_to_request_id ? { kind: "answer" as const, inReplyToRequestId: row.in_reply_to_request_id }
+      : row.response_required ? { kind: "request" as const } : { kind: "signal" as const };
   return { messageId: row.message_id, ...answer, senderAgentId: row.sender_agent_id, recipientAgentId: row.recipient_agent_id, sourceEntryId: row.source_entry_id, payloadDigest: row.payload_digest, deliveryTiming: row.delivery_timing, responseRequired: Number(row.response_required) === 1, onAccepted: row.on_accepted, ...(row.acceptance_sequence == null ? {} : { acceptanceSequence: Number(row.acceptance_sequence) }), deliveryStatus: row.delivery_status, createdAtMs: Number(row.created_at_ms), ...(row.accepted_at_ms == null ? {} : { acceptedAtMs: Number(row.accepted_at_ms) }), ...(row.delivered_at_ms == null ? {} : { deliveredAtMs: Number(row.delivered_at_ms) }) };
 }
-function mapPointer(row: PointerRow): PendingMessagePointer { return { messageId: row.message_id, senderAgentId: row.sender_agent_id, recipientAgentId: row.recipient_agent_id, sourceEntryId: row.source_entry_id, payloadDigest: row.payload_digest, deliveryTiming: row.delivery_timing, responseRequired: Number(row.response_required) === 1, reactivatesRecipient: Number(row.reactivates_recipient) === 1, ...(row.in_reply_to_request_id ? { inReplyToRequestId: row.in_reply_to_request_id } : {}), acceptanceSequence: Number(row.acceptance_sequence), acceptedAtMs: Number(row.accepted_at_ms) }; }
-function mapRequest(row: RequestRow): RequestRecord { return { requestId: row.request_id, requesterAgentId: row.requester_agent_id, responderAgentId: row.responder_agent_id, answerDeliveryTiming: row.answer_delivery_timing, status: row.status, ...(row.answer_message_id ? { answerMessageId: row.answer_message_id } : {}) }; }
+function mapPointer(row: PointerRow): PendingMessagePointer { return { messageId: row.message_id, senderAgentId: row.sender_agent_id, recipientAgentId: row.recipient_agent_id, sourceEntryId: row.source_entry_id, payloadDigest: row.payload_digest, deliveryTiming: row.delivery_timing, responseRequired: Number(row.response_required) === 1, reactivatesRecipient: Number(row.reactivates_recipient) === 1, ...(row.in_reply_to_request_id ? { inReplyToRequestId: row.in_reply_to_request_id } : {}), ...(row.protocol_notice_kind ? { protocolNoticeKind: row.protocol_notice_kind, canonicalRequestId: row.canonical_request_id! } : {}), acceptanceSequence: Number(row.acceptance_sequence), acceptedAtMs: Number(row.accepted_at_ms), projectionClaimed: Number(row.projection_claimed) === 1, projectionCommitted: Number(row.projection_committed) === 1 }; }
+function mapRequest(row: RequestRow): RequestRecord {
+  return {
+    requestId: row.request_id,
+    requesterAgentId: row.requester_agent_id,
+    responderAgentId: row.responder_agent_id,
+    answerDeliveryTiming: row.answer_delivery_timing,
+    status: row.status,
+    ...(row.answer_message_id ? { answerMessageId: row.answer_message_id } : {}),
+    ...(row.cancelled_at_ms == null ? {} : { cancelledAtMs: Number(row.cancelled_at_ms) }),
+    ...(row.cancellation_notice_message_id ? { cancellationNotice: {
+      messageId: row.cancellation_notice_message_id,
+      message: row.cancellation_notice_payload!,
+      deliveryStatus: row.cancellation_notice_delivery_status!,
+      ...(row.cancellation_notice_delivered_at_ms == null ? {} : { deliveredAtMs: Number(row.cancellation_notice_delivered_at_ms) }),
+    } } : {}),
+  };
+}
+
+function cancellationReceipt(row: RequestRow): RequestCancellationReceipt {
+  if (row.status !== "cancelled") throw new Error(`Request ${row.request_id} is not cancelled`);
+  if (!row.cancellation_notice_message_id) {
+    return { requestId: row.request_id, status: "cancelled", delivery: "suppressed" };
+  }
+  return {
+    requestId: row.request_id,
+    status: "cancelled",
+    delivery: row.cancellation_notice_delivery_status === "delivered" ? "notice-delivered" : "notice-queued",
+    noticeMessageId: row.cancellation_notice_message_id,
+  };
+}
+
+function cancellationNoticePayload(row: RequestRow): string {
+  return [
+    `Request ${row.request_id} was cancelled by requester Agent ${row.requester_agent_id}.`,
+    "Stop work for this Request if possible and do not send an Answer.",
+    "Cancellation does not roll back completed work or external side effects.",
+  ].join("\n");
+}
 function receiptFor(row: MessageRow) { if (row.acceptance_sequence == null) throw new Error(`Unaccepted Message ${row.message_id} has no receipt`); return { status: row.delivery_status === "delivered" ? "delivered" as const : "queued" as const, messageId: row.message_id, recipientAgentId: row.recipient_agent_id, acceptanceSequence: Number(row.acceptance_sequence) }; }
 function assertSameBinding(row: MessageRow, request: { sender: AgentReference; recipient: AgentReference; sourceEntryId: string; payloadDigest: string; deliveryTiming: SignalDeliveryTiming; responseRequired: boolean; inReplyToRequestId?: string; onAccepted?: "continue" | "complete" } | SignalAcceptRequest): void {
   const sender = "sender" in request ? request.sender.agentId : request.senderAgentId; const recipient = "recipient" in request ? request.recipient.agentId : request.recipientAgentId;
