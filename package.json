@@ -14,8 +14,8 @@
   "type": "module",
   "scripts": {
     "lint": "oxlint pi-extension test",
-    "test": "node --test \"test/**/*.test.ts\"",
-    "test:smoke": "node --test test/smoke/smoke.ts"
+    "test": "node --test --test-reporter=dot \"test/**/*.test.ts\"",
+    "test:smoke": "node --test --test-reporter=dot test/smoke/smoke.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
