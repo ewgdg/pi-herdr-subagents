@@ -1307,6 +1307,13 @@ describe("subagent discovery", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
   });
 
+  it("preserves explicitly requested agent_inspect without widening other allowlists", () => {
+    assert.equal(
+      testApi.buildSubagentToolAllowlist("read,agent_inspect"),
+      "read,agent_inspect,caller_ping,subagent_done",
+    );
+  });
+
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
@@ -2123,7 +2130,7 @@ describe("tool registration", () => {
 
     assert.deepEqual(
       registeredTools.map((tool) => tool.name).sort(),
-      ["agent_send", "subagent", "subagent_interrupt", "subagent_resume", "subagents_list"],
+      ["agent_inspect", "agent_send", "subagent", "subagent_interrupt", "subagent_resume", "subagents_list"],
     );
     const spawn = registeredTools.find((tool) => tool.name === "subagent");
     const resume = registeredTools.find((tool) => tool.name === "subagent_resume");
@@ -2279,6 +2286,21 @@ describe("tool registration", () => {
       assert.equal(registeredTools.some((tool) => tool.name === "subagent"), false);
       assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), false);
       assert.equal(registeredTools.some((tool) => tool.name === "subagents_list"), true);
+      assert.equal(registeredTools.some((tool) => tool.name === "agent_inspect"), true);
+    } finally {
+      delete process.env.PI_SUBAGENT_ID;
+      delete process.env.PI_DENY_TOOLS;
+    }
+  });
+
+  it("allows a restricted child to explicitly deny agent_inspect", () => {
+    process.env.PI_SUBAGENT_ID = "child-test";
+    process.env.PI_DENY_TOOLS = "agent_inspect";
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      assert.equal(registeredTools.some((tool) => tool.name === "agent_inspect"), false);
+      assert.equal(registeredTools.some((tool) => tool.name === "agent_send"), true);
     } finally {
       delete process.env.PI_SUBAGENT_ID;
       delete process.env.PI_DENY_TOOLS;

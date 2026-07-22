@@ -15,6 +15,7 @@ import {
   registerAgentSendTool,
   startDirectSignalRouter,
 } from "./protocol/direct-signal-extension.ts";
+import { registerAgentInspectTool } from "./protocol/agent-inspect-extension.ts";
 import {
   HumanInterruptInputBridge,
   registerAgentAskUserTool,
@@ -422,6 +423,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  registerAgentInspectTool(pi, workflowBootstrap, !parseDeniedTools(deniedToolsValue).includes("agent_inspect"));
   registerAgentSendTool(
     pi,
     workflowBootstrap,

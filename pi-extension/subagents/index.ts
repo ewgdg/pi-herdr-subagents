@@ -107,6 +107,7 @@ import {
   registerAgentSendTool,
   startDirectSignalRouter,
 } from "./protocol/direct-signal-extension.ts";
+import { registerAgentInspectTool } from "./protocol/agent-inspect-extension.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -2166,6 +2167,7 @@ function subagentsExtensionWithOptions(
 
   const shouldRegister = (name: string) => !deniedTools.has(name);
 
+  registerAgentInspectTool(pi, runtime.workflowBootstrap, shouldRegister("agent_inspect"));
   registerAgentSendTool(pi, runtime.workflowBootstrap, shouldRegister("agent_send"), {
     async reconcileSpawnedInitialRequest(input) {
       const agentDefinition = loadAgentDefaults(input.agent);

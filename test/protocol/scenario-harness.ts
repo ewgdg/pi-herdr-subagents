@@ -248,6 +248,25 @@ export class ControllableRuntimeAdapter {
     return this.#controlPlane.agent(agentId);
   }
 
+  owner(): AgentReference {
+    return this.#controlPlane.owner;
+  }
+
+  inspectTarget(target: import("../../pi-extension/subagents/protocol/workflow-inspection.ts").InspectionTarget) {
+    return this.#controlPlane.inspectTarget(target);
+  }
+
+  snapshotDurableState() {
+    const agents = this.#controlPlane.listWorkflow(this.#controlPlane.owner);
+    return agents.map((agent) => ({
+      agent,
+      activation: this.#controlPlane.inspectActivation(this.#controlPlane.agent(agent.agentId)),
+      ownership: this.#controlPlane.currentAgentRun(this.#controlPlane.agent(agent.agentId)),
+      human: this.#controlPlane.inspectHumanInterrupt(this.#controlPlane.agent(agent.agentId)),
+      undeclared: this.#controlPlane.inspectUndeclaredEpisode(this.#controlPlane.agent(agent.agentId)),
+    }));
+  }
+
   inspect(reference: AgentReference): AgentRecord {
     return this.#controlPlane.inspectAgent(reference);
   }

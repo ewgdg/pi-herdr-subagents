@@ -31,6 +31,7 @@ import {
 } from "./provisional-spawn.ts";
 import { resolveCanonicalSpawnedInitialMessage } from "./direct-signal-transcript.ts";
 import { DirectSignalStore } from "./sqlite-message-store.ts";
+import type { InspectionTarget } from "./workflow-inspection.ts";
 
 export const WORKFLOW_OWNER_SESSION_ID_ENV = "PI_WORKFLOW_OWNER_SESSION_ID";
 export const WORKFLOW_OWNER_SESSION_PATH_ENV = "PI_WORKFLOW_OWNER_SESSION_PATH";
@@ -283,6 +284,10 @@ export class WorkflowBootstrap {
   inspect(agentId: string): AgentRecord {
     const controlPlane = this.#requireControlPlane();
     return controlPlane.inspectAgent(controlPlane.agent(agentId));
+  }
+
+  inspectTarget(target: InspectionTarget): unknown {
+    return this.#requireControlPlane().inspectTarget(target);
   }
 
   inspectActivation(agentId: string): ActivationRecord | undefined {

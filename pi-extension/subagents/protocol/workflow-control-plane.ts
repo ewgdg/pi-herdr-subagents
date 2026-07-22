@@ -11,10 +11,12 @@ import {
   type UndeclaredSettlementEpisode,
 } from "./activation-lifecycle.ts";
 import { readPiSessionUuid, assertSessionUuid } from "./workflow-identity.ts";
+import { WorkflowInspection, type InspectionTarget } from "./workflow-inspection.ts";
 import { assertDescendantTranscriptPath, createWorkflowLayout } from "./workflow-layout.ts";
 import { SQLiteWorkflowStore } from "./sqlite-workflow-store.ts";
 import {
   DirectSignalStore,
+  DirectSignalInspectionStore,
   type SpawnedInitialRequestReceipt,
 } from "./sqlite-message-store.ts";
 import {
@@ -109,6 +111,7 @@ export class WorkflowControlPlane {
   readonly #store: SQLiteWorkflowStore;
   readonly #ownership: AgentRunOwnershipStore;
   readonly #activations: ActivationLifecycleStore;
+  readonly #messageInspection: DirectSignalInspectionStore;
   readonly #now: () => number;
   readonly #currentAgentId: string;
   #closed = false;
@@ -125,6 +128,7 @@ export class WorkflowControlPlane {
     this.#store = store;
     this.#ownership = ownership;
     this.#activations = activations;
+    this.#messageInspection = new DirectSignalInspectionStore(workflow.databasePath);
     this.#now = now;
     this.#currentAgentId = currentAgentId;
   }
@@ -282,6 +286,7 @@ export class WorkflowControlPlane {
     if (this.#closed) return;
     this.#ownership.close();
     this.#activations.close();
+    this.#messageInspection.close();
     this.#store.close();
     this.#closed = true;
   }
@@ -413,6 +418,20 @@ export class WorkflowControlPlane {
     this.#assertOpen();
     this.#assertReference(reference);
     return this.#store.inspectAgent(reference.workflowOwnerId, reference.agentId);
+  }
+
+  inspectTarget(target: InspectionTarget): unknown {
+    this.#assertOpen();
+    return new WorkflowInspection({
+      workflow: this.workflow,
+      caller: this.currentAgent,
+      agents: this.#store,
+      inspectActivation: (agent) => this.#activations.inspect(agent),
+      inspectHumanInterrupt: (agent) => this.#activations.inspectHumanInterrupt(agent),
+      inspectUndeclaredEpisode: (agent) => this.#activations.inspectUndeclaredEpisode(agent),
+      inspectRequestProjection: (requestId) => this.#messageInspection.inspectRequestProjection(this.workflow.ownerAgentId, requestId),
+      now: this.#now,
+    }).inspect(target);
   }
 
   listDirectChildren(spawner: AgentReference): AgentRecord[] {

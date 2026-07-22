@@ -262,6 +262,23 @@ agent_send({ target: { request: requestId }, message: "Review complete" });
 
 Only the Agent addressed by a Request may answer it. The first queued Answer closes the Request; retrying that same Answer is idempotent. An Answer can also set `responseRequired: true` to create its own Request atomically. A Request becomes resolved only when its Answer is committed to the requester’s inbox; unresolved Requests remain durable Agent dependencies.
 
+## agent_inspect — Read-only Workflow State
+
+`agent_inspect` reads capability-filtered durable state without waking Agents, creating activations, reserving ownership, changing protocol state, or writing transcript content:
+
+```typescript
+agent_inspect({ target: { agent: agentId } });
+agent_inspect({ target: { request: requestId } });
+agent_inspect({ target: { directChildren: true } });
+agent_inspect({ target: { workflow: true } }); // Workflow Owner only
+```
+
+A caller may inspect a known Agent ID, but that does not grant control, ownership, or enumeration. Non-owner Agents can enumerate only their direct children; the Workflow Owner can enumerate the complete Workflow. Human Interrupt and undeclared-settlement state is redacted so canonical question, response, notice payloads, and model-facing identities are not duplicated.
+
+This bounded implementation reports only state already persisted by the current protocol: Agent activation/waiting state, Human Interrupt state, undeclared-settlement correction state, and Request `open`, `answered`, or `resolved` state. Request cancellation/orphan state, Operation Review details, and Incident Visibility remain deferred to their producer work and are not represented by placeholders.
+
+An explicit child `tools` allowlist remains exact: include `agent_inspect` when that restricted child needs inspection. Without an explicit allowlist it is available by default, and `deny-tools: agent_inspect` removes it.
+
 ## caller_ping — Child-to-Parent Help Request
 
 The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.

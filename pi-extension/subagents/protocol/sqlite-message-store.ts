@@ -87,6 +87,68 @@ export interface EndedRecipientRequestReceipt extends QueuedSignalReceipt {
   committedByThisPreparation: boolean;
 }
 
+/** Query-only Request/Message access. Opens SQLite read-only and performs no schema initialization or PRAGMA writes. */
+export class DirectSignalInspectionStore {
+  readonly #database: DatabaseSync;
+  #closed = false;
+
+  constructor(databasePath: string, busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS) {
+    this.#database = new DatabaseSync(databasePath, { timeout: busyTimeoutMs, readOnly: true });
+  }
+
+  close(): void {
+    if (!this.#closed) { this.#database.close(); this.#closed = true; }
+  }
+
+  inspectMessage(owner: string, messageId: string): DirectSignalRecord | undefined {
+    this.#assertWorkflow(owner);
+    const row = this.#database.prepare("SELECT * FROM direct_signal_messages WHERE message_id = ?").get(messageId) as MessageRow | undefined;
+    return row ? mapMessage(row) : undefined;
+  }
+
+  inspectRequest(owner: string, requestId: string): RequestRecord | undefined {
+    this.#assertWorkflow(owner);
+    const row = this.#database.prepare("SELECT * FROM workflow_requests WHERE request_id = ?").get(requestId) as RequestRow | undefined;
+    return row ? mapRequest(row) : undefined;
+  }
+
+  inspectRequestProjection(owner: string, requestId: string): {
+    request: RequestRecord;
+    requestDeliveryStatus?: DirectSignalRecord["deliveryStatus"];
+    answerDeliveryStatus?: DirectSignalRecord["deliveryStatus"];
+  } | undefined {
+    this.#assertWorkflow(owner);
+    const messageTable = this.#database.prepare(
+      "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'direct_signal_messages'",
+    ).get();
+    if (!messageTable) return undefined;
+    const row = this.#database.prepare(`
+      SELECT r.*, request_message.delivery_status AS request_delivery_status,
+        answer_message.delivery_status AS answer_delivery_status
+      FROM workflow_requests r
+      LEFT JOIN direct_signal_messages request_message ON request_message.message_id = r.request_id
+      LEFT JOIN direct_signal_messages answer_message ON answer_message.message_id = r.answer_message_id
+      WHERE r.request_id = ?
+    `).get(requestId) as (RequestRow & {
+      request_delivery_status: DirectSignalRecord["deliveryStatus"] | null;
+      answer_delivery_status: DirectSignalRecord["deliveryStatus"] | null;
+    }) | undefined;
+    if (!row) return undefined;
+    return {
+      request: mapRequest(row),
+      ...(row.request_delivery_status ? { requestDeliveryStatus: row.request_delivery_status } : {}),
+      ...(row.answer_delivery_status ? { answerDeliveryStatus: row.answer_delivery_status } : {}),
+    };
+  }
+
+  #assertWorkflow(owner: string): void {
+    const row = this.#database.prepare("SELECT owner_agent_id FROM workflow_metadata WHERE singleton = 1").get() as { owner_agent_id: string } | undefined;
+    if (!row || row.owner_agent_id !== owner) {
+      throw new WorkflowProtocolError("WorkflowMismatch", "Inspection source does not belong to the current Workflow");
+    }
+  }
+}
+
 /** Durable inbox pointers and Agent-scoped Request obligations. */
 export class DirectSignalStore {
   readonly #database: DatabaseSync;
