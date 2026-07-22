@@ -13,7 +13,7 @@ export const AgentCancelParams = Type.Object({
   target: Type.Union([AgentCancellationTarget, RequestCancellationTarget]),
 }, { additionalProperties: false });
 
-/** Register strict Request or single-activation cancellation. */
+/** Register strict Request or obligation-preserving activation cancellation. */
 export function registerAgentCancelTool(
   pi: ExtensionAPI,
   workflowBootstrap: WorkflowBootstrap,
@@ -25,7 +25,7 @@ export function registerAgentCancelTool(
     label: "Cancel Request or Activation",
     description:
       "Cancel either one unresolved Request created by the current Agent or one authorized open Subagent activation. " +
-      "Activation cancellation requires Workflow Owner or direct Spawner authority, confirms exact process termination, and does not cascade to descendants.",
+      "Activation cancellation requires Workflow Owner or direct Spawner authority, confirms exact process termination, and prunes descendants except for their external Request-dependency closure.",
     promptSnippet:
       "Cancel one Request you created or one authorized Agent activation. Use the durable Workflow Agent ID, not a pane, display name, or legacy running ID.",
     parameters: AgentCancelParams,

@@ -300,7 +300,7 @@ Request cancellation removes the requester's dependency and permits completion w
 
 ### Agent target
 
-The Workflow Owner may cancel any open Subagent activation. A Spawner may cancel only its direct child's open activation. Agent Definition names, including `moderator`, do not grant authority. Cancellation affects one activation only; it does not cascade to descendants.
+The Workflow Owner may cancel any open Subagent activation. A Spawner may cancel only its direct child's open activation. Agent Definition names, including `moderator`, do not grant authority. The target always cancels. Its descendants cancel by default, except for the transitive closure of descendants needed to satisfy unresolved Requests that entered the subtree from outside.
 
 The runtime first durably claims a cancellation operation, which blocks completion through a `cancellation:*` operation dependency. It then reads the exact fenced Agent Run locator, inspects the process, closes its herdr surface, and inspects again. Missing process evidence confirms termination; unavailable inspection does not. Until termination is confirmed and the final transaction commits, the activation remains open and retains its Router and Agent Run ownership. Unconfirmed termination is reported as `CancellationInDoubt` rather than success. A later authorized `agent_cancel` call for that same open activation resumes the original operation even though Pi supplies a new tool-call ID; both IDs remain durably fenced to the original activation and cannot cancel a replacement activation when replayed.
 
@@ -314,6 +314,8 @@ After confirmed termination, one immediate Workflow transaction revalidates the 
 - terminalizes pending, response-bound, and unconsumed Human Interrupt results, clears `DECIDE` attention, and closes an open undeclared-settlement episode.
 
 An orphan notice's canonical payload and exactly-once delivery metadata live on its Request. Delivery resolves the requester's dependency. Reactivating the former responder cannot reopen or Answer the orphaned Request; replacement work requires a new Request.
+
+Before the root activation ends, the runtime freezes its descendant plan. An unresolved incoming Request from outside the subtree retains that recipient; each unresolved Request it owns retains its descendant responder transitively. Signals, Addressability, and transcript references do not retain Agents. Survivors keep their identities, Spawner relationships, durable sessions, and Requests. They are already independently controllable by the Workflow Owner, so this fallback adds no model turn, attention item, authority transfer, or reparenting. A survivor may later cancel a retained Request through ordinary Request cancellation. If a descendant cancellation remains in doubt after its root ends, a later authorized `agent_cancel` for that historical root resumes only its pending cascade; its new tool-call ID is fenced to that historical operation and cannot affect a replacement activation.
 
 ## agent_inspect — Read-only Workflow State
 

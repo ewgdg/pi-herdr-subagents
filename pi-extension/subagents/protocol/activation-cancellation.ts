@@ -19,7 +19,9 @@ export type CancellationOperationState =
 export type CancellationAuthority =
   | { kind: "workflow-owner" }
   | { kind: "direct-spawner" }
-  | { kind: "incident-control"; incidentId: string; rationale: string };
+  | { kind: "incident-control"; incidentId: string; rationale: string }
+  /** Runtime-attributed propagation from a committed root cancellation. */
+  | { kind: "cascade"; rootOperationId: string };
 
 export interface AgentRunLocator {
   surface: string;
@@ -70,9 +72,10 @@ interface CancellationRow {
   operation_id: string;
   actor_agent_id: string;
   source_id: string;
-  authority_kind: "workflow-owner" | "direct-spawner" | "incident-control";
+  authority_kind: "workflow-owner" | "direct-spawner" | "incident-control" | "cascade";
   incident_id: string | null;
   rationale: string | null;
+  root_operation_id: string | null;
   target_agent_id: string;
   activation_id: string;
   run_id: string;
@@ -105,6 +108,12 @@ interface RequestTransformationRow {
   in_reply_to_request_id: string | null;
 }
 
+export interface DescendantCancellationPlan {
+  rootOperationId: string;
+  cancelled: Array<{ agentId: string; activationId: string }>;
+  survivors: string[];
+}
+
 export class ActivationCancellationStore {
   readonly #database: DatabaseSync;
   #closed = false;
@@ -116,14 +125,16 @@ export class ActivationCancellationStore {
     messages.close();
     this.#database = new DatabaseSync(databasePath, { timeout: busyTimeoutMs });
     this.#database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+    this.#migrateAuthoritySchema();
     this.#database.exec(`
       CREATE TABLE IF NOT EXISTS activation_cancellations (
         operation_id TEXT PRIMARY KEY,
         actor_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
         source_id TEXT NOT NULL,
-        authority_kind TEXT NOT NULL CHECK (authority_kind IN ('workflow-owner', 'direct-spawner', 'incident-control')),
+        authority_kind TEXT NOT NULL CHECK (authority_kind IN ('workflow-owner', 'direct-spawner', 'incident-control', 'cascade')),
         incident_id TEXT,
         rationale TEXT,
+        root_operation_id TEXT REFERENCES activation_cancellations(operation_id),
         target_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
         activation_id TEXT NOT NULL UNIQUE REFERENCES agent_activations(activation_id),
         run_id TEXT NOT NULL,
@@ -137,8 +148,9 @@ export class ActivationCancellationStore {
         updated_at_ms INTEGER NOT NULL,
         committed_at_ms INTEGER,
         UNIQUE (actor_agent_id, source_id),
-        CHECK ((authority_kind = 'incident-control' AND incident_id IS NOT NULL AND rationale IS NOT NULL)
-          OR (authority_kind != 'incident-control' AND incident_id IS NULL AND rationale IS NULL)),
+        CHECK ((authority_kind = 'incident-control' AND incident_id IS NOT NULL AND rationale IS NOT NULL AND root_operation_id IS NULL)
+          OR (authority_kind = 'cascade' AND incident_id IS NULL AND rationale IS NULL AND root_operation_id IS NOT NULL)
+          OR (authority_kind IN ('workflow-owner', 'direct-spawner') AND incident_id IS NULL AND rationale IS NULL AND root_operation_id IS NULL)),
         CHECK ((state = 'committed' AND committed_at_ms IS NOT NULL)
           OR (state != 'committed' AND committed_at_ms IS NULL))
       ) STRICT;
@@ -151,11 +163,138 @@ export class ActivationCancellationStore {
         bound_at_ms INTEGER NOT NULL,
         PRIMARY KEY (actor_agent_id, source_id)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS activation_cancellation_cascades (
+        root_operation_id TEXT PRIMARY KEY REFERENCES activation_cancellations(operation_id),
+        planned_at_ms INTEGER NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS activation_cancellation_descendants (
+        root_operation_id TEXT NOT NULL REFERENCES activation_cancellations(operation_id),
+        agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
+        disposition TEXT NOT NULL CHECK (disposition IN ('cancelled', 'survives')),
+        activation_id TEXT REFERENCES agent_activations(activation_id),
+        cascade_state TEXT NOT NULL DEFAULT 'pending'
+          CHECK (cascade_state IN ('pending', 'cancelled', 'skipped', 'survives')),
+        depth INTEGER NOT NULL CHECK (depth > 0),
+        PRIMARY KEY (root_operation_id, agent_id),
+        CHECK ((disposition = 'cancelled' AND activation_id IS NOT NULL)
+          OR (disposition = 'survives' AND activation_id IS NULL)),
+        CHECK ((disposition = 'cancelled' AND cascade_state IN ('pending', 'cancelled', 'skipped'))
+          OR (disposition = 'survives' AND cascade_state = 'survives'))
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS activation_cancellation_descendants_root_disposition
+        ON activation_cancellation_descendants (root_operation_id, disposition, depth, agent_id);
       INSERT OR IGNORE INTO activation_cancellation_sources (
         actor_agent_id, source_id, operation_id, bound_at_ms
       ) SELECT actor_agent_id, source_id, operation_id, created_at_ms
-        FROM activation_cancellations;
+      FROM activation_cancellations;
     `);
+    this.#initializeDescendantCascadeState();
+  }
+
+  #initializeDescendantCascadeState(): void {
+    const columns = this.#database.prepare("PRAGMA table_info(activation_cancellation_descendants)")
+      .all() as Array<{ name: string }>;
+    if (columns.some((column) => column.name === "cascade_state")) return;
+    this.#database.exec(`ALTER TABLE activation_cancellation_descendants
+      ADD COLUMN cascade_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (cascade_state IN ('pending', 'cancelled', 'skipped', 'survives'))`);
+    this.#database.prepare(`UPDATE activation_cancellation_descendants
+      SET cascade_state = 'survives' WHERE disposition = 'survives'`
+    ).run();
+  }
+
+  /** Rebuild once because SQLite cannot widen an existing CHECK constraint. */
+  #migrateAuthoritySchema(): void {
+    const observed = this.#database.prepare(
+      "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'activation_cancellations'",
+    ).get() as { sql: string } | undefined;
+    if (!observed || (observed.sql.includes("'cascade'") && observed.sql.includes("root_operation_id"))) return;
+
+    this.#database.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
+    try {
+      // A concurrent opener may have completed this migration while this
+      // connection waited for the write lock. Snapshot only after rechecking.
+      const table = this.#database.prepare(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'activation_cancellations'",
+      ).get() as { sql: string } | undefined;
+      if (!table || (table.sql.includes("'cascade'") && table.sql.includes("root_operation_id"))) {
+        this.#database.exec("COMMIT");
+        return;
+      }
+      const sourceTable = this.#database.prepare(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'activation_cancellation_sources'",
+      ).get();
+      const sources = sourceTable
+        ? this.#database.prepare(`SELECT actor_agent_id, source_id, operation_id, bound_at_ms
+            FROM activation_cancellation_sources`
+          ).all() as Array<{
+            actor_agent_id: string;
+            source_id: string;
+            operation_id: string;
+            bound_at_ms: number;
+          }>
+        : [];
+      this.#database.exec(`
+        CREATE TABLE activation_cancellations_v2 (
+          operation_id TEXT PRIMARY KEY,
+          actor_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
+          source_id TEXT NOT NULL,
+          authority_kind TEXT NOT NULL CHECK (authority_kind IN ('workflow-owner', 'direct-spawner', 'incident-control', 'cascade')),
+          incident_id TEXT,
+          rationale TEXT,
+          root_operation_id TEXT REFERENCES activation_cancellations_v2(operation_id),
+          target_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
+          activation_id TEXT NOT NULL UNIQUE REFERENCES agent_activations(activation_id),
+          run_id TEXT NOT NULL,
+          fencing_epoch INTEGER NOT NULL CHECK (fencing_epoch > 0),
+          activation_revision INTEGER NOT NULL CHECK (activation_revision > 0),
+          run_locator TEXT,
+          state TEXT NOT NULL CHECK (state IN ('terminating', 'ready-to-commit', 'in-doubt', 'committed')),
+          termination_attempts INTEGER NOT NULL DEFAULT 0 CHECK (termination_attempts >= 0),
+          last_error TEXT,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          committed_at_ms INTEGER,
+          UNIQUE (actor_agent_id, source_id),
+          CHECK ((authority_kind = 'incident-control' AND incident_id IS NOT NULL AND rationale IS NOT NULL AND root_operation_id IS NULL)
+            OR (authority_kind = 'cascade' AND incident_id IS NULL AND rationale IS NULL AND root_operation_id IS NOT NULL)
+            OR (authority_kind IN ('workflow-owner', 'direct-spawner') AND incident_id IS NULL AND rationale IS NULL AND root_operation_id IS NULL)),
+          CHECK ((state = 'committed' AND committed_at_ms IS NOT NULL)
+            OR (state != 'committed' AND committed_at_ms IS NULL))
+        ) STRICT;
+        INSERT INTO activation_cancellations_v2 (
+          operation_id, actor_agent_id, source_id, authority_kind, incident_id, rationale, root_operation_id,
+          target_agent_id, activation_id, run_id, fencing_epoch, activation_revision, run_locator,
+          state, termination_attempts, last_error, created_at_ms, updated_at_ms, committed_at_ms
+        ) SELECT
+          operation_id, actor_agent_id, source_id, authority_kind, incident_id, rationale, NULL,
+          target_agent_id, activation_id, run_id, fencing_epoch, activation_revision, run_locator,
+          state, termination_attempts, last_error, created_at_ms, updated_at_ms, committed_at_ms
+        FROM activation_cancellations;
+        DROP TABLE IF EXISTS activation_cancellation_sources;
+        DROP TABLE activation_cancellations;
+        ALTER TABLE activation_cancellations_v2 RENAME TO activation_cancellations;
+        CREATE TABLE activation_cancellation_sources (
+          actor_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
+          source_id TEXT NOT NULL,
+          operation_id TEXT NOT NULL REFERENCES activation_cancellations(operation_id),
+          bound_at_ms INTEGER NOT NULL,
+          PRIMARY KEY (actor_agent_id, source_id)
+        ) STRICT;
+      `);
+      const insertSource = this.#database.prepare(`INSERT INTO activation_cancellation_sources (
+        actor_agent_id, source_id, operation_id, bound_at_ms
+      ) VALUES (?, ?, ?, ?)`);
+      for (const source of sources) {
+        insertSource.run(source.actor_agent_id, source.source_id, source.operation_id, source.bound_at_ms);
+      }
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      if (this.#database.isTransaction) this.#database.exec("ROLLBACK");
+      throw error;
+    } finally {
+      this.#database.exec("PRAGMA foreign_keys = ON");
+    }
   }
 
   close(): void {
@@ -171,6 +310,9 @@ export class ActivationCancellationStore {
     operationId: string;
     authority?: CancellationAuthority;
     incidentControlAuthorized?: boolean;
+    cascadeAuthorized?: boolean;
+    /** A cascade must never cancel work that began after its root was planned. */
+    expectedActivationId?: string;
     now: number;
   }): ActivationCancellationRecord {
     assertNonEmpty(input.sourceId, "Cancellation source ID");
@@ -205,7 +347,9 @@ export class ActivationCancellationStore {
         : target.spawner_agent_id === input.actor.agentId
           ? { kind: "direct-spawner" as const }
           : undefined);
-      if (!authority || (authority.kind === "incident-control" && input.incidentControlAuthorized !== true)) {
+      if (!authority
+        || (authority.kind === "incident-control" && input.incidentControlAuthorized !== true)
+        || (authority.kind === "cascade" && input.cascadeAuthorized !== true)) {
         throw new WorkflowProtocolError(
           "ActivationCancellationUnauthorized",
           `Agent ${input.actor.agentId} cannot cancel activation owned by Agent ${input.target.agentId}`,
@@ -217,12 +361,32 @@ export class ActivationCancellationStore {
       if (authority.kind === "direct-spawner" && target.spawner_agent_id !== input.actor.agentId) {
         throw new WorkflowProtocolError("ActivationCancellationUnauthorized", "Direct Spawner authority attribution does not match the actor");
       }
+      if (authority.kind === "cascade") this.#assertCascadeAuthority(input.actor, input.target, authority);
+
+      if (authority.kind === "cascade" && input.expectedActivationId) {
+        const inherited = this.#readByActivation(input.expectedActivationId);
+        if (inherited?.target_agent_id === input.target.agentId
+          && inherited.root_operation_id === authority.rootOperationId) {
+          const bound = this.#database.prepare(`INSERT INTO activation_cancellation_sources (
+            actor_agent_id, source_id, operation_id, bound_at_ms
+          ) VALUES (?, ?, ?, ?)`
+          ).run(input.actor.agentId, input.sourceId, inherited.operation_id, input.now);
+          if (Number(bound.changes) !== 1) throw new Error(`Cascade source ${input.sourceId} was not bound`);
+          return mapCancellation(inherited);
+        }
+      }
 
       const activation = this.#currentActivation(input.target.agentId);
       if (!activation || activation.phase !== "open") {
         throw new WorkflowProtocolError(
           "InvalidLifecycleTransition",
           `Agent ${input.target.agentId} has no open activation to cancel`,
+        );
+      }
+      if (input.expectedActivationId && activation.activation_id !== input.expectedActivationId) {
+        throw new WorkflowProtocolError(
+          "InvalidLifecycleTransition",
+          `Agent ${input.target.agentId} no longer has cascade activation ${input.expectedActivationId}`,
         );
       }
       const existing = this.#readByActivation(activation.activation_id);
@@ -265,10 +429,10 @@ export class ActivationCancellationStore {
         : null;
       const activationRevision = Number(activation.revision) + 1;
       this.#database.prepare(`INSERT INTO activation_cancellations (
-        operation_id, actor_agent_id, source_id, authority_kind, incident_id, rationale,
+        operation_id, actor_agent_id, source_id, authority_kind, incident_id, rationale, root_operation_id,
         target_agent_id, activation_id, run_id, fencing_epoch, activation_revision,
         run_locator, state, termination_attempts, last_error, created_at_ms, updated_at_ms, committed_at_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'terminating', 0, NULL, ?, ?, NULL)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'terminating', 0, NULL, ?, ?, NULL)`
       ).run(
         input.operationId,
         input.actor.agentId,
@@ -276,6 +440,7 @@ export class ActivationCancellationStore {
         authority.kind,
         authority.kind === "incident-control" ? authority.incidentId : null,
         authority.kind === "incident-control" ? authority.rationale : null,
+        authority.kind === "cascade" ? authority.rootOperationId : null,
         input.target.agentId,
         activation.activation_id,
         activation.run_id,
@@ -326,6 +491,175 @@ export class ActivationCancellationStore {
       ORDER BY created_at_ms DESC LIMIT 1`
     ).get(input.agentId, input.runId, input.fencingEpoch) as CancellationRow | undefined;
     return row ? mapCancellation(row) : undefined;
+  }
+
+  /**
+   * Freeze the only Request edges that keep a descendant outside the cascade.
+   * The root itself cannot survive: its direct cancellation has already won.
+   */
+  planDescendantCancellation(rootOperationId: string, now: number): DescendantCancellationPlan {
+    return this.#withImmediateTransaction(() => {
+      const root = this.#readRequired(rootOperationId);
+      if (root.authority_kind === "cascade") {
+        throw new WorkflowProtocolError("ActivationCancellationConflict", "A cascade operation cannot start another cascade");
+      }
+      const planned = this.#database.prepare(`SELECT 1 FROM activation_cancellation_cascades
+        WHERE root_operation_id = ?`
+      ).get(rootOperationId);
+      if (planned) return this.#readDescendantPlan(rootOperationId);
+
+      const agents = this.#database.prepare(`SELECT agent_id, spawner_agent_id
+        FROM workflow_agents ORDER BY agent_id`
+      ).all() as Array<{ agent_id: string; spawner_agent_id: string | null }>;
+      const children = new Map<string, string[]>();
+      for (const agent of agents) {
+        if (!agent.spawner_agent_id) continue;
+        const siblings = children.get(agent.spawner_agent_id) ?? [];
+        siblings.push(agent.agent_id);
+        children.set(agent.spawner_agent_id, siblings);
+      }
+      const descendants: Array<{ agentId: string; depth: number }> = [];
+      const queue = (children.get(root.target_agent_id) ?? []).map((agentId) => ({ agentId, depth: 1 }));
+      for (let index = 0; index < queue.length; index += 1) {
+        const candidate = queue[index]!;
+        descendants.push(candidate);
+        for (const child of children.get(candidate.agentId) ?? []) {
+          queue.push({ agentId: child, depth: candidate.depth + 1 });
+        }
+      }
+      const subtree = new Set([root.target_agent_id, ...descendants.map((item) => item.agentId)]);
+      const descendantIds = new Set(descendants.map((item) => item.agentId));
+      const requests = this.#database.prepare(`SELECT requester_agent_id, responder_agent_id
+        FROM workflow_requests WHERE status = 'open'`
+      ).all() as Array<{ requester_agent_id: string; responder_agent_id: string }>;
+      const survivors = new Set<string>();
+      for (const request of requests) {
+        if (descendantIds.has(request.responder_agent_id) && !subtree.has(request.requester_agent_id)) {
+          survivors.add(request.responder_agent_id);
+        }
+      }
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const request of requests) {
+          if (survivors.has(request.requester_agent_id)
+            && descendantIds.has(request.responder_agent_id)
+            && !survivors.has(request.responder_agent_id)) {
+            survivors.add(request.responder_agent_id);
+            changed = true;
+          }
+        }
+      }
+
+      this.#database.prepare(`INSERT INTO activation_cancellation_cascades (
+        root_operation_id, planned_at_ms
+      ) VALUES (?, ?)`
+      ).run(rootOperationId, now);
+      const insert = this.#database.prepare(`INSERT INTO activation_cancellation_descendants (
+        root_operation_id, agent_id, disposition, activation_id, cascade_state, depth
+      ) VALUES (?, ?, ?, ?, ?, ?)`);
+      for (const descendant of descendants) {
+        if (survivors.has(descendant.agentId)) {
+          insert.run(rootOperationId, descendant.agentId, "survives", null, "survives", descendant.depth);
+          continue;
+        }
+        const activation = this.#currentActivation(descendant.agentId);
+        if (activation?.phase === "open") {
+          insert.run(rootOperationId, descendant.agentId, "cancelled", activation.activation_id, "pending", descendant.depth);
+        }
+      }
+      return this.#readDescendantPlan(rootOperationId);
+    });
+  }
+
+  /** Bind a later public tool call to an incomplete cascade whose root already ended. */
+  resumeIncompleteCascade(input: {
+    actor: AgentReference;
+    target: AgentReference;
+    sourceId: string;
+    now: number;
+  }): ActivationCancellationRecord | undefined {
+    return this.#withImmediateTransaction(() => {
+      const ownerAgentId = this.#workflowOwnerId();
+      this.#assertReference(input.actor, ownerAgentId);
+      this.#assertReference(input.target, ownerAgentId);
+      this.#assertHistoricalCancellationAuthority(input.actor, input.target.agentId, ownerAgentId);
+      const root = this.#database.prepare(`SELECT operation.*
+        FROM activation_cancellations operation
+        JOIN activation_cancellation_cascades cascade
+          ON cascade.root_operation_id = operation.operation_id
+        WHERE operation.target_agent_id = ?
+          AND operation.state = 'committed'
+          AND operation.authority_kind != 'cascade'
+          AND EXISTS (
+            SELECT 1 FROM activation_cancellation_descendants descendant
+            WHERE descendant.root_operation_id = operation.operation_id
+              AND descendant.disposition = 'cancelled'
+              AND descendant.cascade_state = 'pending'
+          )
+        ORDER BY operation.committed_at_ms DESC, operation.operation_id DESC
+        LIMIT 1`
+      ).get(input.target.agentId) as CancellationRow | undefined;
+      if (!root) return undefined;
+      const existingSource = this.#database.prepare(`SELECT operation.*
+        FROM activation_cancellation_sources source
+        JOIN activation_cancellations operation ON operation.operation_id = source.operation_id
+        WHERE source.actor_agent_id = ? AND source.source_id = ?`
+      ).get(input.actor.agentId, input.sourceId) as CancellationRow | undefined;
+      if (existingSource) {
+        if (existingSource.operation_id !== root.operation_id) {
+          throw new WorkflowProtocolError(
+            "ActivationCancellationConflict",
+            `Cancellation source ${input.sourceId} is already bound to a different cancellation operation`,
+          );
+        }
+        return mapCancellation(root);
+      }
+      const bound = this.#database.prepare(`INSERT INTO activation_cancellation_sources (
+        actor_agent_id, source_id, operation_id, bound_at_ms
+      ) VALUES (?, ?, ?, ?)`
+      ).run(input.actor.agentId, input.sourceId, root.operation_id, input.now);
+      if (Number(bound.changes) !== 1) throw new Error(`Cascade retry source ${input.sourceId} was not bound`);
+      return mapCancellation(root);
+    });
+  }
+
+  markPlannedDescendantCancelled(input: {
+    rootOperationId: string;
+    agentId: string;
+    activationId: string;
+  }): void {
+    this.#setPlannedDescendantState({ ...input, state: "cancelled" });
+  }
+
+  /** Mark only a definitively ended or replaced planned activation as harmless. */
+  skipStalePlannedDescendant(input: {
+    rootOperationId: string;
+    agentId: string;
+    activationId: string;
+  }): boolean {
+    return this.#withImmediateTransaction(() => {
+      const planned = this.#database.prepare(`SELECT cascade_state FROM activation_cancellation_descendants
+        WHERE root_operation_id = ? AND agent_id = ? AND disposition = 'cancelled' AND activation_id = ?`
+      ).get(input.rootOperationId, input.agentId, input.activationId) as { cascade_state: string } | undefined;
+      if (!planned) throw new Error(`Cascade plan has no matching descendant ${input.agentId}`);
+      if (planned.cascade_state === "skipped") return true;
+      if (planned.cascade_state !== "pending") return false;
+      const plannedActivation = this.#database.prepare(`SELECT phase FROM agent_activations
+        WHERE activation_id = ? AND agent_id = ?`
+      ).get(input.activationId, input.agentId) as { phase: "open" | "ended" } | undefined;
+      const current = this.#currentActivation(input.agentId);
+      if (!plannedActivation || (plannedActivation.phase !== "ended" && current?.activation_id === input.activationId)) {
+        return false;
+      }
+      const skipped = this.#database.prepare(`UPDATE activation_cancellation_descendants
+        SET cascade_state = 'skipped'
+        WHERE root_operation_id = ? AND agent_id = ? AND activation_id = ?
+          AND disposition = 'cancelled' AND cascade_state = 'pending'`
+      ).run(input.rootOperationId, input.agentId, input.activationId);
+      if (Number(skipped.changes) !== 1) throw new Error(`Cascade plan lost stale descendant ${input.agentId}`);
+      return true;
+    });
   }
 
   markReady(operationId: string, now: number): ActivationCancellationRecord {
@@ -610,6 +944,87 @@ export class ActivationCancellationStore {
     ).get(agentId) as ActivationRow | undefined;
   }
 
+  #readDescendantPlan(rootOperationId: string): DescendantCancellationPlan {
+    const rows = this.#database.prepare(`SELECT agent_id, disposition, activation_id, cascade_state
+      FROM activation_cancellation_descendants
+      WHERE root_operation_id = ? ORDER BY depth, agent_id`
+    ).all(rootOperationId) as Array<{
+      agent_id: string;
+      disposition: "cancelled" | "survives";
+      activation_id: string | null;
+      cascade_state: "pending" | "cancelled" | "skipped" | "survives";
+    }>;
+    return {
+      rootOperationId,
+      cancelled: rows
+        .filter((row) => row.disposition === "cancelled" && row.cascade_state === "pending")
+        .map((row) => ({ agentId: row.agent_id, activationId: row.activation_id! })),
+      survivors: rows.filter((row) => row.disposition === "survives").map((row) => row.agent_id),
+    };
+  }
+
+  #setPlannedDescendantState(input: {
+    rootOperationId: string;
+    agentId: string;
+    activationId: string;
+    state: "cancelled";
+  }): void {
+    this.#withImmediateTransaction(() => {
+      const updated = this.#database.prepare(`UPDATE activation_cancellation_descendants
+        SET cascade_state = ?
+        WHERE root_operation_id = ? AND agent_id = ? AND activation_id = ?
+          AND disposition = 'cancelled' AND cascade_state = 'pending'`
+      ).run(input.state, input.rootOperationId, input.agentId, input.activationId);
+      if (Number(updated.changes) === 1) return;
+      const row = this.#database.prepare(`SELECT cascade_state FROM activation_cancellation_descendants
+        WHERE root_operation_id = ? AND agent_id = ? AND activation_id = ? AND disposition = 'cancelled'`
+      ).get(input.rootOperationId, input.agentId, input.activationId) as { cascade_state: string } | undefined;
+      if (row?.cascade_state !== input.state) {
+        throw new Error(`Cascade plan lost cancelled descendant ${input.agentId}`);
+      }
+    });
+  }
+
+  #assertCascadeAuthority(
+    actor: AgentReference,
+    target: AgentReference,
+    authority: Extract<CancellationAuthority, { kind: "cascade" }>,
+  ): void {
+    const root = this.#readRequired(authority.rootOperationId);
+    if (root.state !== "committed" || root.authority_kind === "cascade") {
+      throw new WorkflowProtocolError("ActivationCancellationUnauthorized", "Cascade authority does not match a committed root cancellation");
+    }
+    this.#assertHistoricalCancellationAuthority(actor, root.target_agent_id, actor.workflowOwnerId);
+    let ancestor = target.agentId;
+    while (true) {
+      const row = this.#database.prepare("SELECT spawner_agent_id FROM workflow_agents WHERE agent_id = ?")
+        .get(ancestor) as { spawner_agent_id: string | null } | undefined;
+      if (!row?.spawner_agent_id) break;
+      if (row.spawner_agent_id === root.target_agent_id) return;
+      ancestor = row.spawner_agent_id;
+    }
+    throw new WorkflowProtocolError(
+      "ActivationCancellationUnauthorized",
+      `Agent ${target.agentId} is not a descendant of cascade root ${root.target_agent_id}`,
+    );
+  }
+
+  /** The Owner already has authority; a direct Spawner retains its own Child Control. */
+  #assertHistoricalCancellationAuthority(
+    actor: AgentReference,
+    targetAgentId: string,
+    ownerAgentId: string,
+  ): void {
+    if (actor.agentId === ownerAgentId) return;
+    const target = this.#database.prepare("SELECT spawner_agent_id FROM workflow_agents WHERE agent_id = ?")
+      .get(targetAgentId) as { spawner_agent_id: string | null } | undefined;
+    if (target?.spawner_agent_id === actor.agentId) return;
+    throw new WorkflowProtocolError(
+      "ActivationCancellationUnauthorized",
+      `Agent ${actor.agentId} cannot resume cancellation of Agent ${targetAgentId}`,
+    );
+  }
+
   #readByActivation(activationId: string): CancellationRow | undefined {
     return this.#database.prepare("SELECT * FROM activation_cancellations WHERE activation_id = ?")
       .get(activationId) as CancellationRow | undefined;
@@ -723,18 +1138,31 @@ export class ActivationCancellationService {
     sourceId: string;
     authority?: Extract<CancellationAuthority, { kind: "incident-control" }>;
   }): Promise<ActivationCancellationRecord> {
-    const operation = this.#store.claim({
-      actor: this.#actor,
-      target: input.target,
-      sourceId: input.sourceId,
-      operationId: this.#allocateOperationId(),
-      authority: input.authority,
-      incidentControlAuthorized: input.authority
-        ? this.#authorizeIncidentControl?.({ actor: this.#actor, target: input.target, authority: input.authority }) === true
-        : undefined,
-      now: this.#now(),
-    });
-    return this.#attempt(operation);
+    let operation: ActivationCancellationRecord;
+    try {
+      operation = this.#store.claim({
+        actor: this.#actor,
+        target: input.target,
+        sourceId: input.sourceId,
+        operationId: this.#allocateOperationId(),
+        authority: input.authority,
+        incidentControlAuthorized: input.authority
+          ? this.#authorizeIncidentControl?.({ actor: this.#actor, target: input.target, authority: input.authority }) === true
+          : undefined,
+        now: this.#now(),
+      });
+    } catch (error) {
+      if (!(error instanceof WorkflowProtocolError) || error.code !== "InvalidLifecycleTransition") throw error;
+      const historicalRoot = this.#store.resumeIncompleteCascade({
+        actor: this.#actor,
+        target: input.target,
+        sourceId: input.sourceId,
+        now: this.#now(),
+      });
+      if (!historicalRoot) throw error;
+      operation = historicalRoot;
+    }
+    return this.#completeRootCascade(operation);
   }
 
   async retry(operationId: string): Promise<ActivationCancellationRecord> {
@@ -743,7 +1171,50 @@ export class ActivationCancellationService {
     if (operation.actorAgentId !== this.#actor.agentId) {
       throw new WorkflowProtocolError("ActivationCancellationUnauthorized", `Agent ${this.#actor.agentId} cannot retry cancellation ${operationId}`);
     }
-    return this.#attempt(operation);
+    return operation.authority.kind === "cascade"
+      ? this.#attempt(operation)
+      : this.#completeRootCascade(operation);
+  }
+
+  async #completeRootCascade(operation: ActivationCancellationRecord): Promise<ActivationCancellationRecord> {
+    const plan = this.#store.planDescendantCancellation(operation.operationId, this.#now());
+    const receipt = await this.#attempt(operation);
+    for (const descendant of plan.cancelled) {
+      try {
+        const cascade = this.#store.claim({
+          actor: this.#actor,
+          target: {
+            workflowOwnerId: this.#actor.workflowOwnerId,
+            agentId: descendant.agentId,
+          },
+          sourceId: `${operation.operationId}:cascade:${descendant.agentId}`,
+          operationId: this.#allocateOperationId(),
+          authority: { kind: "cascade", rootOperationId: operation.operationId },
+          cascadeAuthorized: true,
+          expectedActivationId: descendant.activationId,
+          now: this.#now(),
+        });
+        await this.#attempt(cascade);
+        this.#store.markPlannedDescendantCancelled({
+          rootOperationId: operation.operationId,
+          agentId: descendant.agentId,
+          activationId: descendant.activationId,
+        });
+      } catch (error) {
+        const staleLifecycle = error instanceof WorkflowProtocolError
+          && error.code === "InvalidLifecycleTransition";
+        if ((staleLifecycle || error instanceof CancellationInDoubtError)
+          && this.#store.skipStalePlannedDescendant({
+            rootOperationId: operation.operationId,
+            agentId: descendant.agentId,
+            activationId: descendant.activationId,
+          })) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    return receipt;
   }
 
   async #attempt(operation: ActivationCancellationRecord): Promise<ActivationCancellationRecord> {
@@ -810,7 +1281,9 @@ export function parseAgentRunLocator(value: string): AgentRunLocator | undefined
 function mapCancellation(row: CancellationRow): ActivationCancellationRecord {
   const authority: CancellationAuthority = row.authority_kind === "incident-control"
     ? { kind: "incident-control", incidentId: row.incident_id!, rationale: row.rationale! }
-    : { kind: row.authority_kind };
+    : row.authority_kind === "cascade"
+      ? { kind: "cascade", rootOperationId: row.root_operation_id! }
+      : { kind: row.authority_kind };
   return {
     operationId: row.operation_id,
     actorAgentId: row.actor_agent_id,

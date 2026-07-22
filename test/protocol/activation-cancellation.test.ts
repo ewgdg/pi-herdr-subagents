@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -114,6 +115,235 @@ describe("Activation Cancellation", () => {
       receipt,
       "the exact tool source remains bound after the activation ends",
     );
+  });
+
+  it("resumes a pending descendant cascade through a later cancellation of its ended root", async (test) => {
+    const setup = await setupCancellation(test);
+    const rootSession = setup.scenario.transcripts.resume(
+      setup.runtime.inspect(setup.runtime.agent(setup.child.agentId)).sessionPath,
+    );
+    const rootRuntime = setup.scenario.startAgent(setup.runtime.workflow, rootSession);
+    test.after(() => rootRuntime.close());
+    const descendantSession = setup.scenario.childSession(rootRuntime, "pending-cascade-descendant");
+    const descendant = rootRuntime.addAgent({
+      session: descendantSession,
+      spawner: rootRuntime.agent(setup.child.agentId),
+      name: "Pending Cascade Descendant",
+    });
+    const descendantRun = rootRuntime.startAgentRun(rootRuntime.agent(descendant.agentId));
+    rootRuntime.checkpoint(descendantRun, JSON.stringify({ surface: "pending-cascade-descendant" }));
+
+    // The root is already durable when this descendant's termination becomes uncertain.
+    setup.observations.splice(0, setup.observations.length, "present", "missing", "present", "unavailable");
+    await assert.rejects(
+      setup.service.cancel({ target: setup.runtime.agent(setup.child.agentId), sourceId: "root-cascade-first-call" }),
+      (error: unknown) => error instanceof CancellationInDoubtError,
+    );
+    assert.deepEqual(setup.runtime.inspectActivation(setup.runtime.agent(setup.child.agentId))?.state, {
+      kind: "ended", outcome: "cancelled",
+    });
+    assert.equal(setup.runtime.inspectActivation(setup.runtime.agent(descendant.agentId))?.state.kind, "active");
+
+    setup.observations.push("missing");
+    const resumed = await setup.service.cancel({
+      target: setup.runtime.agent(setup.child.agentId),
+      sourceId: "root-cascade-later-call",
+    });
+    assert.equal(resumed.operationId, "cancellation-operation-1");
+    assert.deepEqual(setup.runtime.inspectActivation(setup.runtime.agent(descendant.agentId))?.state, {
+      kind: "ended", outcome: "cancelled",
+    });
+  });
+
+  it("lets the Workflow Owner resume a direct Spawner's pending cascade but rejects unrelated peers", async (test) => {
+    const setup = await setupCancellation(test);
+    const spawnerSession = setup.scenario.transcripts.resume(
+      setup.runtime.inspect(setup.runtime.agent(setup.child.agentId)).sessionPath,
+    );
+    const spawnerRuntime = setup.scenario.startAgent(setup.runtime.workflow, spawnerSession);
+    test.after(() => spawnerRuntime.close());
+    const rootSession = setup.scenario.childSession(spawnerRuntime, "spawner-cancelled-root");
+    const root = spawnerRuntime.addAgent({
+      session: rootSession,
+      spawner: spawnerRuntime.agent(setup.child.agentId),
+      name: "Spawner-cancelled Root",
+    });
+    const rootRun = spawnerRuntime.startAgentRun(spawnerRuntime.agent(root.agentId));
+    spawnerRuntime.checkpoint(rootRun, JSON.stringify({ surface: "spawner-cancelled-root" }));
+    const rootRuntime = setup.scenario.startAgent(setup.runtime.workflow, rootSession);
+    test.after(() => rootRuntime.close());
+    const descendantSession = setup.scenario.childSession(rootRuntime, "spawner-cascade-descendant");
+    const descendant = rootRuntime.addAgent({
+      session: descendantSession,
+      spawner: rootRuntime.agent(root.agentId),
+      name: "Spawner Cascade Descendant",
+    });
+    const descendantRun = rootRuntime.startAgentRun(rootRuntime.agent(descendant.agentId));
+    rootRuntime.checkpoint(descendantRun, JSON.stringify({ surface: "spawner-cascade-descendant" }));
+
+    const observations: Array<"present" | "missing" | "unavailable"> = ["present", "missing", "present", "unavailable"];
+    const spawnerService = new ActivationCancellationService({
+      databasePath: setup.runtime.workflow.databasePath,
+      actor: spawnerRuntime.agent(setup.child.agentId),
+      terminator: {
+        async inspect() { return { kind: observations.shift() ?? "missing" }; },
+        async close() {},
+      },
+      allocateOperationId: (() => {
+        let sequence = 0;
+        return () => `spawner-cascade-operation-${++sequence}`;
+      })(),
+    });
+    test.after(() => spawnerService.close());
+    await assert.rejects(
+      spawnerService.cancel({ target: spawnerRuntime.agent(root.agentId), sourceId: "spawner-first-call" }),
+      (error: unknown) => error instanceof CancellationInDoubtError,
+    );
+
+    const peerSession = setup.scenario.childSession(setup.runtime, "unrelated-cascade-peer");
+    const peer = setup.runtime.addAgent({ session: peerSession, spawner: setup.runtime.owner(), name: "Unrelated Peer" });
+    const peerService = new ActivationCancellationService({
+      databasePath: setup.runtime.workflow.databasePath,
+      actor: setup.runtime.agent(peer.agentId),
+      terminator: { async inspect() { return { kind: "missing" }; }, async close() {} },
+      allocateOperationId: () => "unrelated-peer-operation",
+    });
+    test.after(() => peerService.close());
+    await assert.rejects(
+      peerService.cancel({ target: setup.runtime.agent(root.agentId), sourceId: "unrelated-peer-retry" }),
+      (error: unknown) => error instanceof WorkflowProtocolError && error.code === "ActivationCancellationUnauthorized",
+    );
+
+    const ownerService = new ActivationCancellationService({
+      databasePath: setup.runtime.workflow.databasePath,
+      actor: setup.runtime.owner(),
+      terminator: { async inspect() { return { kind: "missing" }; }, async close() {} },
+      allocateOperationId: (() => {
+        let sequence = 0;
+        return () => `owner-resume-operation-${++sequence}`;
+      })(),
+    });
+    test.after(() => ownerService.close());
+    const resumed = await ownerService.cancel({
+      target: setup.runtime.agent(root.agentId),
+      sourceId: "owner-resumes-spawner-cascade",
+    });
+    assert.equal(resumed.operationId, "spawner-cascade-operation-1");
+    assert.deepEqual(setup.runtime.inspectActivation(setup.runtime.agent(descendant.agentId))?.state, {
+      kind: "ended", outcome: "cancelled",
+    });
+  });
+
+  it("skips stale planned descendants and continues cancelling later siblings", async (test) => {
+    const setup = await setupCancellation(test);
+    const rootSession = setup.scenario.transcripts.resume(
+      setup.runtime.inspect(setup.runtime.agent(setup.child.agentId)).sessionPath,
+    );
+    const rootRuntime = setup.scenario.startAgent(setup.runtime.workflow, rootSession);
+    test.after(() => rootRuntime.close());
+    const firstSession = setup.scenario.childSession(rootRuntime, "stale-first-descendant");
+    const first = rootRuntime.addAgent({
+      session: firstSession,
+      spawner: rootRuntime.agent(setup.child.agentId),
+      name: "Stale First Descendant",
+    });
+    const firstRun = rootRuntime.startAgentRun(rootRuntime.agent(first.agentId));
+    rootRuntime.checkpoint(firstRun, JSON.stringify({ surface: "stale-first-descendant" }));
+    const secondSession = setup.scenario.childSession(rootRuntime, "later-sibling");
+    const second = rootRuntime.addAgent({
+      session: secondSession,
+      spawner: rootRuntime.agent(setup.child.agentId),
+      name: "Later Sibling",
+    });
+    const secondRun = rootRuntime.startAgentRun(rootRuntime.agent(second.agentId));
+    rootRuntime.checkpoint(secondRun, JSON.stringify({ surface: "later-sibling" }));
+
+    let rootClosed = false;
+    const service = new ActivationCancellationService({
+      databasePath: setup.runtime.workflow.databasePath,
+      actor: setup.runtime.owner(),
+      allocateOperationId: (() => {
+        let sequence = 0;
+        return () => `stale-sibling-operation-${++sequence}`;
+      })(),
+      terminator: {
+        async inspect(locator) {
+          return locator.surface === `pane:${setup.child.agentId}` && !rootClosed
+            ? { kind: "present" as const }
+            : { kind: "missing" as const };
+        },
+        async close(locator) {
+          if (locator.surface !== `pane:${setup.child.agentId}`) return;
+          rootClosed = true;
+          setup.runtime.cancelActivation(firstRun);
+        },
+      },
+    });
+    test.after(() => service.close());
+
+    await service.cancel({ target: setup.runtime.agent(setup.child.agentId), sourceId: "stale-sibling-root" });
+    assert.deepEqual(setup.runtime.inspectActivation(setup.runtime.agent(first.agentId))?.state, {
+      kind: "ended", outcome: "cancelled",
+    });
+    assert.deepEqual(setup.runtime.inspectActivation(setup.runtime.agent(second.agentId))?.state, {
+      kind: "ended", outcome: "cancelled",
+    });
+    const database = new DatabaseSync(setup.runtime.workflow.databasePath, { readOnly: true });
+    const planState = database.prepare(`SELECT cascade_state FROM activation_cancellation_descendants
+      WHERE root_operation_id = 'stale-sibling-operation-1' AND agent_id = ?`
+    ).get(first.agentId) as { cascade_state: string };
+    database.close();
+    assert.equal(planState.cascade_state, "skipped");
+  });
+
+  it("migrates cancellation source fences under the migration write lock", async (test) => {
+    const setup = await setupCancellation(test);
+    const legacy = new ActivationCancellationStore(setup.runtime.workflow.databasePath);
+    const claim = legacy.claim({
+      actor: setup.runtime.owner(),
+      target: setup.runtime.agent(setup.child.agentId),
+      sourceId: "legacy-source-fence",
+      operationId: "legacy-source-operation",
+      now: setup.scenario.clock.now(),
+    });
+    legacy.close();
+    const database = new DatabaseSync(setup.runtime.workflow.databasePath);
+    database.exec(`
+      PRAGMA foreign_keys = OFF;
+      BEGIN IMMEDIATE;
+      CREATE TABLE activation_cancellations_v1 AS
+        SELECT operation_id, actor_agent_id, source_id, authority_kind, incident_id, rationale,
+          target_agent_id, activation_id, run_id, fencing_epoch, activation_revision, run_locator,
+          state, termination_attempts, last_error, created_at_ms, updated_at_ms, committed_at_ms
+        FROM activation_cancellations;
+      DROP TABLE activation_cancellation_sources;
+      DROP TABLE activation_cancellation_cascades;
+      DROP TABLE activation_cancellation_descendants;
+      DROP TABLE activation_cancellations;
+      ALTER TABLE activation_cancellations_v1 RENAME TO activation_cancellations;
+      CREATE TABLE activation_cancellation_sources (
+        actor_agent_id TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        bound_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (actor_agent_id, source_id)
+      ) STRICT;
+      INSERT INTO activation_cancellation_sources VALUES ('${setup.runtime.workflow.ownerAgentId}', 'legacy-source-fence', 'legacy-source-operation', 1);
+      COMMIT;
+      PRAGMA foreign_keys = ON;
+    `);
+    database.close();
+
+    const migrated = new ActivationCancellationStore(setup.runtime.workflow.databasePath);
+    test.after(() => migrated.close());
+    const replay = migrated.claim({
+      actor: setup.runtime.owner(),
+      target: setup.runtime.agent(setup.child.agentId),
+      sourceId: "legacy-source-fence",
+      operationId: "different-operation",
+      now: setup.scenario.clock.now(),
+    });
+    assert.equal(replay.operationId, claim.operationId);
   });
 
   it("retains the activation, Router, and ownership in doubt, then retries the same durable claim", async (test) => {
@@ -248,23 +478,176 @@ describe("Activation Cancellation", () => {
     } finally { incidentStore.close(); }
   });
 
-  it("does not cascade into descendants", async (test) => {
+  it("cancels descendants while retaining the external Request-dependency closure", async (test) => {
     const setup = await setupCancellation(test);
-    const childSession = setup.scenario.transcripts.resume(setup.runtime.inspect(setup.runtime.agent(setup.child.agentId)).sessionPath);
-    const childRuntime = setup.scenario.startAgent(setup.runtime.workflow, childSession);
-    test.after(() => childRuntime.close());
-    const grandchildSession = setup.scenario.childSession(childRuntime, "non-cascaded-grandchild");
-    const grandchild = childRuntime.addAgent({
-      session: grandchildSession,
-      spawner: childRuntime.agent(setup.child.agentId),
-      name: "Grandchild",
-    });
-    const grandchildRun = childRuntime.startAgentRun(childRuntime.agent(grandchild.agentId));
+    const rootSession = setup.scenario.transcripts.resume(
+      setup.runtime.inspect(setup.runtime.agent(setup.child.agentId)).sessionPath,
+    );
+    const rootRuntime = setup.scenario.startAgent(setup.runtime.workflow, rootSession);
+    test.after(() => rootRuntime.close());
 
-    await setup.service.cancel({ target: setup.runtime.agent(setup.child.agentId), sourceId: "single-activation-only" });
-    assert.equal(setup.runtime.inspectActivation(setup.runtime.agent(setup.child.agentId))?.state.kind, "ended");
-    assert.equal(setup.runtime.inspectActivation(setup.runtime.agent(grandchild.agentId))?.state.kind, "active");
-    assert.equal(setup.runtime.currentAgentRun(setup.runtime.agent(grandchild.agentId))?.runId, grandchildRun.ownership.runId);
+    const peerSession = setup.scenario.childSession(setup.runtime, "external-peer");
+    const peer = setup.runtime.addAgent({ session: peerSession, spawner: setup.runtime.owner(), name: "External Peer" });
+    const peerRun = setup.runtime.startAgentRun(setup.runtime.agent(peer.agentId));
+
+    const seedSession = setup.scenario.childSession(rootRuntime, "survivor-seed");
+    const seed = rootRuntime.addAgent({ session: seedSession, spawner: rootRuntime.agent(setup.child.agentId), name: "Survivor Seed" });
+    const seedRun = rootRuntime.startAgentRun(rootRuntime.agent(seed.agentId));
+    rootRuntime.checkpoint(seedRun, JSON.stringify({ surface: "survivor-seed" }));
+
+    const retainedSession = setup.scenario.childSession(rootRuntime, "retained-dependency");
+    const retained = rootRuntime.addAgent({ session: retainedSession, spawner: rootRuntime.agent(setup.child.agentId), name: "Retained Dependency" });
+    const retainedRun = rootRuntime.startAgentRun(rootRuntime.agent(retained.agentId));
+    rootRuntime.checkpoint(retainedRun, JSON.stringify({ surface: "retained-dependency" }));
+    const retainedRuntime = setup.scenario.startAgent(setup.runtime.workflow, retainedSession);
+    test.after(() => retainedRuntime.close());
+
+    const transitiveSession = setup.scenario.childSession(retainedRuntime, "transitive-dependency");
+    const transitive = retainedRuntime.addAgent({
+      session: transitiveSession,
+      spawner: retainedRuntime.agent(retained.agentId),
+      name: "Transitive Dependency",
+    });
+    const transitiveRun = retainedRuntime.startAgentRun(retainedRuntime.agent(transitive.agentId));
+    retainedRuntime.checkpoint(transitiveRun, JSON.stringify({ surface: "transitive-dependency" }));
+
+    const signalOnlySession = setup.scenario.childSession(rootRuntime, "signal-only-descendant");
+    const signalOnly = rootRuntime.addAgent({
+      session: signalOnlySession,
+      spawner: rootRuntime.agent(setup.child.agentId),
+      name: "Signal-only Descendant",
+    });
+    const signalOnlyRun = rootRuntime.startAgentRun(rootRuntime.agent(signalOnly.agentId));
+    rootRuntime.checkpoint(signalOnlyRun, JSON.stringify({ surface: "signal-only-descendant" }));
+
+    const prunableSession = setup.scenario.childSession(rootRuntime, "prunable-descendant");
+    const prunable = rootRuntime.addAgent({
+      session: prunableSession,
+      spawner: rootRuntime.agent(setup.child.agentId),
+      name: "Prunable Descendant",
+    });
+    const prunableRun = rootRuntime.startAgentRun(rootRuntime.agent(prunable.agentId));
+    rootRuntime.checkpoint(prunableRun, JSON.stringify({ surface: "prunable-descendant" }));
+    const prunableRuntime = setup.scenario.startAgent(setup.runtime.workflow, prunableSession);
+    test.after(() => prunableRuntime.close());
+
+    const requesterSession = setup.scenario.childSession(prunableRuntime, "internal-requester");
+    const requester = prunableRuntime.addAgent({
+      session: requesterSession,
+      spawner: prunableRuntime.agent(prunable.agentId),
+      name: "Internal Requester",
+    });
+    const requesterRun = prunableRuntime.startAgentRun(prunableRuntime.agent(requester.agentId));
+    prunableRuntime.checkpoint(requesterRun, JSON.stringify({ surface: "internal-requester" }));
+
+    const messages = new DirectSignalStore(setup.runtime.workflow.databasePath);
+    test.after(() => messages.close());
+    const routers = [
+      [setup.runtime.agent(peer.agentId), peerRun.ownership, "external-peer-router"],
+      [rootRuntime.agent(seed.agentId), seedRun.ownership, "survivor-seed-router"],
+      [rootRuntime.agent(retained.agentId), retainedRun.ownership, "retained-dependency-router"],
+      [retainedRuntime.agent(transitive.agentId), transitiveRun.ownership, "transitive-dependency-router"],
+      [rootRuntime.agent(signalOnly.agentId), signalOnlyRun.ownership, "signal-only-descendant-router"],
+      [rootRuntime.agent(prunable.agentId), prunableRun.ownership, "prunable-descendant-router"],
+      [prunableRuntime.agent(requester.agentId), requesterRun.ownership, "internal-requester-router"],
+    ] as const;
+    for (const [recipient, ownership, endpoint] of routers) {
+      messages.registerRouter({ recipient, ownership, endpoint, registeredAtMs: setup.scenario.clock.now() });
+    }
+
+    acceptRequest({
+      store: messages, runtime: setup.runtime, sender: setup.runtime.agent(peer.agentId),
+      recipient: rootRuntime.agent(seed.agentId), recipientOwnership: seedRun.ownership,
+      endpoint: "survivor-seed-router", id: "external-request",
+    });
+    acceptRequest({
+      store: messages, runtime: setup.runtime, sender: rootRuntime.agent(seed.agentId),
+      recipient: rootRuntime.agent(retained.agentId), recipientOwnership: retainedRun.ownership,
+      endpoint: "retained-dependency-router", id: "seed-dependency-request",
+    });
+    acceptRequest({
+      store: messages, runtime: setup.runtime, sender: rootRuntime.agent(retained.agentId),
+      recipient: retainedRuntime.agent(transitive.agentId), recipientOwnership: transitiveRun.ownership,
+      endpoint: "transitive-dependency-router", id: "retained-dependency-request",
+    });
+    acceptRequest({
+      store: messages, runtime: setup.runtime, sender: rootRuntime.agent(prunable.agentId),
+      recipient: setup.runtime.agent(peer.agentId), recipientOwnership: peerRun.ownership,
+      endpoint: "external-peer-router", id: "prunable-outgoing-request",
+    });
+    acceptRequest({
+      store: messages, runtime: setup.runtime, sender: prunableRuntime.agent(requester.agentId),
+      recipient: rootRuntime.agent(prunable.agentId), recipientOwnership: prunableRun.ownership,
+      endpoint: "prunable-descendant-router", id: "prunable-incoming-request",
+    });
+    acceptRequest({
+      store: messages, runtime: setup.runtime, sender: prunableRuntime.agent(requester.agentId),
+      recipient: setup.runtime.agent(peer.agentId), recipientOwnership: peerRun.ownership,
+      endpoint: "external-peer-router", id: "requester-outgoing-request",
+    });
+    messages.bindMessage({
+      messageId: "signal-only-edge", sender: rootRuntime.agent(seed.agentId), recipient: rootRuntime.agent(signalOnly.agentId),
+      sourceEntryId: "signal-only-source", payloadDigest: "signal-only-digest", deliveryTiming: "steer",
+      responseRequired: false, createdAtMs: setup.scenario.clock.now(),
+    });
+    messages.acceptSignal({
+      request: {
+        workflowOwnerId: setup.runtime.workflow.ownerAgentId, messageId: "signal-only-edge",
+        senderAgentId: seed.agentId, recipientAgentId: signalOnly.agentId,
+        sourceEntryId: "signal-only-source", payloadDigest: "signal-only-digest", deliveryTiming: "steer",
+        responseRequired: false, onAccepted: "continue", message: "A Signal must not retain this Agent.",
+      },
+      recipient: rootRuntime.agent(signalOnly.agentId), ownership: signalOnlyRun.ownership,
+      endpoint: "signal-only-descendant-router", acceptedAtMs: setup.scenario.clock.now(),
+    });
+
+    const database = new DatabaseSync(setup.runtime.workflow.databasePath, { readOnly: true });
+    const turnSequence = (agentId: string) => Number((database.prepare(`SELECT turn_sequence FROM agent_activations
+      WHERE agent_id = ? ORDER BY activation_sequence DESC LIMIT 1`).get(agentId) as { turn_sequence: number }).turn_sequence);
+    const survivorTurns = new Map([
+      [seed.agentId, turnSequence(seed.agentId)],
+      [retained.agentId, turnSequence(retained.agentId)],
+      [transitive.agentId, turnSequence(transitive.agentId)],
+    ]);
+    database.close();
+
+    await setup.service.cancel({ target: setup.runtime.agent(setup.child.agentId), sourceId: "cancel-root-with-closure" });
+
+    for (const agent of [setup.child, prunable, requester, signalOnly]) {
+      assert.deepEqual(setup.runtime.inspectActivation(setup.runtime.agent(agent.agentId))?.state, {
+        kind: "ended", outcome: "cancelled",
+      });
+    }
+    for (const agent of [seed, retained, transitive]) {
+      assert.equal(setup.runtime.inspectActivation(setup.runtime.agent(agent.agentId))?.state.kind, "active");
+      assert.equal(existsSync(setup.runtime.inspect(setup.runtime.agent(agent.agentId)).sessionPath), true);
+      assert.equal(setup.runtime.hasHumanAttention(setup.runtime.agent(agent.agentId)), false);
+    }
+    assert.equal(setup.runtime.inspect(setup.runtime.agent(seed.agentId)).spawnerAgentId, setup.child.agentId);
+    assert.equal(setup.runtime.inspect(setup.runtime.agent(retained.agentId)).spawnerAgentId, setup.child.agentId);
+    assert.equal(setup.runtime.inspect(setup.runtime.agent(transitive.agentId)).spawnerAgentId, retained.agentId);
+
+    const after = new DatabaseSync(setup.runtime.workflow.databasePath, { readOnly: true });
+    for (const [agentId, before] of survivorTurns) {
+      const current = Number((after.prepare(`SELECT turn_sequence FROM agent_activations
+        WHERE agent_id = ? ORDER BY activation_sequence DESC LIMIT 1`).get(agentId) as { turn_sequence: number }).turn_sequence);
+      assert.equal(current, before, "fallback supervision must not create a model turn");
+    }
+    after.close();
+
+    for (const requestId of ["external-request", "seed-dependency-request", "retained-dependency-request"]) {
+      assert.equal(messages.inspectRequest(setup.runtime.workflow.ownerAgentId, requestId)?.status, "open");
+    }
+    assert.equal(messages.inspectRequest(setup.runtime.workflow.ownerAgentId, "prunable-outgoing-request")?.status, "cancelled");
+    assert.equal(messages.inspectRequest(setup.runtime.workflow.ownerAgentId, "requester-outgoing-request")?.status, "cancelled");
+    assert.equal(messages.inspectRequest(setup.runtime.workflow.ownerAgentId, "prunable-incoming-request")?.status, "orphaned");
+    assert.equal(messages.inspectMessage(setup.runtime.workflow.ownerAgentId, "signal-only-edge")?.deliveryStatus, "queued");
+
+    const cancellation = messages.cancelRequest({
+      requester: rootRuntime.agent(seed.agentId), requestId: "seed-dependency-request",
+      noticeMessageId: "seed-cancels-retained-request", cancelledAtMs: setup.scenario.clock.now(),
+    });
+    assert.equal(cancellation.status, "cancelled");
   });
 
   it("makes completion and cancellation first-commit-wins through the cancellation operation dependency", async (test) => {
