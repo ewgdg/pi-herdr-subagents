@@ -192,6 +192,7 @@ test("blocked fused final Answer rolls back its Answer slot and message acceptan
       requestId: "blocked-answer-request",
       requesterAgentId: f.owner.currentAgent.agentId,
       responderAgentId: worker.agentId,
+      responderActivationId: f.ownership.runId,
       answerDeliveryTiming: "steer",
       status: "open",
     });

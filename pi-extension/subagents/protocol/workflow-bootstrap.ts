@@ -33,6 +33,11 @@ import { resolveCanonicalSpawnedInitialMessage } from "./direct-signal-transcrip
 import { DirectSignalStore } from "./sqlite-message-store.ts";
 import type { InspectionTarget } from "./workflow-inspection.ts";
 import { CompletionGateStore, type CompletionSource } from "./completion-gate.ts";
+import {
+  ActivationCancellationService,
+  ActivationCancellationInspectionStore,
+  type AgentRunTerminator,
+} from "./activation-cancellation.ts";
 
 export const WORKFLOW_OWNER_SESSION_ID_ENV = "PI_WORKFLOW_OWNER_SESSION_ID";
 export const WORKFLOW_OWNER_SESSION_PATH_ENV = "PI_WORKFLOW_OWNER_SESSION_PATH";
@@ -81,6 +86,7 @@ export interface AgentRunLocator {
 export class WorkflowBootstrap {
   readonly #now: () => number;
   readonly #confirmRunTerminated: ((locator: AgentRunLocator) => Promise<boolean>) | undefined;
+  readonly #agentRunTerminator: AgentRunTerminator;
   #controlPlane: WorkflowControlPlane | undefined;
   #sessionId: string | undefined;
   #sessionPath: string | undefined;
@@ -104,9 +110,14 @@ export class WorkflowBootstrap {
   constructor(options: {
     now?: () => number;
     confirmRunTerminated?: (locator: AgentRunLocator) => Promise<boolean>;
+    agentRunTerminator?: AgentRunTerminator;
   } = {}) {
     this.#now = options.now ?? Date.now;
     this.#confirmRunTerminated = options.confirmRunTerminated;
+    this.#agentRunTerminator = options.agentRunTerminator ?? {
+      async inspect() { return { kind: "unavailable", error: "Agent Run terminator is unavailable" }; },
+      async close() { throw new Error("Agent Run terminator is unavailable"); },
+    };
   }
 
   get workflow(): WorkflowRecord | undefined {
@@ -250,7 +261,10 @@ export class WorkflowBootstrap {
 
   close(): void {
     if (this.#directSignals) {
-      void Promise.resolve(this.#directSignals.close()).catch((error) => {
+      const preserveRouterRegistration = Boolean(
+        this.#selfOwnership && this.isCancellationOwnedRun(this.#selfOwnership),
+      );
+      void Promise.resolve(this.#directSignals.close({ preserveRouterRegistration })).catch((error) => {
         process.emitWarning(`Direct Signal Router cleanup failed: ${(error as Error).message}`);
       });
     }
@@ -270,7 +284,9 @@ export class WorkflowBootstrap {
       const activation = this.#controlPlane.inspectActivation(
         this.#controlPlane.agent(this.#selfOwnership.agentId),
       );
-      if (activation?.runId === this.#selfOwnership.runId && activation.state.kind !== "ended") {
+      if (activation?.runId === this.#selfOwnership.runId
+        && activation.state.kind !== "ended"
+        && !this.isCancellationOwnedRun(this.#selfOwnership)) {
         this.#controlPlane.failAgentRun(this.#selfOwnership, {
           error: "Agent Run runtime closed without committed completion or cancellation",
         });
@@ -351,6 +367,22 @@ export class WorkflowBootstrap {
     return this.#directSignalRuntime().cancelRequest(requestId);
   }
 
+  async cancelActivation(agentId: string, sourceId: string) {
+    const controlPlane = this.#requireControlPlane();
+    const service = new ActivationCancellationService({
+      databasePath: controlPlane.workflow.databasePath,
+      actor: controlPlane.currentAgent,
+      terminator: this.#agentRunTerminator,
+      now: this.#now,
+      allocateOperationId: randomUUID,
+    });
+    try {
+      return await service.cancel({ target: controlPlane.agent(agentId), sourceId });
+    } finally {
+      service.close();
+    }
+  }
+
   spawnInitialRequest(input: Omit<import("./workflow-control-plane.ts").SpawnedInitialRequestInput, "capabilities"> & {
     capabilities?: AgentCapabilityConfiguration;
   }) {
@@ -378,7 +410,10 @@ export class WorkflowBootstrap {
   async closeDirectSignalRouter(): Promise<void> {
     const runtime = this.#directSignals;
     this.#directSignals = undefined;
-    if (runtime) await runtime.close();
+    const preserveRouterRegistration = Boolean(
+      this.#selfOwnership && this.isCancellationOwnedRun(this.#selfOwnership),
+    );
+    if (runtime) await runtime.close({ preserveRouterRegistration });
   }
 
   reconcilePendingDirectSignals(options: { waitForResolution?: boolean } = {}) {
@@ -600,6 +635,7 @@ export class WorkflowBootstrap {
     },
   ): ActivationRecord | undefined {
     if (!confirmed) return;
+    if (this.isCancellationOwnedRun(ownership)) return;
     const completed = this.#inspectRun(ownership);
     if (completed?.state.kind === "ended" && completed.state.outcome === "completed") return undefined;
     if (this.#controlPlane?.workflow.ownerAgentId === ownership.workflowOwnerId) {
@@ -652,6 +688,44 @@ export class WorkflowBootstrap {
       return activation?.runId === ownership.runId
         && activation.state.kind === "ended"
         && activation.state.outcome === "completed";
+    } finally {
+      store.close();
+    }
+  }
+
+  isCancellationOwnedRun(ownership: AgentRunOwnership): boolean {
+    const databasePath = this.#workflowDatabases.get(ownership.workflowOwnerId)
+      ?? (this.#controlPlane?.workflow.ownerAgentId === ownership.workflowOwnerId
+        ? this.#controlPlane.workflow.databasePath
+        : undefined);
+    if (!databasePath) return false;
+    const store = new ActivationCancellationInspectionStore(databasePath);
+    try {
+      return Boolean(store.inspectForRun({
+        workflowOwnerId: ownership.workflowOwnerId,
+        agentId: ownership.agentId,
+        runId: ownership.runId,
+        fencingEpoch: ownership.epoch,
+      }));
+    } finally {
+      store.close();
+    }
+  }
+
+  wasProtocolCancelled(ownership: AgentRunOwnership): boolean {
+    const databasePath = this.#workflowDatabases.get(ownership.workflowOwnerId)
+      ?? (this.#controlPlane?.workflow.ownerAgentId === ownership.workflowOwnerId
+        ? this.#controlPlane.workflow.databasePath
+        : undefined);
+    if (!databasePath) return false;
+    const store = new ActivationCancellationInspectionStore(databasePath);
+    try {
+      return store.inspectForRun({
+        workflowOwnerId: ownership.workflowOwnerId,
+        agentId: ownership.agentId,
+        runId: ownership.runId,
+        fencingEpoch: ownership.epoch,
+      })?.state === "committed";
     } finally {
       store.close();
     }

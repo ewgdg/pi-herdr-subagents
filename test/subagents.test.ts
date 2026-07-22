@@ -11,6 +11,7 @@ import {
   selectCompletionApi,
   shouldDeliverSubagentCompletion,
   shouldPreserveSubagentsOnShutdown,
+  shouldSuppressAgentRunWatcherResult,
 } from "../pi-extension/subagents/index.ts";
 
 import {
@@ -2767,6 +2768,28 @@ describe("subagent parent lifecycle", () => {
 
     // Pre-lifecycle fixtures without a lifecycle field still default to pending.
     assert.equal(shouldDeliverSubagentCompletion({} as any), true);
+  });
+
+  it("suppresses the legacy watcher while durable cancellation owns the exact run", () => {
+    const ownership = {
+      workflowOwnerId: "owner",
+      agentId: "agent",
+      runId: "run",
+      resourceId: "agent-run:owner:agent",
+      epoch: 1,
+    };
+    let completionChecks = 0;
+    assert.equal(shouldSuppressAgentRunWatcherResult({
+      isCancellationOwnedRun(candidate) {
+        assert.equal(candidate, ownership);
+        return true;
+      },
+      wasProtocolCompleted() {
+        completionChecks += 1;
+        return false;
+      },
+    } as never, ownership), true);
+    assert.equal(completionChecks, 0, "cancellation claim suppresses before watcher failure reconciliation");
   });
 
   it("delivers completion through the reloaded extension API", () => {

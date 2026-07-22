@@ -71,6 +71,9 @@ export type WorkflowProtocolErrorCode =
   | "AnswerAlreadyClosed"
   | "RequestCancellationUnauthorized"
   | "RequestAlreadyClosed"
+  | "ActivationCancellationUnauthorized"
+  | "ActivationCancellationConflict"
+  | "CancellationInDoubt"
   | "UnknownRequest";
 
 export class WorkflowProtocolError extends Error {

@@ -576,6 +576,15 @@ export interface SubagentsExtensionOptions {
 
 function createWorkflowBootstrap(): WorkflowBootstrap {
   return new WorkflowBootstrap({
+    agentRunTerminator: {
+      async inspect(locator) {
+        const inspection = await inspectPane(locator.surface);
+        if (inspection.kind === "present") return { kind: "present" };
+        if (inspection.kind === "missing") return { kind: "missing" };
+        return { kind: "unavailable", error: inspection.error };
+      },
+      async close(locator) { closePane(locator.surface); },
+    },
     async confirmRunTerminated(locator) {
       const inspection = await inspectPane(locator.surface);
       if (inspection.kind === "missing") return true;
@@ -629,6 +638,15 @@ export function shouldDeliverSubagentCompletion(
   // Authoritative gate: only pending deliveries may be sent.
   // Missing lifecycle (pre-migration fixtures) defaults to pending/true.
   return (running.lifecycle?.delivery ?? "pending") === "pending";
+}
+
+/** Durable protocol outcomes own the exact run; its legacy watcher must stay silent. */
+export function shouldSuppressAgentRunWatcherResult(
+  workflowBootstrap: Pick<WorkflowBootstrap, "isCancellationOwnedRun" | "wasProtocolCompleted">,
+  ownership: import("./protocol/workflow-types.ts").AgentRunOwnership,
+): boolean {
+  return workflowBootstrap.isCancellationOwnedRun(ownership)
+    || workflowBootstrap.wasProtocolCompleted(ownership);
 }
 
 export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
@@ -1598,6 +1616,7 @@ async function launchSubagent(
         launchPolicy,
         sessionBinding: workflowSessionBinding,
         routerEndpoint: ready.routerEndpoint,
+        checkpoint: JSON.stringify({ surface }),
       });
       spawnedOwnership = {
         workflowOwnerId: runtime.workflowBootstrap.workflow!.ownerAgentId,
@@ -2069,7 +2088,7 @@ function createDefaultLegacyAgentRunAdapters(pi: ExtensionAPI): ConfiguredLegacy
     },
     watchCompleted(running, result) {
       if (running.workflowOwnership) {
-        if (runtime.workflowBootstrap.wasProtocolCompleted(running.workflowOwnership)) return false;
+        if (shouldSuppressAgentRunWatcherResult(runtime.workflowBootstrap, running.workflowOwnership)) return false;
         runtime.workflowBootstrap.runTerminated(
           running.workflowOwnership,
           hasConfirmedAgentRunTermination(result),

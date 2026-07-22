@@ -83,7 +83,7 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 | Collaboration tool | Description |
 | ------------------ | ----------- |
 | `agent_send`       | Send Signals and Requests, or Answer a Request |
-| `agent_cancel`     | Cancel an unresolved Request created by the current Agent |
+| `agent_cancel`     | Cancel an owned Request or an authorized open Agent activation |
 | `agent_inspect`    | Inspect capability-filtered durable Agent and Request state |
 
 | Command                    | Description                          |
@@ -279,19 +279,41 @@ gracefully without selecting or relaying a second legacy result.
 
 Only the Agent addressed by a Request may answer it. The first queued Answer closes the Request; retrying that same Answer is idempotent. An Answer can also set `responseRequired: true` to create its own Request atomically. A Request becomes resolved only when its Answer is committed to the requester’s inbox; unresolved Requests remain durable Agent dependencies.
 
-## agent_cancel — Request Cancellation
+## agent_cancel — Request or Activation Cancellation
 
-`agent_cancel` cancels one unresolved Request created by the current Agent:
+`agent_cancel` accepts exactly one nested target:
 
 ```typescript
-agent_cancel({ request: requestId });
+agent_cancel({ target: { request: requestId } });
+agent_cancel({ target: { agent: workflowAgentId } });
 ```
+
+The Agent target is the durable Workflow Agent ID. Pane IDs, display names, watcher IDs, and other aliases are not accepted.
+
+### Request target
 
 Only the original requester has cancellation authority. Cancellation and Answer acceptance arbitrate through one durable commit: whichever commits first wins, and the losing operation has no Request-state effects. Retrying a successful cancellation is idempotent and cannot create another notice.
 
 If the responder has not durably received the Request, cancellation suppresses its inbox pointer without waking the responder. If the Request was delivered, the runtime queues one correlated Steer Protocol Notice, using ordinary inbox ordering and delivery confirmation, so a waiting responder wakes with actionable cancellation context. The notice is runtime-authored; its canonical payload and delivery state live on the Request rather than in an Agent transcript.
 
-Cancellation removes the requester's dependency and permits completion when no other blockers remain. It does not fabricate an Answer, undo completed work, or claim to roll back external side effects. This tool cancels Requests only; it does not cancel Agent activations.
+Request cancellation removes the requester's dependency and permits completion when no other blockers remain. It does not fabricate an Answer, undo completed work, or claim to roll back external side effects.
+
+### Agent target
+
+The Workflow Owner may cancel any open Subagent activation. A Spawner may cancel only its direct child's open activation. Agent Definition names, including `moderator`, do not grant authority. Cancellation affects one activation only; it does not cascade to descendants.
+
+The runtime first durably claims a cancellation operation, which blocks completion through a `cancellation:*` operation dependency. It then reads the exact fenced Agent Run locator, inspects the process, closes its herdr surface, and inspects again. Missing process evidence confirms termination; unavailable inspection does not. Until termination is confirmed and the final transaction commits, the activation remains open and retains its Router and Agent Run ownership. Unconfirmed termination is reported as `CancellationInDoubt` rather than success. A later authorized `agent_cancel` call for that same open activation resumes the original operation even though Pi supplies a new tool-call ID; both IDs remain durably fenced to the original activation and cannot cancel a replacement activation when replayed.
+
+After confirmed termination, one immediate Workflow transaction revalidates the activation ID, run ID, fencing epoch, lifecycle revision, ownership, and checkpoint. It then atomically:
+
+- records `ended(cancelled)`, removes the exact Router, and releases Agent Run ownership;
+- discards still-unaccepted outbound Message bindings with their exact `acceptance:*` dependencies; acceptance that committed first keeps its Signal or Answer effects and transforms any resulting open Request;
+- cancels open outgoing Requests while preserving answered Requests and accepted-but-undelivered Answers;
+- orphans open incoming Requests without fabricating Answers;
+- queues one correlated, runtime-authored orphan Protocol Notice per orphaned Request;
+- terminalizes pending, response-bound, and unconsumed Human Interrupt results, clears `DECIDE` attention, and closes an open undeclared-settlement episode.
+
+An orphan notice's canonical payload and exactly-once delivery metadata live on its Request. Delivery resolves the requester's dependency. Reactivating the former responder cannot reopen or Answer the orphaned Request; replacement work requires a new Request.
 
 ## agent_inspect — Read-only Workflow State
 
@@ -306,7 +328,7 @@ agent_inspect({ target: { workflow: true } }); // Workflow Owner only
 
 A caller may inspect a known Agent ID, but that does not grant control, ownership, or enumeration. Non-owner Agents can enumerate only their direct children; the Workflow Owner can enumerate the complete Workflow. Human Interrupt and undeclared-settlement state is redacted so canonical question, response, notice payloads, and model-facing identities are not duplicated.
 
-Inspection reports Agent activation/waiting state, Human Interrupt state, undeclared-settlement correction state, and Request `open`, `answered`, `resolved`, or `cancelled` state. Cancelled Request projections show the satisfied requester dependency and cancellation-notice delivery metadata without duplicating the canonical notice payload. Orphan state, Operation Review details, and Incident Visibility remain deferred to their producer work and are not represented by placeholders.
+Inspection reports Agent activation/waiting state, Human Interrupt state, undeclared-settlement correction state, active or committed cancellation operation state, and Request `open`, `answered`, `resolved`, `cancelled`, or `orphaned` state. Request correlation includes requester/responder activation provenance. Cancelled and orphaned Request projections expose notice identity and delivery state without duplicating canonical notice payloads.
 
 An explicit child `tools` allowlist remains exact: include `agent_inspect` or `agent_cancel` when that restricted child needs the corresponding operation. Without an explicit allowlist both are available by default; `deny-tools` removes either tool by name.
 

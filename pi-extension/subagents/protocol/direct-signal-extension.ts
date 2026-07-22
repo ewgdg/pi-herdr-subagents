@@ -260,7 +260,7 @@ export function projectInboxBatch(batch: InboxBatch): {
       inReplyToRequestId?: string;
     } | {
       kind: "protocol-notice";
-      noticeKind: "request-cancelled";
+      noticeKind: "request-cancelled" | "request-orphaned";
       messageId: string;
       requestId: string;
       recipientAgentId: string;

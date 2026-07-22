@@ -110,16 +110,18 @@ export class RecipientInboxRouter {
     }
   }
 
-  async close(): Promise<void> {
+  async close(options: { preserveRegistration?: boolean } = {}): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
     if (this.#durableDrainTimer) clearInterval(this.#durableDrainTimer);
     this.#durableDrainTimer = undefined;
     const errors: unknown[] = [];
-    try {
-      this.#store.unregisterRouter(this.#options.recipient, this.#endpoint);
-    } catch (error) {
-      errors.push(error);
+    if (!options.preserveRegistration) {
+      try {
+        this.#store.unregisterRouter(this.#options.recipient, this.#endpoint);
+      } catch (error) {
+        errors.push(error);
+      }
     }
     try {
       if (this.#server) await this.#server.close();
@@ -313,11 +315,11 @@ export class RecipientInboxRouter {
   }
 
   #resolve(pointer: PendingMessagePointer): DirectSignalMessage {
-    if (pointer.protocolNoticeKind === "request-cancelled") {
+    if (pointer.protocolNoticeKind) {
       const canonical = this.#store.resolveProtocolNotice(this.#options.workflowOwnerId, pointer.messageId);
       return {
         kind: "protocol-notice",
-        noticeKind: "request-cancelled",
+        noticeKind: canonical.kind,
         messageId: pointer.messageId,
         requestId: canonical.requestId,
         recipientAgentId: pointer.recipientAgentId,

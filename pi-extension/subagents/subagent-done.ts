@@ -22,6 +22,7 @@ import {
   HumanInterruptInputBridge,
   registerAgentAskUserTool,
 } from "./protocol/human-interrupt-extension.ts";
+import { closePane, inspectPane } from "./terminal.ts";
 
 const RELOAD_SAFE_WORKFLOW_BOOTSTRAP = Symbol.for(
   "pi-herdr-subagents.child-workflow-bootstrap",
@@ -30,7 +31,17 @@ const RELOAD_SAFE_WORKFLOW_BOOTSTRAP = Symbol.for(
 export function getReloadSafeWorkflowBootstrap(): WorkflowBootstrap {
   const globalState = globalThis as any;
   return globalState[RELOAD_SAFE_WORKFLOW_BOOTSTRAP] ??=
-    new WorkflowBootstrap();
+    new WorkflowBootstrap({
+      agentRunTerminator: {
+        async inspect(locator) {
+          const inspection = await inspectPane(locator.surface);
+          if (inspection.kind === "present") return { kind: "present" };
+          if (inspection.kind === "missing") return { kind: "missing" };
+          return { kind: "unavailable", error: inspection.error };
+        },
+        async close(locator) { closePane(locator.surface); },
+      },
+    });
 }
 
 export function releaseReloadSafeWorkflowBootstrap(

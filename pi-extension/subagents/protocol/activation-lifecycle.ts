@@ -302,6 +302,17 @@ export class ActivationLifecycleStore {
         now,
         now,
       );
+      if (current?.ended_outcome === "failed") {
+        this.#database.prepare(`UPDATE workflow_requests
+          SET requester_activation_id = ?
+          WHERE requester_activation_id = ? AND (status IN ('open', 'answered')
+            OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))`
+        ).run(ownership.runId, current.activation_id);
+        this.#database.prepare(`UPDATE workflow_requests
+          SET responder_activation_id = ?
+          WHERE responder_activation_id = ? AND status = 'open'`
+        ).run(ownership.runId, current.activation_id);
+      }
       if (recoveredHuman) {
         this.#database.prepare(`
           UPDATE human_interrupts SET activation_id = ?, updated_at_ms = ?
@@ -424,7 +435,7 @@ export class ActivationLifecycleStore {
       if (row.open_state !== "active") {
         throw this.#invalidTransition(row, "settle");
       }
-      const declaredDependencies = this.#readDeclaredDependencies(row.activation_id, row.agent_id);
+      const declaredDependencies = this.#readDeclaredDependencies(row.activation_id);
       if (declaredDependencies.length === 0 && !this.#openHumanInterrupt(row.agent_id)) {
         this.#recordUndeclaredSettlement(row, now, actorRole);
       } else if (declaredDependencies.length > 0) {
@@ -749,41 +760,6 @@ export class ActivationLifecycleStore {
     });
   }
 
-  cancelAndRelease(ownership: AgentRunOwnership, now: number): ActivationRecord {
-    return this.#withImmediateTransaction(() => {
-      this.#assertCurrentOwnership(ownership);
-      const row = this.#requireOwnedOpenRow(ownership);
-      this.#database.prepare(`
-        UPDATE human_interrupts
-        SET status = 'terminal', response_input_id = NULL,
-            terminal_reason = 'activation-cancelled', updated_at_ms = ?
-        WHERE agent_id = ? AND status IN ('pending', 'response-bound')
-      `).run(now, row.agent_id);
-      this.#database.prepare("DELETE FROM human_attention WHERE agent_id = ?").run(row.agent_id);
-      this.#database.prepare(`
-        UPDATE undeclared_settlement_episodes
-        SET status = 'closed', updated_at_ms = ?
-        WHERE agent_id = ? AND status = 'open'
-      `).run(now, row.agent_id);
-      this.#database.prepare(`
-        UPDATE agent_activations
-        SET phase = 'ended', open_state = NULL, ended_outcome = 'cancelled',
-            failure_error = NULL, failure_exit_code = NULL, revision = revision + 1,
-            interrupt_turn_sequence = NULL, interrupt_requested_at_ms = NULL,
-            updated_at_ms = ?
-        WHERE activation_id = ?
-      `).run(now, row.activation_id);
-      const released = this.#database.prepare(`
-        DELETE FROM ownership
-        WHERE resource_id = ? AND owner_id = ? AND fencing_epoch = ?
-      `).run(ownership.resourceId, ownership.runId, ownership.epoch);
-      if (Number(released.changes) !== 1) {
-        throw new WorkflowProtocolError("OwnershipLost", `Agent Run no longer owns ${ownership.agentId} at fencing epoch ${ownership.epoch}`);
-      }
-      return this.#requireCurrent(ownership.agentId, ownership.workflowOwnerId);
-    });
-  }
-
   releaseWithoutActivation(ownership: AgentRunOwnership): void {
     this.#withImmediateTransaction(() => {
       this.#assertCurrentOwnership(ownership);
@@ -1000,9 +976,9 @@ export class ActivationLifecycleStore {
       SELECT 'agent' AS dependency_kind, request_id AS dependency_id,
              responder_agent_id AS agent_id
       FROM workflow_requests
-      WHERE requester_agent_id = (
-        SELECT agent_id FROM agent_activations WHERE activation_id = ?
-      ) AND status IN ('open', 'answered')
+      WHERE requester_activation_id = ?
+        AND (status IN ('open', 'answered')
+          OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))
       ORDER BY dependency_kind, dependency_id
     `).all(activationId, activationId) as unknown as DependencyRow[];
     if (rows.length === 0) return [{ kind: "undeclared", dependencyId: UNDECLARED_DEPENDENCY_ID }];
@@ -1011,7 +987,7 @@ export class ActivationLifecycleStore {
       : { kind: "operation", dependencyId: row.dependency_id });
   }
 
-  #readDeclaredDependencies(activationId: string, agentId: string): DependencyRow[] {
+  #readDeclaredDependencies(activationId: string): DependencyRow[] {
     return this.#database.prepare(`
       SELECT dependency_kind, dependency_id, dependency_agent_id AS agent_id
       FROM activation_dependencies WHERE activation_id = ?
@@ -1019,8 +995,10 @@ export class ActivationLifecycleStore {
       SELECT 'agent' AS dependency_kind, request_id AS dependency_id,
              responder_agent_id AS agent_id
       FROM workflow_requests
-      WHERE requester_agent_id = ? AND status IN ('open', 'answered')
-    `).all(activationId, agentId) as unknown as DependencyRow[];
+      WHERE requester_activation_id = ?
+        AND (status IN ('open', 'answered')
+          OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))
+    `).all(activationId, activationId) as unknown as DependencyRow[];
   }
 
   #humanInterrupt(agentId: string, toolCallId: string): HumanInterruptRow | undefined {

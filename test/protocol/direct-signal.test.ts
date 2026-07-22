@@ -367,6 +367,7 @@ describe("direct Signal protocol scenarios", () => {
       requestId: request.messageId,
       requesterAgentId: owner.agentId,
       responderAgentId: responder.agentId,
+      responderActivationId: responderRun.ownership.runId,
       answerDeliveryTiming: "deferred",
       status: "open",
     });
@@ -508,10 +509,12 @@ describe("direct Signal protocol scenarios", () => {
     assert.deepEqual(retry, answer);
     assert.deepEqual(ownerMessages.inspectRequest(request.messageId), {
       requestId: request.messageId, requesterAgentId: owner.agentId, responderAgentId: responder.agentId,
+      responderActivationId: responderRun.ownership.runId,
       answerDeliveryTiming: "deferred", status: "answered", answerMessageId: answer.messageId,
     });
     assert.deepEqual(ownerMessages.inspectRequest(answer.messageId), {
       requestId: answer.messageId, requesterAgentId: responder.agentId, responderAgentId: owner.agentId,
+      requesterActivationId: responderRun.ownership.runId,
       answerDeliveryTiming: "deferred", status: "open",
     });
     const laterSource = scenario.transcripts.appendAgentSend(responderSession, {
@@ -1254,16 +1257,19 @@ describe("direct Signal protocol scenarios", () => {
       });
     } finally { boundStore.close(); }
     let preparations = 0;
+    let resumedActivationId = "";
     const answer = await ownerMessages.sendMessage({
       target: { requestId: original.messageId }, message: "Decision and follow-up.", sourceEntryId: answerSource, responseRequired: true,
       async prepareEndedRecipient(request) {
         preparations += 1;
         const store = new DirectSignalStore(ownerRuntime.workflow.databasePath);
         try {
-          return store.acceptEndedRecipientRequest({
+          const accepted = store.acceptEndedRecipientRequest({
             request, recipient: ownerRuntime.agent(recipient.agentId), endpoint: "prepared://ended-answer",
             runId: scenario.identities.next(), checkpoint: JSON.stringify({ surface: "ended-answer" }), acceptedAtMs: scenario.clock.now(),
           });
+          resumedActivationId = accepted.ownership.runId;
+          return accepted;
         } finally { store.close(); }
       },
     });
@@ -1282,6 +1288,7 @@ describe("direct Signal protocol scenarios", () => {
     assert.equal(ownerMessages.inspectRequest(original.messageId)?.status, "answered");
     assert.deepEqual(ownerMessages.inspectRequest(answer.messageId), {
       requestId: answer.messageId, requesterAgentId: owner.agentId, responderAgentId: recipient.agentId,
+      responderActivationId: resumedActivationId,
       answerDeliveryTiming: "steer", status: "open",
     });
     assert.equal(ownerMessages.listPending(ownerRuntime.agent(recipient.agentId))[0]?.inReplyToRequestId, original.messageId);

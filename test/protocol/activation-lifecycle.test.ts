@@ -215,7 +215,7 @@ describe("canonical activation lifecycle scenarios", () => {
     runtime.close();
   });
 
-  it("keeps a prepared Human result authorized when cancellation commits after preparation", async () => {
+  it("makes an unconsumed prepared Human result stale when cancellation commits", async () => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime } = scenario.createOwner();
     const session = scenario.childSession(runtime, "worker");
@@ -227,12 +227,10 @@ describe("canonical activation lifecycle scenarios", () => {
     runtime.bindHumanResponse(run, "ask-1", "input-1");
     assert.equal(runtime.prepareHumanResponseResult(run, "ask-1").status, "result-pending");
 
-    // The preparation transaction is the persistence authorization fence.
-    // Cancellation may end the activation, but cannot make this returned Pi
-    // tool result stale before Pi has a chance to commit it.
     assert.equal(runtime.cancelActivation(run).state.outcome, "cancelled");
-    assert.equal(runtime.inspectHumanInterrupt(reference)?.status, "result-pending");
-    assert.equal(runtime.confirmHumanResponseResult(run, "ask-1")?.status, "consumed");
+    assert.equal(runtime.inspectHumanInterrupt(reference)?.status, "terminal");
+    assert.equal(runtime.inspectHumanInterrupt(reference)?.responseInputId, undefined);
+    assert.equal(runtime.confirmHumanResponseResult(run, "ask-1"), undefined);
     runtime.close();
   });
 

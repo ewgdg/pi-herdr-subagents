@@ -1,5 +1,6 @@
 import type { ActivationRecord, HumanInterruptRecord, UndeclaredSettlementEpisode } from "./activation-lifecycle.ts";
 import type { DirectSignalRecord, RequestRecord } from "./direct-signal-types.ts";
+import type { ActivationCancellationRecord } from "./activation-cancellation.ts";
 import type { SQLiteWorkflowStore } from "./sqlite-workflow-store.ts";
 import { WorkflowProtocolError, type AgentRecord, type AgentReference, type WorkflowRecord } from "./workflow-types.ts";
 
@@ -16,6 +17,7 @@ export interface InspectionSources {
   inspectActivation(agent: AgentReference): ActivationRecord | undefined;
   inspectHumanInterrupt(agent: AgentReference): HumanInterruptRecord | undefined;
   inspectUndeclaredEpisode(agent: AgentReference): UndeclaredSettlementEpisode | undefined;
+  inspectActivationCancellation?(agent: AgentReference): ActivationCancellationRecord | undefined;
   inspectRequestProjection(requestId: string): {
     request: RequestRecord;
     requestDeliveryStatus?: DirectSignalRecord["deliveryStatus"];
@@ -63,6 +65,8 @@ export class WorkflowInspection {
       : this.#sources.inspectActivation(reference);
     const human = activation ? this.#sources.inspectHumanInterrupt(reference) : undefined;
     const undeclared = activation ? this.#sources.inspectUndeclaredEpisode(reference) : undefined;
+    const cancellation = activation ? this.#sources.inspectActivationCancellation?.(reference) : undefined;
+    const currentCancellation = cancellation?.activationId === activation?.activationId ? cancellation : undefined;
     const dependencies = activation?.state.kind === "waiting"
       ? activation.state.dependencies.map((dependency) => dependency.kind === "agent"
         ? { kind: "agent" as const, dependencyId: dependency.dependencyId, agentId: dependency.agentId }
@@ -81,7 +85,7 @@ export class WorkflowInspection {
       state: activation ? projectActivationState(activation) : { kind: agent.agentId === this.#sources.workflow.ownerAgentId ? "owner" : "inactive" },
       elapsedMs: activationDurationMs(activation, this.#sources.now()),
       ...(dependencies.length ? { waitingReason: waitingReason(dependencies), dependencies } : {}),
-      callerAuthority: authority(this.#sources, agent),
+      callerAuthority: authority(this.#sources, agent, activation),
       transcriptPath: agent.sessionPath,
       ...(human && (human.status === "pending" || human.status === "response-bound" || human.status === "result-pending")
         ? { humanInterrupt: { state: human.status === "pending" ? "awaiting-response" : "response-bound-awaiting-resume" } }
@@ -90,6 +94,14 @@ export class WorkflowInspection {
         status: undeclared.status,
         allowanceConsumed: true,
         repeatTriggered: undeclared.repeatTriggered,
+      } } : {}),
+      ...(currentCancellation ? { cancellation: {
+        operationId: currentCancellation.operationId,
+        state: currentCancellation.state,
+        actorAgentId: currentCancellation.actorAgentId,
+        authority: currentCancellation.authority,
+        terminationAttempts: currentCancellation.terminationAttempts,
+        ...(currentCancellation.lastError ? { lastError: currentCancellation.lastError } : {}),
       } } : {}),
     };
   }
@@ -108,7 +120,12 @@ export class WorkflowInspection {
     return {
       kind: "request",
       requestId: request.requestId,
-      correlation: { requesterAgentId: request.requesterAgentId, responderAgentId: request.responderAgentId },
+      correlation: {
+        requesterAgentId: request.requesterAgentId,
+        responderAgentId: request.responderAgentId,
+        ...(request.requesterActivationId ? { requesterActivationId: request.requesterActivationId } : {}),
+        ...(request.responderActivationId ? { responderActivationId: request.responderActivationId } : {}),
+      },
       status: request.status,
       answer: request.answerMessageId ? { messageId: request.answerMessageId } : null,
       delivery: {
@@ -119,7 +136,13 @@ export class WorkflowInspection {
         noticeMessageId: request.cancellationNotice.messageId,
         delivery: request.cancellationNotice.deliveryStatus,
       } } : {}),
-      requesterDependency: request.status === "resolved" || request.status === "cancelled" ? "satisfied" : "unresolved",
+      ...(request.orphanNotice ? { orphaning: {
+        noticeMessageId: request.orphanNotice.messageId,
+        delivery: request.orphanNotice.deliveryStatus,
+      } } : {}),
+      requesterDependency: request.status === "resolved" || request.status === "cancelled"
+        || (request.status === "orphaned" && request.orphanNotice?.deliveryStatus === "delivered")
+        ? "satisfied" : "unresolved",
       requesterLifecycleDependency: dependency ? "waiting" : "not-waiting",
       callerAuthority: {
         inspect: true,
@@ -135,7 +158,11 @@ export class WorkflowInspection {
   }
 }
 
-function authority(sources: InspectionSources, agent: AgentRecord) {
+function authority(
+  sources: InspectionSources,
+  agent: AgentRecord,
+  activation: ActivationRecord | undefined,
+) {
   const callerId = sources.caller.agentId;
   return {
     inspect: true,
@@ -144,6 +171,8 @@ function authority(sources: InspectionSources, agent: AgentRecord) {
       : agent.spawnerAgentId === callerId ? "spawner" : "known-agent",
     enumerateDirectChildren: callerId === agent.agentId,
     enumerateWorkflow: callerId === sources.workflow.ownerAgentId,
+    cancelActivation: Boolean(activation && activation.state.kind !== "ended")
+      && (callerId === sources.workflow.ownerAgentId || agent.spawnerAgentId === callerId),
   };
 }
 

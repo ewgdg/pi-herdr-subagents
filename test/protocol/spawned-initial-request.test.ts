@@ -57,6 +57,7 @@ describe("Spawned Initial Request", () => {
       requestId: receipt.messageId,
       requesterAgentId: runtime.workflow.ownerAgentId,
       responderAgentId: child.agentId,
+      responderActivationId: receipt.runId,
       answerDeliveryTiming: "steer",
       status: "open",
     }]);
@@ -77,6 +78,7 @@ describe("Spawned Initial Request", () => {
       name: "Cloned spawner",
     });
     const clonedRuntime = scenario.startAgent(runtime.workflow, clonedSpawner);
+    runtime.startAgentRun(runtime.agent(clonedSpawner.agentId));
     const ownerChild = scenario.childSession(runtime, "owner-worker");
     const clonedChild = scenario.childSession(clonedRuntime, "cloned-worker");
     const ownerReceipt = runtime.spawnInitialRequest({

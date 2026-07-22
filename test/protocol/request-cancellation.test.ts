@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, it, type TestContext } from "node:test";
 import { DirectSignalRuntime, type InboxBatch } from "../../pi-extension/subagents/protocol/direct-signal.ts";
 import { DirectSignalStore } from "../../pi-extension/subagents/protocol/sqlite-message-store.ts";
@@ -107,6 +108,18 @@ describe("Request cancellation", () => {
     assert.equal(setup.responderBatches.flatMap((batch) => batch.messages)
       .some((message) => message.messageId === request.messageId), false);
     assert.equal(setup.responderWakes(), 0);
+  });
+
+  it("fails atomically when an unprojected Request loses its pending pointer", async (test) => {
+    const setup = await cancellationScenario(test, false);
+    const request = await sendRequest(setup);
+    const database = new DatabaseSync(setup.ownerRuntime.workflow.databasePath);
+    database.prepare("DELETE FROM pending_message_pointers WHERE message_id = ?").run(request.messageId);
+    database.close();
+
+    await assert.rejects(setup.ownerMessages.cancelRequest(request.messageId), /Pending pointer is missing/);
+    assert.equal(setup.ownerMessages.inspectRequest(request.messageId)?.status, "open");
+    assert.equal(setup.ownerMessages.inspectMessage(request.messageId)?.deliveryStatus, "queued");
   });
 
   it("queues exactly one correlated runtime-authored Steer notice after delivery and wakes a waiting responder", async (test) => {

@@ -15,7 +15,7 @@ export interface AgentDirectSignalMessage {
 
 export interface ProtocolNoticeMessage {
   kind: "protocol-notice";
-  noticeKind: "request-cancelled";
+  noticeKind: "request-cancelled" | "request-orphaned";
   messageId: string;
   requestId: string;
   recipientAgentId: string;
@@ -51,7 +51,7 @@ export interface DirectSignalRecord {
   inReplyToRequestId?: string;
   acceptanceSequence?: number;
   deliveryStatus: "bound" | "queued" | "delivered" | "suppressed";
-  protocolNoticeKind?: "request-cancelled";
+  protocolNoticeKind?: "request-cancelled" | "request-orphaned";
   canonicalRequestId?: string;
   createdAtMs: number;
   acceptedAtMs?: number;
@@ -63,10 +63,19 @@ export interface RequestRecord {
   requesterAgentId: string;
   responderAgentId: string;
   answerDeliveryTiming: SignalDeliveryTiming;
-  status: "open" | "answered" | "resolved" | "cancelled";
+  status: "open" | "answered" | "resolved" | "cancelled" | "orphaned";
+  requesterActivationId?: string;
+  responderActivationId?: string;
   answerMessageId?: string;
   cancelledAtMs?: number;
   cancellationNotice?: {
+    messageId: string;
+    message: string;
+    deliveryStatus: "queued" | "delivered";
+    deliveredAtMs?: number;
+  };
+  orphanedAtMs?: number;
+  orphanNotice?: {
     messageId: string;
     message: string;
     deliveryStatus: "queued" | "delivered";
@@ -94,7 +103,7 @@ export interface PendingMessagePointer {
   inReplyToRequestId?: string;
   acceptanceSequence: number;
   acceptedAtMs: number;
-  protocolNoticeKind?: "request-cancelled";
+  protocolNoticeKind?: "request-cancelled" | "request-orphaned";
   canonicalRequestId?: string;
   /** Durable evidence that transcript projection may already have occurred. */
   projectionClaimed: boolean;

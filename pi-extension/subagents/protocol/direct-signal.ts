@@ -468,24 +468,24 @@ export class DirectSignalRuntime {
     this.#router?.releaseDeferred();
   }
 
-  close(): Promise<void> {
+  close(options: { preserveRouterRegistration?: boolean } = {}): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     this.#closed = true;
     this.#cancelAcceptanceRetry();
     for (const waiter of this.#acceptanceResolutionWaiters) waiter.reject(new Error("Direct Signal runtime closed before acceptance reconciliation completed"));
     this.#acceptanceResolutionWaiters.clear();
-    this.#closePromise = this.#close();
+    this.#closePromise = this.#close(options);
     return this.#closePromise;
   }
 
-  async #close(): Promise<void> {
+  async #close(options: { preserveRouterRegistration?: boolean }): Promise<void> {
     // Router startup reports its own failure; closing must still release the
     // store when that startup raced with shutdown.
     await this.#routerStartup?.catch(() => undefined);
     const router = this.#router;
     this.#router = undefined;
     try {
-      await router?.close();
+      await router?.close({ preserveRegistration: options.preserveRouterRegistration });
     } finally {
       this.#store.close();
     }

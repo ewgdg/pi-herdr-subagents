@@ -97,7 +97,7 @@ export function commitMechanicalCompletion(
     ) as { activation_id: string; phase: "open" | "ended" } | undefined;
   if (!activation || activation.phase !== "open") throw new WorkflowProtocolError("InvalidLifecycleTransition", "Completion requires the current open activation");
 
-  const blockers = collectCompletionBlockers(database, ownership.agentId);
+  const blockers = collectCompletionBlockers(database, ownership.agentId, activation.activation_id);
   if (blockers.length) throw new CompletionRejectedError(blockers);
 
   database.prepare("UPDATE undeclared_settlement_episodes SET status = 'closed', updated_at_ms = ? WHERE agent_id = ? AND status = 'open'").run(completedAtMs, ownership.agentId);
@@ -113,14 +113,17 @@ export function commitMechanicalCompletion(
   return { activationId: activation.activation_id, agentId: ownership.agentId, completedAtMs, source };
 }
 
-function collectCompletionBlockers(database: DatabaseSync, agentId: string): CompletionBlocker[] {
+function collectCompletionBlockers(database: DatabaseSync, agentId: string, activationId: string): CompletionBlocker[] {
   const blockers: CompletionBlocker[] = [];
   const failed = database.prepare("SELECT ended_outcome FROM agent_activations WHERE agent_id = ? ORDER BY activation_sequence DESC LIMIT 2").all(agentId) as Array<{ ended_outcome: string | null }>;
   const recoveryPending = failed.some((row) => row.ended_outcome === "failed");
-  for (const row of database.prepare("SELECT request_id FROM workflow_requests WHERE responder_agent_id = ? AND status = 'open' ORDER BY request_id").all(agentId) as Array<{ request_id: string }>) {
+  for (const row of database.prepare("SELECT request_id FROM workflow_requests WHERE responder_activation_id = ? AND status = 'open' ORDER BY request_id").all(activationId) as Array<{ request_id: string }>) {
     blockers.push({ kind: recoveryPending ? "recovery-pending-request" : "incoming-request", requestId: row.request_id });
   }
-  for (const row of database.prepare("SELECT request_id FROM workflow_requests WHERE requester_agent_id = ? AND status IN ('open', 'answered') ORDER BY request_id").all(agentId) as Array<{ request_id: string }>) blockers.push({ kind: "outgoing-request", requestId: row.request_id });
+  for (const row of database.prepare(`SELECT request_id FROM workflow_requests
+    WHERE requester_activation_id = ? AND (status IN ('open', 'answered')
+      OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))
+    ORDER BY request_id`).all(activationId) as Array<{ request_id: string }>) blockers.push({ kind: "outgoing-request", requestId: row.request_id });
   for (const row of database.prepare("SELECT message_id FROM pending_message_pointers WHERE recipient_agent_id = ? ORDER BY acceptance_sequence").all(agentId) as Array<{ message_id: string }>) blockers.push({ kind: "accepted-undelivered-input", messageId: row.message_id });
   for (const row of database.prepare("SELECT tool_call_id, status FROM human_interrupts WHERE agent_id = ? AND status IN ('pending','response-bound','result-pending') ORDER BY tool_call_id").all(agentId) as Array<{ tool_call_id: string; status: string }>) blockers.push({ kind: "human-interrupt", toolCallId: row.tool_call_id, status: row.status });
   for (const row of database.prepare(`SELECT DISTINCT dependency_id FROM activation_dependencies

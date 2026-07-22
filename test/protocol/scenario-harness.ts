@@ -20,6 +20,7 @@ import {
 import type { InboxBatch } from "../../pi-extension/subagents/protocol/direct-signal.ts";
 import { projectInboxBatch } from "../../pi-extension/subagents/protocol/direct-signal-extension.ts";
 import { DirectSignalStore } from "../../pi-extension/subagents/protocol/sqlite-message-store.ts";
+import { ActivationCancellationStore } from "../../pi-extension/subagents/protocol/activation-cancellation.ts";
 
 export class ManualClock {
   #now: number;
@@ -218,15 +219,18 @@ export class ControllableRuntimeAdapter {
   readonly processAdapter: ControllableProcessAdapter;
   #controlPlane: WorkflowControlPlane;
   readonly #reopen: () => WorkflowControlPlane;
+  readonly #now: () => number;
 
   constructor(
     controlPlane: WorkflowControlPlane,
     processAdapter: ControllableProcessAdapter,
     reopen: () => WorkflowControlPlane,
+    now: () => number,
   ) {
     this.#controlPlane = controlPlane;
     this.processAdapter = processAdapter;
     this.#reopen = reopen;
+    this.#now = now;
   }
 
   get controlPlane(): WorkflowControlPlane {
@@ -291,6 +295,7 @@ export class ControllableRuntimeAdapter {
     agentDefinition: string;
     launchPolicy?: import("../../pi-extension/subagents/protocol/workflow-types.ts").AgentLaunchPolicy;
     routerEndpoint?: string;
+    checkpoint?: string;
   }) {
     if (!input.child.workflowBinding) throw new Error(`Scenario session is not bound to a Workflow: ${input.child.sessionPath}`);
     return this.#controlPlane.spawnInitialRequest({
@@ -305,6 +310,7 @@ export class ControllableRuntimeAdapter {
       launchPolicy: input.launchPolicy,
       sessionBinding: input.child.workflowBinding,
       routerEndpoint: input.routerEndpoint,
+      checkpoint: input.checkpoint,
     });
   }
 
@@ -483,8 +489,25 @@ export class ControllableRuntimeAdapter {
   }
 
   cancelActivation(run: ScenarioAgentRun): ActivationRecord {
-    this.processAdapter.confirmExit(run.processId);
-    return this.#controlPlane.cancelActivation(run.ownership);
+    this.#controlPlane.writeAgentRunCheckpoint(run.ownership, JSON.stringify({ surface: run.processId }));
+    const cancellation = new ActivationCancellationStore(this.workflow.databasePath);
+    let operationId: string;
+    try {
+      const claim = cancellation.claim({
+        actor: this.#controlPlane.currentAgent,
+        target: this.#controlPlane.agent(run.ownership.agentId),
+        sourceId: `${run.ownership.runId}:scenario-cancel`,
+        operationId: `${run.ownership.runId}:scenario-cancel`,
+        now: this.#now(),
+      });
+      operationId = claim.operationId;
+      this.processAdapter.confirmExit(run.processId);
+      cancellation.markReady(operationId, this.#now());
+      cancellation.finalize(operationId, this.#now());
+    } finally {
+      cancellation.close();
+    }
+    return this.#controlPlane.inspectActivation(this.#controlPlane.agent(run.ownership.agentId))!;
   }
 
   checkpoint(run: ScenarioAgentRun, value: string): void {
@@ -536,7 +559,7 @@ export class WorkflowScenario {
       ownerName: name,
       now: this.clock.now,
     });
-    return new ControllableRuntimeAdapter(open(), this.processes, open);
+    return new ControllableRuntimeAdapter(open(), this.processes, open, this.clock.now);
   }
 
   startAgent(workflow: WorkflowRecord, agent: ScenarioSession): ControllableRuntimeAdapter {
@@ -547,7 +570,7 @@ export class WorkflowScenario {
       agentSessionPath: agent.sessionPath,
       now: this.clock.now,
     });
-    return new ControllableRuntimeAdapter(open(), this.processes, open);
+    return new ControllableRuntimeAdapter(open(), this.processes, open, this.clock.now);
   }
 
   childSession(runtime: ControllableRuntimeAdapter, label: string): ScenarioSession {

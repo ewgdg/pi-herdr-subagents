@@ -44,7 +44,13 @@ describe("Workflow inspection", () => {
     assert.equal(projected.state.kind, "waiting");
     assert.deepEqual(projected.dependencies, [{ kind: "undeclared" }]);
     assert.equal(projected.waitingReason, "undeclared-settlement-correction");
-    assert.deepEqual(projected.callerAuthority, { inspect: true, relationship: "workflow-owner", enumerateDirectChildren: false, enumerateWorkflow: true });
+    assert.deepEqual(projected.callerAuthority, {
+      inspect: true,
+      relationship: "workflow-owner",
+      enumerateDirectChildren: false,
+      enumerateWorkflow: true,
+      cancelActivation: true,
+    });
     assert.deepEqual(projected.undeclaredSettlement, { status: episode.status, allowanceConsumed: true, repeatTriggered: false });
     assert.equal(JSON.stringify(projected).includes(episode.noticeId), false);
     assert.equal(JSON.stringify(projected).includes(episode.noticeText), false);
@@ -145,7 +151,11 @@ describe("Workflow inspection", () => {
     store.acceptSignal({ request, recipient: runtime.owner(), endpoint: "owner-router", acceptedAtMs: scenario.clock.now() });
 
     const projection = runtime.inspectTarget({ request: "request-1" }) as any;
-    assert.deepEqual(projection.correlation, { requesterAgentId: requester.agentId, responderAgentId: runtime.workflow.ownerAgentId });
+    assert.deepEqual(projection.correlation, {
+      requesterAgentId: requester.agentId,
+      responderAgentId: runtime.workflow.ownerAgentId,
+      requesterActivationId: run.ownership.runId,
+    });
     assert.equal(projection.status, "open");
     assert.equal(projection.answer, null);
     assert.deepEqual(projection.delivery, { request: "queued", answer: "not-created" });

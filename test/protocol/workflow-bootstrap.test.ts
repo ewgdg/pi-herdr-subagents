@@ -22,6 +22,10 @@ import { HumanInterruptInputBridge, registerAgentAskUserTool } from "../../pi-ex
 import { initializeSubagentSessionFile } from "../../pi-extension/subagents/session.ts";
 import { bindNewWorkflowSession } from "../../pi-extension/subagents/protocol/workflow-session-binding.ts";
 import { DeterministicIdentityFactory, ManualClock } from "./scenario-harness.ts";
+import {
+  ActivationCancellationStore,
+  CancellationInDoubtError,
+} from "../../pi-extension/subagents/protocol/activation-cancellation.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -48,6 +52,92 @@ function context(sessionId: string, sessionPath: string): WorkflowBootstrapConte
 }
 
 describe("production Workflow bootstrap", () => {
+  it("resumes an in-doubt activation cancellation from a later public tool call", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: ownerPath, childCwd: root, childSessionId: ownerId });
+    const observations = ["present", "unavailable", "missing"] as const;
+    let observation = 0;
+    const owner = new WorkflowBootstrap({
+      agentRunTerminator: {
+        async inspect() { return { kind: observations[observation++] }; },
+        async close() {},
+      },
+    });
+    owner.sessionStarted(context(ownerId, ownerPath));
+    const childId = identities.next();
+    const childPath = join(owner.workflow!.sessionsDirectory, "retry-cancellation-child.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: childPath, childCwd: root, childSessionId: childId });
+    const prepared = owner.prepareSpawn({
+      agentId: childId,
+      sessionPath: childPath,
+      runId: "retry-cancellation-run",
+      surface: "retry-cancellation-surface",
+      name: "Child",
+      sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: childId, sessionPath: childPath }),
+    });
+    owner.runStarted(prepared.ownership);
+
+    let firstOperationId = "";
+    await assert.rejects(owner.cancelActivation(childId, "first-tool-call"), (error: unknown) => {
+      assert.ok(error instanceof CancellationInDoubtError);
+      firstOperationId = error.operation.operationId;
+      return true;
+    });
+    const result = await owner.cancelActivation(childId, "later-tool-call");
+    assert.equal(result.state, "committed");
+    assert.equal(result.operationId, firstOperationId);
+    assert.equal(result.sourceId, "first-tool-call");
+    owner.close();
+  });
+
+  it("does not let target shutdown reclassify a cancellation-owned run as failed", async () => {
+    const root = await temporaryDirectory();
+    const identities = new DeterministicIdentityFactory();
+    const ownerId = identities.next();
+    const ownerPath = join(root, "owner.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: ownerPath, childCwd: root, childSessionId: ownerId });
+    const owner = new WorkflowBootstrap();
+    owner.sessionStarted(context(ownerId, ownerPath));
+    const childId = identities.next();
+    const childPath = join(owner.workflow!.sessionsDirectory, "cancellation-child.jsonl");
+    initializeSubagentSessionFile({ mode: "standalone", childSessionFile: childPath, childCwd: root, childSessionId: childId });
+    const prepared = owner.prepareSpawn({
+      agentId: childId,
+      sessionPath: childPath,
+      runId: "cancellation-run",
+      surface: "cancellation-surface",
+      name: "Child",
+      sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: childId, sessionPath: childPath }),
+    });
+    owner.runStarted(prepared.ownership);
+    const child = new WorkflowBootstrap();
+    child.sessionStarted(context(childId, childPath), prepared.environment);
+    await child.startDirectSignalRouter({ projectInboxBatch() {} });
+    const cancellation = new ActivationCancellationStore(owner.workflow!.databasePath);
+    const claim = cancellation.claim({
+      actor: { workflowOwnerId: ownerId, agentId: ownerId },
+      target: { workflowOwnerId: ownerId, agentId: childId },
+      sourceId: "shutdown-race-source",
+      operationId: "shutdown-race-operation",
+      now: 1,
+    });
+
+    await child.closeDirectSignalRouter();
+    const database = new DatabaseSync(owner.workflow!.databasePath, { readOnly: true });
+    assert.ok(database.prepare("SELECT 1 FROM recipient_inbox_routers WHERE agent_id = ?").get(childId));
+    database.close();
+    child.close();
+    assert.equal(owner.inspectActivation(childId)?.state.kind, "active");
+    assert.equal(owner.isCancellationOwnedRun(prepared.ownership), true);
+    cancellation.markReady(claim.operationId, 2);
+    assert.equal(cancellation.finalize(claim.operationId, 3).state, "committed");
+    cancellation.close();
+    owner.close();
+  });
+
   it("starts recovery activation and transfers operation dependencies before launcher acknowledgement", async () => {
     const root = await temporaryDirectory();
     const identities = new DeterministicIdentityFactory();

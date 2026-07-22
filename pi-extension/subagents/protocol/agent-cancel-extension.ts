@@ -2,11 +2,18 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import type { WorkflowBootstrap } from "./workflow-bootstrap.ts";
 
-export const AgentCancelParams = Type.Object({
+const AgentCancellationTarget = Type.Object({
+  agent: Type.String({ minLength: 1, description: "Workflow Agent ID whose current open activation will be cancelled" }),
+}, { additionalProperties: false });
+const RequestCancellationTarget = Type.Object({
   request: Type.String({ minLength: 1, description: "Unresolved Request ID owned by the current Agent" }),
 }, { additionalProperties: false });
 
-/** Register requester-authorized Request cancellation. Agent cancellation is intentionally out of scope. */
+export const AgentCancelParams = Type.Object({
+  target: Type.Union([AgentCancellationTarget, RequestCancellationTarget]),
+}, { additionalProperties: false });
+
+/** Register strict Request or single-activation cancellation. */
 export function registerAgentCancelTool(
   pi: ExtensionAPI,
   workflowBootstrap: WorkflowBootstrap,
@@ -15,23 +22,34 @@ export function registerAgentCancelTool(
   if (!enabled) return;
   pi.registerTool({
     name: "agent_cancel",
-    label: "Cancel Request",
+    label: "Cancel Request or Activation",
     description:
-      "Cancel an unresolved Request created by the current Agent. " +
-      "Cancellation removes the response dependency but cannot roll back completed work or external side effects.",
+      "Cancel either one unresolved Request created by the current Agent or one authorized open Subagent activation. " +
+      "Activation cancellation requires Workflow Owner or direct Spawner authority, confirms exact process termination, and does not cascade to descendants.",
     promptSnippet:
-      "Cancel one unresolved Request you created. Undelivered work is suppressed; delivered work receives an actionable cancellation notice.",
+      "Cancel one Request you created or one authorized Agent activation. Use the durable Workflow Agent ID, not a pane, display name, or legacy running ID.",
     parameters: AgentCancelParams,
-    async execute(_toolCallId, params, _signal, _onUpdate, context) {
+    async execute(toolCallId, params, _signal, _onUpdate, context) {
       await workflowBootstrap.waitUntilReady(context);
-      const receipt = await workflowBootstrap.cancelRequest(params.request);
-      const delivery = receipt.delivery === "suppressed"
-        ? " before delivery"
-        : receipt.delivery === "notice-delivered"
-          ? "; its cancellation notice is delivered"
-          : "; its cancellation notice is queued";
+      if ("request" in params.target) {
+        const receipt = await workflowBootstrap.cancelRequest(params.target.request);
+        const delivery = receipt.delivery === "suppressed"
+          ? " before delivery"
+          : receipt.delivery === "notice-delivered"
+            ? "; its cancellation notice is delivered"
+            : "; its cancellation notice is queued";
+        return {
+          content: [{ type: "text", text: `Request ${receipt.requestId} cancelled${delivery}.` }],
+          details: receipt,
+        };
+      }
+
+      const receipt = await workflowBootstrap.cancelActivation(params.target.agent, toolCallId);
       return {
-        content: [{ type: "text", text: `Request ${receipt.requestId} cancelled${delivery}.` }],
+        content: [{
+          type: "text",
+          text: `Activation ${receipt.activationId} cancelled for Agent ${receipt.targetAgentId}.`,
+        }],
         details: receipt,
       };
     },

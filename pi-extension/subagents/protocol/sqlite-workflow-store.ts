@@ -95,16 +95,25 @@ export class SQLiteWorkflowStore {
         request_id TEXT PRIMARY KEY REFERENCES direct_signal_messages(message_id),
         requester_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
         responder_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
+        requester_activation_id TEXT REFERENCES agent_activations(activation_id),
+        responder_activation_id TEXT REFERENCES agent_activations(activation_id),
         answer_delivery_timing TEXT NOT NULL CHECK (answer_delivery_timing IN ('steer', 'deferred')),
-        status TEXT NOT NULL CHECK (status IN ('open', 'answered', 'resolved', 'cancelled')),
+        status TEXT NOT NULL CHECK (status IN ('open', 'answered', 'resolved', 'cancelled', 'orphaned')),
         answer_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
         cancelled_at_ms INTEGER,
         cancellation_notice_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
         cancellation_notice_payload TEXT,
         cancellation_notice_delivery_status TEXT CHECK (cancellation_notice_delivery_status IN ('queued', 'delivered')),
         cancellation_notice_delivered_at_ms INTEGER,
+        orphaned_at_ms INTEGER,
+        orphaned_by_cancellation_operation_id TEXT,
+        orphan_notice_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
+        orphan_notice_payload TEXT,
+        orphan_notice_delivery_status TEXT CHECK (orphan_notice_delivery_status IN ('queued', 'delivered')),
+        orphan_notice_delivered_at_ms INTEGER,
         CHECK ((status IN ('open', 'cancelled') AND answer_message_id IS NULL)
-          OR (status IN ('answered', 'resolved') AND answer_message_id IS NOT NULL)),
+          OR (status IN ('answered', 'resolved') AND answer_message_id IS NOT NULL)
+          OR (status = 'orphaned' AND answer_message_id IS NULL)),
         CHECK ((status != 'cancelled' AND cancelled_at_ms IS NULL
             AND cancellation_notice_message_id IS NULL AND cancellation_notice_payload IS NULL
             AND cancellation_notice_delivery_status IS NULL AND cancellation_notice_delivered_at_ms IS NULL)
@@ -113,7 +122,16 @@ export class SQLiteWorkflowStore {
                 AND cancellation_notice_delivery_status IS NULL AND cancellation_notice_delivered_at_ms IS NULL)
               OR (cancellation_notice_message_id IS NOT NULL AND cancellation_notice_payload IS NOT NULL
                 AND ((cancellation_notice_delivery_status = 'queued' AND cancellation_notice_delivered_at_ms IS NULL)
-                  OR (cancellation_notice_delivery_status = 'delivered' AND cancellation_notice_delivered_at_ms IS NOT NULL))))))
+                  OR (cancellation_notice_delivery_status = 'delivered' AND cancellation_notice_delivered_at_ms IS NOT NULL)))))),
+        CHECK ((status != 'orphaned' AND orphaned_at_ms IS NULL
+            AND orphaned_by_cancellation_operation_id IS NULL
+            AND orphan_notice_message_id IS NULL AND orphan_notice_payload IS NULL
+            AND orphan_notice_delivery_status IS NULL AND orphan_notice_delivered_at_ms IS NULL)
+          OR (status = 'orphaned' AND orphaned_at_ms IS NOT NULL
+            AND orphaned_by_cancellation_operation_id IS NOT NULL
+            AND orphan_notice_message_id IS NOT NULL AND orphan_notice_payload IS NOT NULL
+            AND ((orphan_notice_delivery_status = 'queued' AND orphan_notice_delivered_at_ms IS NULL)
+              OR (orphan_notice_delivery_status = 'delivered' AND orphan_notice_delivered_at_ms IS NOT NULL))))
       ) STRICT;
 
       CREATE INDEX IF NOT EXISTS workflow_requests_requester_open
@@ -130,6 +148,7 @@ export class SQLiteWorkflowStore {
     for (let attempt = 0; attempt < SCHEMA_INITIALIZATION_MAX_ATTEMPTS; attempt += 1) {
       try {
         this.#database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+        this.#migrateWorkflowRequestsIfNeeded();
         this.#database.exec("BEGIN IMMEDIATE");
         try {
           this.#initializeSchema();
@@ -146,6 +165,131 @@ export class SQLiteWorkflowStore {
       }
     }
     throw lastError;
+  }
+
+  /** Rebuild the constrained Request table once so older Workflows can represent orphaning. */
+  #migrateWorkflowRequestsIfNeeded(): void {
+    const table = this.#database.prepare(
+      "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'workflow_requests'",
+    ).get() as { sql: string } | undefined;
+    if (!table || (table.sql.includes("'orphaned'") && table.sql.includes("requester_activation_id"))) return;
+
+    const hasActivations = Boolean(this.#database.prepare(
+      "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'agent_activations'",
+    ).get());
+    const hasMessages = Boolean(this.#database.prepare(
+      "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'direct_signal_messages'",
+    ).get());
+    this.#database.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
+    try {
+      this.#database.exec(`
+        CREATE TABLE workflow_requests_v2 (
+          request_id TEXT PRIMARY KEY REFERENCES direct_signal_messages(message_id),
+          requester_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
+          responder_agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
+          requester_activation_id TEXT REFERENCES agent_activations(activation_id),
+          responder_activation_id TEXT REFERENCES agent_activations(activation_id),
+          answer_delivery_timing TEXT NOT NULL CHECK (answer_delivery_timing IN ('steer', 'deferred')),
+          status TEXT NOT NULL CHECK (status IN ('open', 'answered', 'resolved', 'cancelled', 'orphaned')),
+          answer_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
+          cancelled_at_ms INTEGER,
+          cancellation_notice_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
+          cancellation_notice_payload TEXT,
+          cancellation_notice_delivery_status TEXT CHECK (cancellation_notice_delivery_status IN ('queued', 'delivered')),
+          cancellation_notice_delivered_at_ms INTEGER,
+          orphaned_at_ms INTEGER,
+          orphaned_by_cancellation_operation_id TEXT,
+          orphan_notice_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
+          orphan_notice_payload TEXT,
+          orphan_notice_delivery_status TEXT CHECK (orphan_notice_delivery_status IN ('queued', 'delivered')),
+          orphan_notice_delivered_at_ms INTEGER,
+          CHECK ((status IN ('open', 'cancelled') AND answer_message_id IS NULL)
+            OR (status IN ('answered', 'resolved') AND answer_message_id IS NOT NULL)
+            OR (status = 'orphaned' AND answer_message_id IS NULL)),
+          CHECK ((status != 'cancelled' AND cancelled_at_ms IS NULL
+              AND cancellation_notice_message_id IS NULL AND cancellation_notice_payload IS NULL
+              AND cancellation_notice_delivery_status IS NULL AND cancellation_notice_delivered_at_ms IS NULL)
+            OR (status = 'cancelled' AND answer_message_id IS NULL AND cancelled_at_ms IS NOT NULL
+              AND ((cancellation_notice_message_id IS NULL AND cancellation_notice_payload IS NULL
+                  AND cancellation_notice_delivery_status IS NULL AND cancellation_notice_delivered_at_ms IS NULL)
+                OR (cancellation_notice_message_id IS NOT NULL AND cancellation_notice_payload IS NOT NULL
+                  AND ((cancellation_notice_delivery_status = 'queued' AND cancellation_notice_delivered_at_ms IS NULL)
+                    OR (cancellation_notice_delivery_status = 'delivered' AND cancellation_notice_delivered_at_ms IS NOT NULL)))))),
+          CHECK ((status != 'orphaned' AND orphaned_at_ms IS NULL
+              AND orphaned_by_cancellation_operation_id IS NULL
+              AND orphan_notice_message_id IS NULL AND orphan_notice_payload IS NULL
+              AND orphan_notice_delivery_status IS NULL AND orphan_notice_delivered_at_ms IS NULL)
+            OR (status = 'orphaned' AND orphaned_at_ms IS NOT NULL
+              AND orphaned_by_cancellation_operation_id IS NOT NULL
+              AND orphan_notice_message_id IS NOT NULL AND orphan_notice_payload IS NOT NULL
+              AND ((orphan_notice_delivery_status = 'queued' AND orphan_notice_delivered_at_ms IS NULL)
+                OR (orphan_notice_delivery_status = 'delivered' AND orphan_notice_delivered_at_ms IS NOT NULL))))
+        ) STRICT;
+      `);
+      const acceptedAt = hasMessages
+        ? "COALESCE(message.accepted_at_ms, message.created_at_ms)"
+        : "9223372036854775807";
+      const activationAtAcceptance = (agentColumn: string) => `(
+        SELECT activation_id FROM agent_activations a
+        WHERE a.agent_id = ${agentColumn}
+          AND a.created_at_ms <= ${acceptedAt}
+        ORDER BY a.activation_sequence DESC LIMIT 1
+      )`;
+      const recoveryProvenance = (agentColumn: string, unresolvedStatus: string) => {
+        const historical = activationAtAcceptance(agentColumn);
+        return `CASE WHEN ${unresolvedStatus} THEN COALESCE((
+          SELECT replacement.activation_id
+          FROM agent_activations failed
+          JOIN agent_activations replacement
+            ON replacement.agent_id = failed.agent_id
+            AND replacement.activation_sequence > failed.activation_sequence
+          WHERE failed.activation_id = ${historical}
+            AND failed.ended_outcome = 'failed'
+            AND NOT EXISTS (
+              SELECT 1 FROM agent_activations barrier
+              WHERE barrier.agent_id = failed.agent_id
+                AND barrier.activation_sequence >= failed.activation_sequence
+                AND barrier.activation_sequence < replacement.activation_sequence
+                AND barrier.ended_outcome IS NOT 'failed'
+            )
+          ORDER BY replacement.activation_sequence DESC LIMIT 1
+        ), ${historical}) ELSE ${historical} END`;
+      };
+      const requesterActivation = hasActivations
+        ? recoveryProvenance("old.requester_agent_id", "old.status IN ('open', 'answered')")
+        : "NULL";
+      const responderActivation = hasActivations
+        ? recoveryProvenance("old.responder_agent_id", "old.status = 'open'")
+        : "NULL";
+      this.#database.exec(`
+        INSERT INTO workflow_requests_v2 (
+          request_id, requester_agent_id, responder_agent_id,
+          requester_activation_id, responder_activation_id,
+          answer_delivery_timing, status, answer_message_id, cancelled_at_ms,
+          cancellation_notice_message_id, cancellation_notice_payload,
+          cancellation_notice_delivery_status, cancellation_notice_delivered_at_ms
+        )
+        SELECT old.request_id, old.requester_agent_id, old.responder_agent_id,
+          ${requesterActivation}, ${responderActivation},
+          old.answer_delivery_timing, old.status, old.answer_message_id, old.cancelled_at_ms,
+          old.cancellation_notice_message_id, old.cancellation_notice_payload,
+          old.cancellation_notice_delivery_status, old.cancellation_notice_delivered_at_ms
+        FROM workflow_requests old
+        ${hasMessages ? "LEFT JOIN direct_signal_messages message ON message.message_id = old.request_id" : ""};
+        DROP TABLE workflow_requests;
+        ALTER TABLE workflow_requests_v2 RENAME TO workflow_requests;
+        CREATE INDEX workflow_requests_requester_open
+          ON workflow_requests (requester_agent_id, status);
+        COMMIT;
+      `);
+    } catch (error) {
+      if (this.#database.isTransaction) this.#database.exec("ROLLBACK");
+      throw error;
+    } finally {
+      this.#database.exec("PRAGMA foreign_keys = ON");
+    }
+    const violation = this.#database.prepare("PRAGMA foreign_key_check").get();
+    if (violation) throw new Error(`Workflow Request migration left a foreign-key violation: ${JSON.stringify(violation)}`);
   }
 
   close(): void {
