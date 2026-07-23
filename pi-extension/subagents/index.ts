@@ -27,6 +27,9 @@ import {
   readPane,
   readPaneAsync,
   inspectPane,
+  getSubagentPaneCreationContext,
+  createRecoveryPane,
+  discoverRecoveryPane,
 } from "./terminal.ts";
 import { waitForCompletion } from "./completion.ts";
 import {
@@ -94,6 +97,7 @@ import {
   WORKFLOW_OWNER_SESSION_PATH_ENV,
   humanInterruptActorRoleFromMembership,
 } from "./protocol/workflow-bootstrap.ts";
+import type { AgentRecord } from "./protocol/workflow-types.ts";
 import {
   ProvisionalSpawnGate,
   PROVISIONAL_SPAWN_ENDPOINT_ENV,
@@ -556,6 +560,7 @@ type RunningSubagent = LegacyRunningSubagent;
 interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
   pendingRequestReactivations: Map<string, Promise<import("./protocol/direct-signal-types.ts").QueuedSignalReceipt>>;
+  automaticRecoveryLaunches: Map<string, Promise<void>>;
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
@@ -576,6 +581,11 @@ export interface SubagentsExtensionOptions {
 
 function createWorkflowBootstrap(): WorkflowBootstrap {
   return new WorkflowBootstrap({
+    recoveryPaneLocator: {
+      async discover(locator) {
+        return discoverRecoveryPane(locator);
+      },
+    },
     agentRunTerminator: {
       async inspect(locator) {
         const inspection = await inspectPane(locator.surface);
@@ -602,6 +612,7 @@ function createSubagentRuntime(): SubagentRuntime {
   return {
     runningSubagents: new Map<string, RunningSubagent>(),
     pendingRequestReactivations: new Map(),
+    automaticRecoveryLaunches: new Map(),
     workflowBootstrap: createWorkflowBootstrap(),
   };
 }
@@ -611,6 +622,7 @@ const runtime: SubagentRuntime =
   (globalThis as any)[RUNTIME_KEY] ??
   ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
 runtime.workflowBootstrap ??= createWorkflowBootstrap();
+runtime.automaticRecoveryLaunches ??= new Map();
 const runningSubagents = runtime.runningSubagents;
 
 export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
@@ -642,11 +654,79 @@ export function shouldDeliverSubagentCompletion(
 
 /** Durable protocol outcomes own the exact run; its legacy watcher must stay silent. */
 export function shouldSuppressAgentRunWatcherResult(
-  workflowBootstrap: Pick<WorkflowBootstrap, "isCancellationOwnedRun" | "wasProtocolCompleted">,
+  workflowBootstrap: Pick<WorkflowBootstrap,
+    "isCancellationOwnedRun" | "wasProtocolCompleted" | "isRecoveryOwnedFailedRun"
+  >,
   ownership: import("./protocol/workflow-types.ts").AgentRunOwnership,
 ): boolean {
   return workflowBootstrap.isCancellationOwnedRun(ownership)
-    || workflowBootstrap.wasProtocolCompleted(ownership);
+    || workflowBootstrap.wasProtocolCompleted(ownership)
+    || workflowBootstrap.isRecoveryOwnedFailedRun(ownership);
+}
+
+/** Final durable arbitration immediately before the legacy result relay. */
+export function shouldDeliverAgentRunCompletion(
+  running: Pick<RunningSubagent, "lifecycle" | "workflowOwnership">,
+  workflowBootstrap: Pick<WorkflowBootstrap,
+    "isCancellationOwnedRun" | "wasProtocolCompleted" | "isRecoveryOwnedFailedRun"
+  >,
+): boolean {
+  if (!shouldDeliverSubagentCompletion(running)) return false;
+  return !running.workflowOwnership
+    || !shouldSuppressAgentRunWatcherResult(workflowBootstrap, running.workflowOwnership);
+}
+
+/**
+ * Reconcile a watcher result before the legacy relay sees it. A durable pending
+ * recovery owns the failed run, so it must launch silently rather than waking
+ * the Owner with a fabricated subagent result.
+ */
+export function handleAgentRunWatcherCompletion(
+  workflowBootstrap: Pick<WorkflowBootstrap,
+    "isCancellationOwnedRun" | "wasProtocolCompleted" | "runTerminated" | "isRecoveryOwnedFailedRun"
+  >,
+  ownership: import("./protocol/workflow-types.ts").AgentRunOwnership,
+  result: Pick<LegacyAgentRunResult, "termination" | "errorMessage" | "exitCode">,
+  launchRecovery: () => void,
+): boolean {
+  if (shouldSuppressAgentRunWatcherResult(workflowBootstrap, ownership)) return false;
+  workflowBootstrap.runTerminated(ownership, hasConfirmedAgentRunTermination(result), {
+    error: result.errorMessage ??
+      `Agent Run exited without committed completion or cancellation (exit ${result.exitCode})`,
+    exitCode: result.exitCode,
+  });
+  if (!workflowBootstrap.isRecoveryOwnedFailedRun(ownership)) return true;
+  launchRecovery();
+  return false;
+}
+
+/** Request-reactivation runs are internal transport and never relay a legacy result. */
+export function handleRequestReactivationWatcherCompletion(
+  workflowBootstrap: Pick<WorkflowBootstrap,
+    "isCancellationOwnedRun" | "wasProtocolCompleted" | "runTerminated" | "isRecoveryOwnedFailedRun"
+  >,
+  ownership: import("./protocol/workflow-types.ts").AgentRunOwnership,
+  result: Pick<LegacyAgentRunResult, "termination" | "errorMessage" | "exitCode">,
+  reconcileLiveOwnerRecovery: () => void,
+): false {
+  handleAgentRunWatcherCompletion(
+    workflowBootstrap,
+    ownership,
+    result,
+    reconcileLiveOwnerRecovery,
+  );
+  return false;
+}
+
+function reconcileAutomaticRecoveryWithLiveOwner(
+  ownership: import("./protocol/workflow-types.ts").AgentRunOwnership,
+): void {
+  void runtime.workflowBootstrap.notifyOwnerOfAutomaticRecovery(ownership)
+    .then((destination) => {
+      if (destination === "owner" && runtime.latestCtx) return startAutomaticRecovery(runtime.latestCtx);
+      return undefined;
+    })
+    .catch(() => undefined);
 }
 
 export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
@@ -893,6 +973,25 @@ function buildRequestReactivationCommand(input: {
   appendLaunchPolicyEnvironment(policyEnvironment, input.policy);
   const toolArgs = input.policy.toolAllowlist ? ` --tools ${shellQuote(input.policy.toolAllowlist)}` : "";
   return `${[...input.environment, ...policyEnvironment].join(" ")} pi --session ${shellQuote(input.sessionPath)} -e ${shellQuote(join(SUBAGENTS_DIR, "subagent-done.ts"))}${toolArgs}; echo '__SUBAGENT_DONE_'$?'__'`;
+}
+
+/** Recoveries inherit the durable Agent definition, not only its tool policy. */
+function buildAutomaticRecoveryReactivationCommand(input: {
+  environment: string[];
+  member: Pick<AgentRecord, "agentDefinition">;
+  policy: LaunchPolicy;
+  sessionPath: string;
+}): string {
+  return buildRequestReactivationCommand({
+    environment: [
+      ...input.environment,
+      ...(input.member.agentDefinition
+        ? [`PI_SUBAGENT_AGENT=${shellQuote(input.member.agentDefinition)}`]
+        : []),
+    ],
+    policy: input.policy,
+    sessionPath: input.sessionPath,
+  });
 }
 
 function buildPiPromptArgs(params: {
@@ -1163,6 +1262,7 @@ export const __test__ = {
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
   buildRequestReactivationCommand,
+  buildAutomaticRecoveryReactivationCommand,
   buildPiPromptArgs,
   observeRunningSubagent,
   resolveDenyTools,
@@ -1933,6 +2033,7 @@ async function reactivateEndedRecipientForRequest(
     const env = [
       ...getInheritedPiEnvironment(),
       `PI_SUBAGENT_NAME=${shellQuote(member.name)}`,
+      ...(member.agentDefinition ? [`PI_SUBAGENT_AGENT=${shellQuote(member.agentDefinition)}`] : []),
       `PI_SUBAGENT_SESSION=${shellQuote(member.sessionPath)}`,
       `PI_SUBAGENT_ID=${shellQuote(id)}`,
       `PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`,
@@ -1993,10 +2094,12 @@ async function reactivateEndedRecipientForRequest(
           // relaying an unrelated legacy subagent result to the requester.
           void watchSubagent(running, new AbortController().signal).then((result) => {
             runningSubagents.delete(id);
-            runtime.workflowBootstrap.runTerminated(ownership!, hasConfirmedAgentRunTermination(result), {
-              error: result.errorMessage ?? `Request-driven Agent Run exited (exit ${result.exitCode})`,
-              exitCode: result.exitCode,
-            });
+            handleRequestReactivationWatcherCompletion(
+              runtime.workflowBootstrap,
+              ownership!,
+              result,
+              () => reconcileAutomaticRecoveryWithLiveOwner(ownership!),
+            );
           });
         },
       });
@@ -2017,6 +2120,307 @@ async function reactivateEndedRecipientForRequest(
   return preparation;
 }
 
+/**
+ * The Owner is the only live process allowed to turn a durable recovery intent
+ * into a pane. The stable Herdr label is durable before creation; the generated
+ * pane id is promoted only after exact creation acknowledgement, while an
+ * unsuccessful launch is cleaned through the fenced intent.
+ */
+function recordAutomaticRecoveryRunTermination(input: {
+  failedActivationId: string;
+  ownership: import("./protocol/workflow-types.ts").AgentRunOwnership;
+  failure: { error: string; exitCode?: number };
+}): void {
+  const bootstrap = runtime.workflowBootstrap;
+  const activation = bootstrap.inspectActivation(input.ownership.agentId);
+  if (activation?.runId === input.ownership.runId && activation.state.kind !== "ended") {
+    bootstrap.runTerminated(input.ownership, true, input.failure);
+    return;
+  }
+  // A cancellation-before-bootstrap or a concurrent reconciliation may have
+  // already resolved this exact launch. Do not reinterpret that terminal race
+  // as a fresh failed launch.
+  if (!bootstrap.isAutomaticRecoveryLaunch(input.ownership)) return;
+  // No replacement activation acknowledged child bootstrap. Release the exact
+  // launch ownership and return the same episode to pending atomically.
+  bootstrap.abandonAutomaticRecovery({
+    failedActivationId: input.failedActivationId,
+    ownership: input.ownership,
+    detail: input.failure.error,
+  });
+}
+
+function registerAutomaticRecoveryWatcher(input: {
+  context: ExtensionContext;
+  failedActivationId: string;
+  ownership: import("./protocol/workflow-types.ts").AgentRunOwnership;
+  member: AgentRecord;
+  surface: string;
+}): void {
+  if (runningSubagents.has(input.ownership.runId)) return;
+  const artifactDir = getArtifactDir(
+    input.context.sessionManager.getSessionDir(),
+    input.context.sessionManager.getSessionId(),
+  );
+  const activityFile = getSubagentActivityFile(artifactDir, input.ownership.runId);
+  const running: RunningSubagent = {
+    id: input.ownership.runId,
+    name: input.member.name,
+    task: "Automatic recovery",
+    agent: input.member.agentDefinition,
+    surface: input.surface,
+    startTime: Date.now(),
+    sessionFile: input.member.sessionPath,
+    activityFile,
+    interactive: false,
+    runtimePlan: undefined,
+    launchKind: "resume",
+    workflowOwnership: input.ownership,
+    lifecycle: createLifecycle(Date.now()),
+  };
+  runningSubagents.set(running.id, running);
+  startWidgetRefresh();
+  startStatusRefresh(runtime.pi!);
+  const abortController = new AbortController();
+  running.abortController = abortController;
+  void watchSubagent(running, abortController.signal).then((result) => {
+    runningSubagents.delete(running.id);
+    if (!hasConfirmedAgentRunTermination(result)) return;
+    recordAutomaticRecoveryRunTermination({
+      failedActivationId: input.failedActivationId,
+      ownership: input.ownership,
+      failure: {
+        error: result.errorMessage ?? `Automatic recovery Agent Run exited (exit ${result.exitCode})`,
+        exitCode: result.exitCode,
+      },
+    });
+  }).catch((error) => {
+    runningSubagents.delete(running.id);
+    recordAutomaticRecoveryRunTermination({
+      failedActivationId: input.failedActivationId,
+      ownership: input.ownership,
+      failure: { error: `Automatic recovery watcher failed: ${(error as Error).message}` },
+    });
+  });
+}
+
+function registerAutomaticRecoveryWatchers(
+  context: ExtensionContext,
+  recoveries: import("./protocol/workflow-bootstrap.ts").AutomaticRecoveryRunReconciliation[],
+): void {
+  for (const recovery of recoveries) {
+    if (recovery.kind !== "live" || !recovery.locator) continue;
+    registerAutomaticRecoveryWatcher({
+      context,
+      failedActivationId: recovery.failedActivationId,
+      ownership: recovery.ownership,
+      member: recovery.member,
+      surface: recovery.locator.surface,
+    });
+  }
+}
+
+async function reconcileAutomaticRecoveryRuns(context: ExtensionContext): Promise<void> {
+  await runtime.workflowBootstrap.reconcileAutomaticRecoveryPaneIntents();
+  registerAutomaticRecoveryWatchers(
+    context,
+    await runtime.workflowBootstrap.reconcileAutomaticRecoveryRuns(),
+  );
+}
+
+/** Close an unpromoted pane only while its durable intent still fences it. */
+async function cleanupUnpromotedAutomaticRecoveryPane(
+  bootstrap: WorkflowBootstrap,
+  intent: import("./protocol/activation-recovery.ts").RecoveryPaneIntent,
+  surface: string,
+): Promise<void> {
+  const cleanup = bootstrap.beginRecoveryPaneCleanup(intent.intentId, "Automatic recovery pane was not promoted");
+  if (!cleanup || cleanup.state === "promoted") return;
+  if (cleanup.surface && cleanup.surface !== surface) {
+    throw new Error("Recovery pane cleanup surface no longer matches its durable intent");
+  }
+  closePane(surface);
+  const inspection = await inspectPane(surface);
+  if (inspection.kind !== "missing") {
+    throw new Error(
+      inspection.kind === "unavailable"
+        ? inspection.error ?? "Recovery pane liveness is unavailable after cleanup"
+        : "Recovery pane termination is unconfirmed",
+    );
+  }
+  bootstrap.completeRecoveryPaneCleanup(intent.intentId, surface);
+}
+
+/**
+ * Release a promoted recovery claim only after its exact pane is confirmed
+ * absent. A failed close leaves the claim fenced for Owner reconciliation;
+ * resetting it early would permit a duplicate pane while the old one lives.
+ */
+async function abandonPreparedAutomaticRecoveryClaim(
+  bootstrap: WorkflowBootstrap,
+  prepared: import("./protocol/workflow-bootstrap.ts").PreparedAutomaticRecoveryRun,
+  surface: string,
+  detail: string,
+): Promise<void> {
+  try {
+    const initial = await inspectPane(surface);
+    if (initial.kind === "unavailable") return;
+    if (initial.kind !== "missing") closePane(surface);
+    const afterClose = await inspectPane(surface);
+    if (afterClose.kind !== "missing") return;
+    bootstrap.abandonAutomaticRecovery({
+      failedActivationId: prepared.failedActivationId,
+      ownership: prepared.ownership,
+      detail,
+    });
+  } catch {
+    // Keep the promoted intent and exact Agent Run fence for restart
+    // reconciliation whenever external cleanup is inconclusive.
+  }
+}
+
+async function launchAutomaticRecovery(
+  episode: { failedActivationId: string; agentId: string },
+  context: ExtensionContext,
+): Promise<void> {
+  const bootstrap = runtime.workflowBootstrap;
+  const member = bootstrap.inspect(episode.agentId);
+  if (!member.launchPolicy) return;
+  const proposedIntentId = randomUUID();
+  const proposedRunId = randomUUID();
+  const paneContext = getSubagentPaneCreationContext();
+  const intent = bootstrap.prepareAutomaticRecoveryPane({
+    failedActivationId: episode.failedActivationId,
+    intentId: proposedIntentId,
+    runId: proposedRunId,
+    workspaceId: paneContext.workspaceId,
+    label: `pi-recovery-${proposedIntentId}`,
+    cwd: paneContext.cwd,
+  });
+  if (!intent || intent.state === "promoted" || intent.state === "cleanup-pending") return;
+  const id = intent.runId;
+  let surface = intent.surface;
+  let prepared: import("./protocol/workflow-bootstrap.ts").PreparedAutomaticRecoveryRun | undefined;
+  let dispatchBoundaryEntered = false;
+  try {
+    if (!surface) {
+      // A creating intent means an earlier Owner crossed the external create
+      // boundary but never acknowledged its pane. Until exact discovery
+      // resolves, creating again could duplicate the original pane.
+      if (!shouldCreateAutomaticRecoveryPane(intent)) return;
+      bootstrap.beginAutomaticRecoveryPaneCreation(intent);
+      surface = createRecoveryPane(intent.label, intent);
+      bootstrap.recordAutomaticRecoveryPaneCreated(intent, surface);
+      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    }
+    if (!surface) throw new Error("Automatic recovery pane creation returned no exact surface");
+    prepared = bootstrap.promoteAutomaticRecoveryPane({
+      failedActivationId: episode.failedActivationId,
+      intentId: intent.intentId,
+      runId: intent.runId,
+      surface,
+    });
+    if (!prepared) {
+      const currentIntent = bootstrap.inspectAutomaticRecoveryPaneIntent(intent.intentId);
+      if (currentIntent?.state !== "promoted" && surface) {
+        await cleanupUnpromotedAutomaticRecoveryPane(bootstrap, currentIntent ?? intent, surface);
+      }
+      return;
+    }
+
+    const artifactDir = getArtifactDir(context.sessionManager.getSessionDir(), context.sessionManager.getSessionId());
+    const activityFile = getSubagentActivityFile(artifactDir, id);
+    mkdirSync(dirname(activityFile), { recursive: true });
+    const environment = [
+      ...getInheritedPiEnvironment(),
+      `PI_SUBAGENT_NAME=${shellQuote(member.name)}`,
+      `PI_SUBAGENT_SESSION=${shellQuote(member.sessionPath)}`,
+      `PI_SUBAGENT_ID=${shellQuote(id)}`,
+      `PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`,
+      `PI_SUBAGENT_SURFACE=${shellQuote(surface)}`,
+      ...Object.entries(prepared.environment).map(([key, value]) => `${key}=${shellQuote(value)}`),
+    ];
+    const command = buildAutomaticRecoveryReactivationCommand({
+      environment,
+      member,
+      policy: member.launchPolicy,
+      sessionPath: member.sessionPath,
+    });
+    // The intent checkpoint must be durable before command submission. If the
+    // Owner dies after this point, the outcome is ambiguous and reconciliation
+    // must preserve the fence rather than launching a duplicate child.
+    // Treat entry into this boundary as ambiguous until the durable intent
+    // write itself proves otherwise; a failed transition must not close a pane
+    // that another Owner Run may already be dispatching.
+    dispatchBoundaryEntered = true;
+    bootstrap.beginAutomaticRecoveryDispatch(prepared.ownership);
+    runScriptInPane(surface, command, {
+      scriptPath: join(artifactDir, "subagent-scripts", `${member.name}-automatic-recovery-${id}.sh`),
+      scriptPreamble: `# Automatic recovery for failed activation ${episode.failedActivationId}`,
+    });
+    // This is only command-submission evidence. Child session bootstrap is the
+    // sole acknowledgement that atomically creates the replacement activation.
+    bootstrap.confirmAutomaticRecoveryDispatch(prepared.ownership);
+    registerAutomaticRecoveryWatcher({
+      context,
+      failedActivationId: prepared.failedActivationId,
+      ownership: prepared.ownership,
+      member,
+      surface,
+    });
+  } catch (error) {
+    // Once execution enters the dispatch boundary, the intent may be durable
+    // and the terminal call may have submitted the command before throwing.
+    // Keep both the pane and exact launch fence for Owner reconciliation;
+    // closing or requeueing could duplicate a child.
+    if (!prepared) {
+      const currentIntent = bootstrap.inspectAutomaticRecoveryPaneIntent(intent.intentId);
+      if (currentIntent?.state !== "promoted" && surface) {
+        await cleanupUnpromotedAutomaticRecoveryPane(bootstrap, currentIntent ?? intent, surface).catch(() => undefined);
+      }
+    } else if (!dispatchBoundaryEntered) {
+      // No dispatch intent exists, so release the fence only after exact pane
+      // absence. If cleanup fails, the promoted claim remains fenced and a
+      // later Owner session can retry the same close without duplicating it.
+      await abandonPreparedAutomaticRecoveryClaim(
+        bootstrap,
+        prepared,
+        surface!,
+        `Automatic recovery startup failed: ${(error as Error).message}`,
+      );
+    }
+    throw error;
+  }
+}
+
+/** Only a durable prepared intent may cross the external pane-create boundary. */
+export function shouldCreateAutomaticRecoveryPane(
+  intent: Pick<import("./protocol/activation-recovery.ts").RecoveryPaneIntent, "state" | "surface">,
+): boolean {
+  return intent.state === "prepared" && !intent.surface;
+}
+
+async function startAutomaticRecovery(context: ExtensionContext): Promise<void> {
+  if (!isTerminalAvailable()) return;
+  try {
+    // Cleanup-pending intents must be reconciled before claimable work is
+    // considered; otherwise a failed close can strand a pending episode while
+    // the live Owner repeatedly observes the same durable claim.
+    await runtime.workflowBootstrap.reconcileAutomaticRecoveryPaneIntents();
+  } catch (error) {
+    process.emitWarning(`Automatic recovery pane reconciliation failed: ${(error as Error).message}`);
+    return;
+  }
+  for (const episode of runtime.workflowBootstrap.claimableAutomaticRecoveries()) {
+    const key = episode.failedActivationId;
+    if (runtime.automaticRecoveryLaunches.has(key)) continue;
+    const launch = launchAutomaticRecovery(episode, context)
+      .catch((error) => process.emitWarning(`Automatic recovery launch failed: ${(error as Error).message}`))
+      .finally(() => runtime.automaticRecoveryLaunches.delete(key));
+    runtime.automaticRecoveryLaunches.set(key, launch);
+  }
+}
+
 function createDefaultLegacyAgentRunAdapters(pi: ExtensionAPI): ConfiguredLegacyAgentRunAdapters {
   return createLegacyAgentRunAdapters({
     pi,
@@ -2034,7 +2438,7 @@ function createDefaultLegacyAgentRunAdapters(pi: ExtensionAPI): ConfiguredLegacy
     getShellReadyDelayMs,
     resolveResumeLaunchBehavior,
     resolveResultPresentation,
-    shouldDeliverCompletion: shouldDeliverSubagentCompletion,
+    shouldDeliverCompletion: (running) => shouldDeliverAgentRunCompletion(running, runtime.workflowBootstrap),
     selectCompletionApi,
     formatElapsed,
     updateWidget,
@@ -2088,15 +2492,11 @@ function createDefaultLegacyAgentRunAdapters(pi: ExtensionAPI): ConfiguredLegacy
     },
     watchCompleted(running, result) {
       if (running.workflowOwnership) {
-        if (shouldSuppressAgentRunWatcherResult(runtime.workflowBootstrap, running.workflowOwnership)) return false;
-        runtime.workflowBootstrap.runTerminated(
+        return handleAgentRunWatcherCompletion(
+          runtime.workflowBootstrap,
           running.workflowOwnership,
-          hasConfirmedAgentRunTermination(result),
-          {
-            error: result.errorMessage ??
-              `Agent Run exited without committed completion or cancellation (exit ${result.exitCode})`,
-            exitCode: result.exitCode,
-          },
+          result,
+          () => reconcileAutomaticRecoveryWithLiveOwner(running.workflowOwnership!),
         );
       }
     },
@@ -2117,9 +2517,16 @@ function subagentsExtensionWithOptions(
     legacyAgentRunAdapters.ui.sessionStarted(ctx);
     try {
       runtime.workflowBootstrap.sessionStarted(ctx);
+      if (runtime.workflowBootstrap.workflow) {
+        await reconcileAutomaticRecoveryRuns(ctx);
+        await startAutomaticRecovery(ctx);
+      }
       const sessionFile = ctx.sessionManager?.getSessionFile?.();
       if (sessionFile && existsSync(sessionFile)) {
-        await startDirectSignalRouter(pi, runtime.workflowBootstrap, ctx);
+        await startDirectSignalRouter(pi, runtime.workflowBootstrap, ctx, {
+          onAutomaticRecoveryRequested: () => startAutomaticRecovery(ctx),
+          onAutomaticRecoveryReconciled: (recoveries) => registerAutomaticRecoveryWatchers(ctx, recoveries),
+        });
       }
     } catch (error) {
       ctx.ui.notify(`Workflow startup failed: ${(error as Error).message}`, "error");
@@ -2133,7 +2540,10 @@ function subagentsExtensionWithOptions(
       runtime.workflowBootstrap.sessionStarted(ctx);
       const sessionFile = ctx.sessionManager?.getSessionFile?.();
       if (sessionFile && existsSync(sessionFile)) {
-        await startDirectSignalRouter(pi, runtime.workflowBootstrap, ctx);
+        await startDirectSignalRouter(pi, runtime.workflowBootstrap, ctx, {
+          onAutomaticRecoveryRequested: () => startAutomaticRecovery(ctx),
+          onAutomaticRecoveryReconciled: (recoveries) => registerAutomaticRecoveryWatchers(ctx, recoveries),
+        });
       }
       if (runtime.workflowBootstrap.workflow) {
         confirmProjectedInboxBatches(

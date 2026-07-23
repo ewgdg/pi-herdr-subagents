@@ -23,6 +23,12 @@ import {
   registerAgentAskUserTool,
 } from "./protocol/human-interrupt-extension.ts";
 import { closePane, inspectPane } from "./terminal.ts";
+import {
+  AUTOMATIC_RECOVERY_CONTINUATION,
+  projectAutomaticRecoveryContinuationContext,
+} from "./protocol/automatic-recovery-continuation.ts";
+
+export { projectAutomaticRecoveryContinuationContext } from "./protocol/automatic-recovery-continuation.ts";
 
 const RELOAD_SAFE_WORKFLOW_BOOTSTRAP = Symbol.for(
   "pi-herdr-subagents.child-workflow-bootstrap",
@@ -130,6 +136,34 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
 }
 
 const UNDECLARED_SETTLEMENT_NOTICE = "undeclared_settlement_notice";
+
+/**
+ * Recovery must restart durable work, not manufacture a prompt. This hidden
+ * Pi marker is a one-shot scheduler release after the durable claim decides
+ * an active Request or bound Human result really needs a turn.
+ */
+export function triggerAutomaticRecoveryContinuation(
+  pi: Pick<ExtensionAPI, "sendMessage">,
+  workflowBootstrap: Pick<WorkflowBootstrap, "claimAutomaticRecoveryContinuation" | "abandonAutomaticRecoveryContinuation">,
+): boolean {
+  const recoveryBootstrap = workflowBootstrap as Partial<Pick<WorkflowBootstrap,
+    "claimAutomaticRecoveryContinuation" | "abandonAutomaticRecoveryContinuation"
+  >>;
+  const continuation = recoveryBootstrap.claimAutomaticRecoveryContinuation?.();
+  if (!continuation) return false;
+  try {
+    pi.sendMessage({
+      customType: AUTOMATIC_RECOVERY_CONTINUATION,
+      content: "",
+      display: false,
+      details: continuation,
+    }, { triggerTurn: true, deliverAs: "steer" });
+    return true;
+  } catch (error) {
+    recoveryBootstrap.abandonAutomaticRecoveryContinuation?.();
+    throw error;
+  }
+}
 
 /** Reconcile the transcript before retrying; sendMessage alone is not delivery. */
 export function emitUndeclaredSettlementNotice(
@@ -269,9 +303,16 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Show widget + status bar on session start
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     try {
       workflowBootstrap.sessionStarted(ctx);
+      if ((event as { reason?: unknown }).reason !== "reload") {
+        workflowBootstrap.rearmAutomaticRecoveryContinuation?.();
+      }
+      if (workflowBootstrap.recoveryActivationNotNeeded) {
+        ctx.shutdown();
+        return;
+      }
       if (workflowBootstrap.workflow) {
         registerHumanInterruptTool();
       } else {
@@ -279,12 +320,18 @@ export default function (pi: ExtensionAPI) {
           if (role) registerHumanInterruptTool();
         }).catch(() => undefined);
       }
-      void humanInterruptBridge.reconcile(ctx, workflowBootstrap).catch(() => undefined);
+      await humanInterruptBridge.reconcile(ctx, workflowBootstrap, pi);
       if (workflowBootstrap.workflow) {
         emitUndeclaredSettlementNotice(pi, workflowBootstrap, ctx.sessionManager.getEntries(), undeclaredNoticeDeliveries);
       }
       if (ctx.sessionManager.getSessionFile()) {
         await startDirectSignalRouter(pi, workflowBootstrap, ctx);
+      }
+      if (workflowBootstrap.workflow) {
+        if (workflowBootstrap.releaseAutomaticRecoveryDeferredProjection()) {
+          workflowBootstrap.releaseDeferredSignals();
+        }
+        triggerAutomaticRecoveryContinuation(pi, workflowBootstrap);
       }
     } catch (error) {
       ctx.ui.notify(`Workflow startup failed: ${(error as Error).message}`, "error");
@@ -315,7 +362,7 @@ export default function (pi: ExtensionAPI) {
         await startDirectSignalRouter(pi, workflowBootstrap, ctx);
       }
       if (workflowBootstrap.workflow) {
-        await humanInterruptBridge.reconcile(ctx, workflowBootstrap);
+        await humanInterruptBridge.reconcile(ctx, workflowBootstrap, pi);
         confirmProjectedInboxBatches(workflowBootstrap, ctx.sessionManager.getEntries());
         emitUndeclaredSettlementNotice(pi, workflowBootstrap, ctx.sessionManager.getEntries(), undeclaredNoticeDeliveries);
       }
@@ -328,11 +375,26 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("context", async (event, ctx) => {
-    if (workflowBootstrap.workflow) {
-      await humanInterruptBridge.reconcile(ctx, workflowBootstrap);
-      confirmProjectedInboxBatches(workflowBootstrap, event.messages);
-      emitUndeclaredSettlementNotice(pi, workflowBootstrap, event.messages, undeclaredNoticeDeliveries);
-    }
+    if (!workflowBootstrap.workflow) return;
+    // All transcript evidence is confirmed before this provider boundary
+    // acknowledges the one durable recovery continuation.
+    const humanMessages = humanInterruptBridge.projectRecoveryContinuationContext(
+      event,
+      ctx,
+      workflowBootstrap,
+    );
+    await humanInterruptBridge.reconcile(ctx, workflowBootstrap, pi);
+    confirmProjectedInboxBatches(workflowBootstrap, event.messages);
+    const recoveryProjection = projectAutomaticRecoveryContinuationContext(
+      humanMessages ?? event.messages,
+    );
+    workflowBootstrap.confirmAutomaticRecoveryContinuationContext?.(
+      recoveryProjection.observedProjectionIds,
+    );
+    emitUndeclaredSettlementNotice(pi, workflowBootstrap, event.messages, undeclaredNoticeDeliveries);
+    return humanMessages || recoveryProjection.messages.length !== event.messages.length
+      ? { messages: recoveryProjection.messages }
+      : undefined;
   });
 
   pi.on("agent_start", (_event, ctx) => {
@@ -383,7 +445,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_settled", async (_event, ctx) => {
     if (workflowBootstrap.workflow) {
-      await humanInterruptBridge.reconcile(ctx, workflowBootstrap);
+      await humanInterruptBridge.reconcile(ctx, workflowBootstrap, pi);
       if (!legacyCompletionRequested) {
         workflowBootstrap.currentTurnSettled(latestAgentRunWasAborted);
         workflowBootstrap.releaseDeferredSignals();

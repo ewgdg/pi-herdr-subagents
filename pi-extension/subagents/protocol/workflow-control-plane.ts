@@ -4,6 +4,7 @@ import { AgentRunOwnershipStore } from "./agent-run-ownership.ts";
 import {
   ActivationLifecycleStore,
   type ActivationRecord,
+  type ActivationStartResult,
   type DeclaredActivationDependency,
   type FailedExit,
   type HumanInterruptRecord,
@@ -36,6 +37,11 @@ import {
   type WorkflowRecord,
 } from "./workflow-types.ts";
 import { ActivationCancellationStore } from "./activation-cancellation.ts";
+import {
+  ActivationRecoveryStore,
+  type ActivationRecoveryRecord,
+  type RecoveryPaneIntent,
+} from "./activation-recovery.ts";
 
 export type {
   AgentCapabilityConfiguration,
@@ -48,6 +54,7 @@ export { WorkflowProtocolError } from "./workflow-types.ts";
 export type {
   ActivationDependency,
   ActivationRecord,
+  ActivationStartResult,
   ActivationState,
   DeclaredActivationDependency,
   FailedExit,
@@ -116,6 +123,7 @@ export class WorkflowControlPlane {
   readonly #activations: ActivationLifecycleStore;
   readonly #messageInspection: DirectSignalInspectionStore;
   readonly #cancellations: ActivationCancellationStore;
+  readonly #recoveries: ActivationRecoveryStore;
   readonly #now: () => number;
   readonly #currentAgentId: string;
   #closed = false;
@@ -134,6 +142,7 @@ export class WorkflowControlPlane {
     this.#activations = activations;
     this.#messageInspection = new DirectSignalInspectionStore(workflow.databasePath);
     this.#cancellations = new ActivationCancellationStore(workflow.databasePath);
+    this.#recoveries = new ActivationRecoveryStore(workflow.databasePath);
     this.#now = now;
     this.#currentAgentId = currentAgentId;
   }
@@ -293,6 +302,7 @@ export class WorkflowControlPlane {
     this.#activations.close();
     this.#messageInspection.close();
     this.#cancellations.close();
+    this.#recoveries.close();
     this.#store.close();
     this.#closed = true;
   }
@@ -437,6 +447,7 @@ export class WorkflowControlPlane {
       inspectHumanInterrupt: (agent) => this.#activations.inspectHumanInterrupt(agent),
       inspectUndeclaredEpisode: (agent) => this.#activations.inspectUndeclaredEpisode(agent),
       inspectActivationCancellation: (agent) => this.#cancellations.inspectForAgent(agent),
+      inspectActivationRecovery: (agent) => this.#recoveries.inspect(agent),
       inspectRequestProjection: (requestId) => this.#messageInspection.inspectRequestProjection(this.workflow.ownerAgentId, requestId),
       now: this.#now,
     }).inspect(target);
@@ -516,6 +527,24 @@ export class WorkflowControlPlane {
   startActivation(ownership: AgentRunOwnership): ActivationRecord {
     this.#assertOwnershipReference(ownership);
     return this.#activations.start(ownership, this.#now());
+  }
+
+  /** Start a claimed recovery and report if cancellation made it unnecessary. */
+  startRecoveryActivation(ownership: AgentRunOwnership): ActivationStartResult {
+    this.#assertOwnershipReference(ownership);
+    try {
+      return this.#activations.startRecovery(ownership, this.#now());
+    } catch (error) {
+      // The pane can bootstrap before its Owner returns from runStarted(). If
+      // that pane already resolved and released this exact unneeded claim,
+      // its late launcher observes the same explicit outcome rather than
+      // treating the intentional release as a failed recovery startup.
+      if (error instanceof WorkflowProtocolError && error.code === "OwnershipLost") {
+        const failedActivationId = this.#recoveries.resolvedUnneededReplacement(ownership);
+        if (failedActivationId) return { kind: "not-needed", failedActivationId };
+      }
+      throw error;
+    }
   }
 
   inspectActivation(agent: AgentReference): ActivationRecord | undefined {
@@ -617,6 +646,14 @@ export class WorkflowControlPlane {
     return this.#activations.inspectHumanInterrupt(agent);
   }
 
+  inspectHumanInterruptToolCall(
+    agent: AgentReference,
+    toolCallId: string,
+  ): HumanInterruptRecord | undefined {
+    this.#assertReference(agent);
+    return this.#activations.inspectHumanInterruptToolCall(agent, toolCallId);
+  }
+
   hasHumanAttention(agent: AgentReference): boolean {
     this.#assertReference(agent);
     return this.#activations.humanAttention(agent);
@@ -669,6 +706,189 @@ export class WorkflowControlPlane {
     return this.#activations.failAndRelease(ownership, failure, this.#now());
   }
 
+  claimableRecoveryEpisodes(): ActivationRecoveryRecord[] {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) return [];
+    return this.#recoveries.listClaimable(this.workflow.ownerAgentId);
+  }
+
+  inFlightRecoveryEpisodes(): ActivationRecoveryRecord[] {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) return [];
+    return this.#recoveries.listInFlight(this.workflow.ownerAgentId);
+  }
+
+  claimRecoveryRun(
+    failedActivationId: string,
+    runId: string,
+    preparedSurface?: string,
+  ): { recovery: ActivationRecoveryRecord; ownership: AgentRunOwnership } | undefined {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError("OwnerActivationForbidden", "Only the Workflow Owner can launch automatic recovery");
+    }
+    return this.#recoveries.claimRun(
+      this.workflow.ownerAgentId,
+      failedActivationId,
+      runId,
+      this.#now(),
+      preparedSurface,
+    );
+  }
+
+  prepareRecoveryPaneIntent(input: {
+    failedActivationId: string;
+    intentId: string;
+    runId: string;
+    workspaceId: string;
+    label: string;
+    cwd: string;
+  }): RecoveryPaneIntent | undefined {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError("OwnerActivationForbidden", "Only the Workflow Owner can prepare automatic recovery");
+    }
+    return this.#recoveries.preparePaneIntent({
+      workflowOwnerId: this.workflow.ownerAgentId,
+      ...input,
+      now: this.#now(),
+    });
+  }
+
+  beginRecoveryPaneCreation(intentId: string, runId: string): RecoveryPaneIntent {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError("OwnerActivationForbidden", "Only the Workflow Owner can create automatic recovery panes");
+    }
+    return this.#recoveries.beginPaneCreation({ intentId, runId, now: this.#now() });
+  }
+
+  recordRecoveryPaneCreated(intentId: string, runId: string, surface: string): RecoveryPaneIntent {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError("OwnerActivationForbidden", "Only the Workflow Owner can acknowledge automatic recovery panes");
+    }
+    return this.#recoveries.recordPaneCreated({ intentId, runId, surface, now: this.#now() });
+  }
+
+  promoteRecoveryPaneIntent(input: {
+    failedActivationId: string;
+    intentId: string;
+    runId: string;
+    surface: string;
+  }): { recovery: ActivationRecoveryRecord; ownership: AgentRunOwnership } | undefined {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError("OwnerActivationForbidden", "Only the Workflow Owner can promote automatic recovery");
+    }
+    return this.#recoveries.promotePaneIntent({
+      workflowOwnerId: this.workflow.ownerAgentId,
+      ...input,
+      now: this.#now(),
+    });
+  }
+
+  beginRecoveryPaneCleanup(intentId: string, detail: string): RecoveryPaneIntent | undefined {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError("OwnerActivationForbidden", "Only the Workflow Owner can clean automatic recovery panes");
+    }
+    return this.#recoveries.beginPaneCleanup({ intentId, detail, now: this.#now() });
+  }
+
+  completeRecoveryPaneCleanup(intentId: string, expectedSurface?: string): boolean {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError("OwnerActivationForbidden", "Only the Workflow Owner can clean automatic recovery panes");
+    }
+    return this.#recoveries.completePaneCleanup({ intentId, expectedSurface });
+  }
+
+  retireRecoveryPaneIntent(intentId: string): boolean {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError("OwnerActivationForbidden", "Only the Workflow Owner can retire automatic recovery intents");
+    }
+    return this.#recoveries.retirePaneIntent(intentId);
+  }
+
+  inspectRecoveryPaneIntent(intentId: string): RecoveryPaneIntent | undefined {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) return undefined;
+    return this.#recoveries.inspectPaneIntent(intentId);
+  }
+
+  recoveryPaneIntents(): RecoveryPaneIntent[] {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) return [];
+    return this.#recoveries.listPaneIntents(this.workflow.ownerAgentId);
+  }
+
+  abandonRecoveryEpisodeLaunch(
+    failedActivationId: string,
+    ownership: AgentRunOwnership,
+    detail: string,
+    expectedCheckpoint?: string,
+  ): void {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError("OwnerActivationForbidden", "Only the Workflow Owner can manage automatic recovery");
+    }
+    this.#assertOwnershipReference(ownership);
+    this.#recoveries.abandon(failedActivationId, ownership, this.#now(), detail, expectedCheckpoint);
+  }
+
+  inspectActivationRecovery(agent: AgentReference): ActivationRecoveryRecord | undefined {
+    this.#assertReference(agent);
+    return this.#recoveries.inspect(agent);
+  }
+
+  isRecoveryOwnedFailedRun(ownership: AgentRunOwnership): boolean {
+    this.#assertOwnershipReference(ownership);
+    const activation = this.#activations.inspectRun(ownership);
+    return activation?.state.kind === "ended"
+      && activation.state.outcome === "failed"
+      && this.#recoveries.ownsFailedActivation(ownership.agentId, activation.activationId);
+  }
+
+  isAutomaticRecoveryLaunch(ownership: AgentRunOwnership): boolean {
+    this.#assertOwnershipReference(ownership);
+    return this.#recoveries.isLaunchingReplacement(ownership);
+  }
+
+  releaseAutomaticRecoveryDeferredProjection(ownership: AgentRunOwnership): ActivationRecord | undefined {
+    this.#assertOwnershipReference(ownership);
+    if (!this.#recoveries.releaseDeferredProjection(ownership, this.#now())) return undefined;
+    return this.#activations.inspectRun(ownership);
+  }
+
+  claimAutomaticRecoveryContinuation(ownership: AgentRunOwnership) {
+    this.#assertOwnershipReference(ownership);
+    return this.#recoveries.claimContinuation(ownership, this.#now()) ?? false;
+  }
+
+  rearmAutomaticRecoveryContinuation(ownership: AgentRunOwnership): boolean {
+    this.#assertOwnershipReference(ownership);
+    return this.#recoveries.rearmContinuation(ownership, this.#now());
+  }
+
+  confirmAutomaticRecoveryContinuationContext(
+    ownership: AgentRunOwnership,
+    observedProjectionIds: string[],
+  ): boolean {
+    this.#assertOwnershipReference(ownership);
+    return this.#recoveries.confirmContinuationContext(
+      ownership,
+      observedProjectionIds,
+      this.#now(),
+    );
+  }
+
+  abandonAutomaticRecoveryContinuation(ownership: AgentRunOwnership): void {
+    this.#assertOwnershipReference(ownership);
+    this.#recoveries.abandonContinuation(ownership, this.#now());
+  }
+
   acquireCurrentAgentRun(runId: string): AgentRunOwnership {
     this.#assertOpen();
     const member = this.inspectAgent(this.currentAgent);
@@ -703,6 +923,16 @@ export class WorkflowControlPlane {
     this.#assertOwnershipReference(ownership);
     this.inspectAgent(ownership);
     this.#ownership.writeCheckpoint(ownership, value);
+  }
+
+  compareAndSetAgentRunCheckpoint(
+    ownership: AgentRunOwnership,
+    expectedValue: string,
+    value: string,
+  ): boolean {
+    this.#assertOwnershipReference(ownership);
+    this.inspectAgent(ownership);
+    return this.#ownership.compareAndSetCheckpoint(ownership, expectedValue, value);
   }
 
   readAgentRunCheckpoint(

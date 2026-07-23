@@ -128,12 +128,31 @@ function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): str
   ];
 }
 
-export function createHerdrSurface(name: string): string {
+export interface HerdrPaneRecord {
+  paneId: string;
+  workspaceId: string;
+  tabId: string | undefined;
+  label: string | undefined;
+  cwd: string | undefined;
+  foregroundCwd: string | undefined;
+}
+
+export function getHerdrPaneCreationContext(): { workspaceId: string; cwd: string } {
+  const { workspace_id: workspaceId } = getHerdrCurrentPaneInfo();
+  return { workspaceId, cwd: process.cwd() };
+}
+
+export function createHerdrSurface(
+  name: string,
+  options?: { workspaceId?: string; cwd?: string },
+): string {
   // Create a new tab per subagent so parallel spawns each get a full tab
   // instead of ever-narrower splits of the parent pane. Target the current
   // workspace explicitly because Herdr's implicit default may be another space.
-  const { workspace_id: workspaceId } = getHerdrCurrentPaneInfo();
-  const output = herdrExec(buildTabCreateArgs(name, process.cwd(), workspaceId));
+  const { workspaceId: currentWorkspaceId, cwd: currentCwd } = getHerdrPaneCreationContext();
+  const workspaceId = options?.workspaceId ?? currentWorkspaceId;
+  const cwd = options?.cwd ?? currentCwd;
+  const output = herdrExec(buildTabCreateArgs(name, cwd, workspaceId));
   const paneId = extractHerdrRootPaneId(output, "tab create");
   try {
     herdrExec(["pane", "rename", paneId, name]);
@@ -141,6 +160,72 @@ export function createHerdrSurface(name: string): string {
     // Optional — pane label is cosmetic.
   }
   return paneId;
+}
+
+function parseHerdrPaneListOutput(output: string, expectedWorkspaceId?: string): HerdrPaneRecord[] {
+  const parsed = parseHerdrJson(output) as { result?: { panes?: unknown[] } } | null;
+  const panes = parsed?.result?.panes;
+  if (!Array.isArray(panes)) {
+    throw new Error(`Unexpected herdr pane list output: ${output.trim() || "(empty)"}`);
+  }
+  return panes.flatMap((raw) => {
+    if (!raw || typeof raw !== "object") return [];
+    const record = raw as {
+      pane_id?: unknown;
+      workspace_id?: unknown;
+      tab_id?: unknown;
+      label?: unknown;
+      cwd?: unknown;
+      foreground_cwd?: unknown;
+    };
+    if (typeof record.pane_id !== "string" || !record.pane_id
+      || typeof record.workspace_id !== "string" || !record.workspace_id
+      || (expectedWorkspaceId && record.workspace_id !== expectedWorkspaceId)) return [];
+    return [{
+      paneId: record.pane_id,
+      workspaceId: record.workspace_id,
+      tabId: typeof record.tab_id === "string" ? record.tab_id : undefined,
+      label: typeof record.label === "string" ? record.label : undefined,
+      cwd: typeof record.cwd === "string" ? record.cwd : undefined,
+      foregroundCwd: typeof record.foreground_cwd === "string" ? record.foreground_cwd : undefined,
+    }];
+  });
+}
+
+export async function listHerdrPanes(workspaceId: string): Promise<HerdrPaneRecord[]> {
+  const output = await herdrExecAsync(["pane", "list", "--workspace", workspaceId]);
+  return parseHerdrPaneListOutput(output, workspaceId);
+}
+
+export interface HerdrTabRecord {
+  tabId: string;
+  workspaceId: string;
+  label: string | undefined;
+}
+
+function parseHerdrTabListOutput(output: string, expectedWorkspaceId?: string): HerdrTabRecord[] {
+  const parsed = parseHerdrJson(output) as { result?: { tabs?: unknown[] } } | null;
+  const tabs = parsed?.result?.tabs;
+  if (!Array.isArray(tabs)) {
+    throw new Error(`Unexpected herdr tab list output: ${output.trim() || "(empty)"}`);
+  }
+  return tabs.flatMap((raw) => {
+    if (!raw || typeof raw !== "object") return [];
+    const record = raw as { tab_id?: unknown; workspace_id?: unknown; label?: unknown };
+    if (typeof record.tab_id !== "string" || !record.tab_id
+      || typeof record.workspace_id !== "string" || !record.workspace_id
+      || (expectedWorkspaceId && record.workspace_id !== expectedWorkspaceId)) return [];
+    return [{
+      tabId: record.tab_id,
+      workspaceId: record.workspace_id,
+      label: typeof record.label === "string" ? record.label : undefined,
+    }];
+  });
+}
+
+export async function listHerdrTabs(workspaceId: string): Promise<HerdrTabRecord[]> {
+  const output = await herdrExecAsync(["tab", "list"]);
+  return parseHerdrTabListOutput(output, workspaceId);
 }
 
 export function createHerdrSurfaceSplit(
@@ -274,4 +359,6 @@ export const __herdrTest__ = {
   extractHerdrRootPaneId,
   parsePaneGetOutput,
   parsePaneGetError,
+  parseHerdrPaneListOutput,
+  parseHerdrTabListOutput,
 };

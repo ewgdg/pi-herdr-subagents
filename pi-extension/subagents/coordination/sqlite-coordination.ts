@@ -179,6 +179,28 @@ export class SQLiteCoordinationStore {
     });
   }
 
+  compareAndSetFencedState(
+    token: OwnershipToken,
+    stateKey: string,
+    expectedValue: string,
+    value: string,
+  ): boolean {
+    return this.#withImmediateTransaction(() => {
+      const currentOwner = this.#readOwner(token.resourceId);
+      if (!currentOwner || !sameOwnership(currentOwner, token)) return false;
+
+      const result = this.#database
+        .prepare(`
+          UPDATE fenced_state
+          SET value = ?
+          WHERE resource_id = ? AND state_key = ?
+            AND fencing_epoch = ? AND value = ?
+        `)
+        .run(value, token.resourceId, stateKey, token.epoch, expectedValue);
+      return Number(result.changes) === 1;
+    });
+  }
+
   readFencedState(resourceId: string, stateKey: string): FencedState | undefined {
     const row = this.#database
       .prepare(`

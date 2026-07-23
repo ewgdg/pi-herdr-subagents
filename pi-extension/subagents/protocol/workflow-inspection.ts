@@ -1,6 +1,7 @@
 import type { ActivationRecord, HumanInterruptRecord, UndeclaredSettlementEpisode } from "./activation-lifecycle.ts";
 import type { DirectSignalRecord, RequestRecord } from "./direct-signal-types.ts";
 import type { ActivationCancellationRecord } from "./activation-cancellation.ts";
+import type { ActivationRecoveryRecord } from "./activation-recovery.ts";
 import type { SQLiteWorkflowStore } from "./sqlite-workflow-store.ts";
 import { WorkflowProtocolError, type AgentRecord, type AgentReference, type WorkflowRecord } from "./workflow-types.ts";
 
@@ -18,6 +19,7 @@ export interface InspectionSources {
   inspectHumanInterrupt(agent: AgentReference): HumanInterruptRecord | undefined;
   inspectUndeclaredEpisode(agent: AgentReference): UndeclaredSettlementEpisode | undefined;
   inspectActivationCancellation?(agent: AgentReference): ActivationCancellationRecord | undefined;
+  inspectActivationRecovery?(agent: AgentReference): ActivationRecoveryRecord | undefined;
   inspectRequestProjection(requestId: string): {
     request: RequestRecord;
     requestDeliveryStatus?: DirectSignalRecord["deliveryStatus"];
@@ -66,6 +68,7 @@ export class WorkflowInspection {
     const human = activation ? this.#sources.inspectHumanInterrupt(reference) : undefined;
     const undeclared = activation ? this.#sources.inspectUndeclaredEpisode(reference) : undefined;
     const cancellation = activation ? this.#sources.inspectActivationCancellation?.(reference) : undefined;
+    const recovery = activation ? this.#sources.inspectActivationRecovery?.(reference) : undefined;
     const currentCancellation = cancellation?.activationId === activation?.activationId ? cancellation : undefined;
     const dependencies = activation?.state.kind === "waiting"
       ? activation.state.dependencies.map((dependency) => dependency.kind === "agent"
@@ -103,6 +106,7 @@ export class WorkflowInspection {
         terminationAttempts: currentCancellation.terminationAttempts,
         ...(currentCancellation.lastError ? { lastError: currentCancellation.lastError } : {}),
       } } : {}),
+      ...(recovery ? { recovery: { state: recovery.state } } : {}),
     };
   }
 

@@ -15,6 +15,8 @@ import type {
   SignalDeliveryTiming,
 } from "./direct-signal-types.ts";
 import { commitMechanicalCompletion, initializeCompletionSchema } from "./completion-gate.ts";
+import { startOwnedActivationInTransaction } from "./activation-lifecycle.ts";
+import { recordRecoveryContinuationEvidence } from "./activation-recovery.ts";
 import { cancelOpenRequestInTransaction } from "./request-cancellation-transition.ts";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
@@ -422,17 +424,17 @@ export class DirectSignalStore {
       this.#database.prepare("INSERT INTO ownership_epochs (resource_id, last_epoch) VALUES (?, ?) ON CONFLICT (resource_id) DO UPDATE SET last_epoch = excluded.last_epoch").run(resourceId, epoch);
       this.#database.prepare("INSERT INTO ownership (resource_id, owner_id, fencing_epoch) VALUES (?, ?, ?)").run(resourceId, input.runId, epoch);
       this.#database.prepare("INSERT INTO fenced_state (resource_id, state_key, value, fencing_epoch) VALUES (?, 'agent-run-checkpoint', ?, ?) ON CONFLICT (resource_id, state_key) DO UPDATE SET value = excluded.value, fencing_epoch = excluded.fencing_epoch").run(resourceId, input.checkpoint, epoch);
-      const prior = this.#database.prepare("SELECT activation_id, activation_sequence, ended_outcome FROM agent_activations WHERE agent_id = ? ORDER BY activation_sequence DESC LIMIT 1").get(input.recipient.agentId) as { activation_id: string; activation_sequence: number; ended_outcome: string | null } | undefined;
-      if (!prior) throw new WorkflowProtocolError("RecipientEnded", `Agent ${input.recipient.agentId} has no activation to reactivate`);
-      this.#database.prepare(`INSERT INTO agent_activations (activation_id, agent_id, run_id, fencing_epoch, activation_sequence, revision, turn_sequence, phase, open_state, ended_outcome, failure_error, failure_exit_code, interrupt_turn_sequence, interrupt_requested_at_ms, created_at_ms, updated_at_ms)
-        VALUES (?, ?, ?, ?, ?, 1, 1, 'open', ?, NULL, NULL, NULL, NULL, NULL, ?, ?)`).run(input.runId, input.recipient.agentId, input.runId, epoch, Number(prior.activation_sequence) + 1,
-          this.#database.prepare("SELECT 1 FROM activation_dependencies WHERE activation_id = ? AND dependency_kind = 'operation' LIMIT 1").get(prior.activation_id) ? "waiting" : "active",
-          input.acceptedAtMs, input.acceptedAtMs);
-      if (prior.ended_outcome === "failed") this.#transferRecoveryRequests(prior.activation_id, input.runId);
-      this.#database.prepare(`INSERT INTO activation_dependencies (activation_id, dependency_kind, dependency_id, dependency_agent_id, created_at_ms)
-        SELECT ?, dependency_kind, dependency_id, dependency_agent_id, ? FROM activation_dependencies
-        WHERE activation_id = ? AND dependency_kind = 'operation'`).run(input.runId, input.acceptedAtMs, prior.activation_id);
-      this.#database.prepare("DELETE FROM activation_dependencies WHERE activation_id = ? AND dependency_kind = 'operation'").run(prior.activation_id);
+      if (!this.#database.prepare("SELECT 1 FROM agent_activations WHERE agent_id = ? LIMIT 1").get(input.recipient.agentId)) {
+        throw new WorkflowProtocolError("RecipientEnded", `Agent ${input.recipient.agentId} has no activation to reactivate`);
+      }
+      const ownership = {
+        workflowOwnerId: input.recipient.workflowOwnerId,
+        agentId: input.recipient.agentId,
+        runId: input.runId,
+        epoch,
+        resourceId,
+      };
+      startOwnedActivationInTransaction(this.#database, ownership, input.acceptedAtMs);
       this.#database.prepare(`INSERT INTO recipient_inbox_routers (agent_id, endpoint, run_id, fencing_epoch, registered_at_ms)
         VALUES (?, ?, ?, ?, ?) ON CONFLICT (agent_id) DO UPDATE SET endpoint = excluded.endpoint, run_id = excluded.run_id, fencing_epoch = excluded.fencing_epoch, registered_at_ms = excluded.registered_at_ms`).run(input.recipient.agentId, input.endpoint, input.runId, epoch, input.acceptedAtMs);
       const sequence = this.#nextAcceptanceSequence(input.recipient.agentId);
@@ -450,7 +452,7 @@ export class DirectSignalStore {
         VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)`).run(input.request.messageId, input.request.senderAgentId, input.request.recipientAgentId, input.request.sourceEntryId, input.request.payloadDigest, input.request.deliveryTiming, input.request.inReplyToRequestId ?? null, sequence, input.acceptedAtMs);
       return {
         status: "queued", messageId: input.request.messageId, recipientAgentId: input.recipient.agentId, acceptanceSequence: sequence,
-        ownership: { workflowOwnerId: input.recipient.workflowOwnerId, agentId: input.recipient.agentId, runId: input.runId, epoch, resourceId },
+        ownership,
         committedByThisPreparation: true,
       };
     });
@@ -549,6 +551,14 @@ export class DirectSignalStore {
         WHERE message_id = ? AND delivery_status = 'queued'`
       ).run(input.deliveredAtMs, input.messageId);
       if (Number(delivered.changes) !== 1) throw new Error(`Message ${input.messageId} could not transition from queued to delivered`);
+      if (input.ownership) {
+        recordRecoveryContinuationEvidence(this.#database, {
+          activationId: input.ownership.runId,
+          evidenceKind: "inbox-batch",
+          evidenceId: input.messageId,
+          now: input.deliveredAtMs,
+        });
+      }
       if (message.protocol_notice_kind === "request-cancelled") {
         const updated = this.#database.prepare(`UPDATE workflow_requests
           SET cancellation_notice_delivery_status = 'delivered', cancellation_notice_delivered_at_ms = ?

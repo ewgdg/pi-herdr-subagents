@@ -5,7 +5,10 @@ import type {
 import { Type } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
 import type { InboxBatch } from "./direct-signal.ts";
-import { WorkflowBootstrap } from "./workflow-bootstrap.ts";
+import {
+  WorkflowBootstrap,
+  type AutomaticRecoveryRunReconciliation,
+} from "./workflow-bootstrap.ts";
 import { WorkflowProtocolError } from "./workflow-types.ts";
 import { assertSoleToolCall, findAgentSendToolCall } from "./direct-signal-transcript.ts";
 import { CompletionRejectedError } from "./completion-gate.ts";
@@ -42,6 +45,10 @@ export async function startDirectSignalRouter(
   pi: ExtensionAPI,
   workflowBootstrap: WorkflowBootstrap,
   context: ExtensionContext,
+  options: {
+    onAutomaticRecoveryRequested?: () => void | Promise<void>;
+    onAutomaticRecoveryReconciled?: (results: AutomaticRecoveryRunReconciliation[]) => void | Promise<void>;
+  } = {},
 ): Promise<void> {
   await workflowBootstrap.waitUntilReady(context);
   await workflowBootstrap.startDirectSignalRouter({
@@ -78,6 +85,8 @@ export async function startDirectSignalRouter(
         details: {},
       }, { triggerTurn: true, deliverAs: "steer" });
     },
+    onAutomaticRecoveryRequested: options.onAutomaticRecoveryRequested,
+    onAutomaticRecoveryReconciled: options.onAutomaticRecoveryReconciled,
     onTerminalCompletion() { context.shutdown(); },
   });
   await workflowBootstrap.reconcilePendingDirectSignals?.({ waitForResolution: true });

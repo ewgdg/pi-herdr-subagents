@@ -4,6 +4,15 @@ import {
   type AgentReference,
   type AgentRunOwnership,
 } from "./workflow-types.ts";
+import {
+  activateRecoveryReplacement,
+  exhaustRecoveryForReplacement,
+  initializeActivationRecoverySchema,
+  recordRecoveryContinuationEvidence,
+  recordRecoveryEpisodeForFailedActivation,
+  resolveRecoveryReplacementIfWorkIsGone,
+  resolveActiveRecovery,
+} from "./activation-recovery.ts";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 const HUMAN_DEPENDENCY_ID = "human";
@@ -75,6 +84,20 @@ export interface FailedExit {
   exitCode?: number;
 }
 
+/** A recovery pane claimed correctly but found no remaining durable work. */
+export interface RecoveryActivationNotNeeded {
+  kind: "not-needed";
+  failedActivationId: string;
+}
+
+export type ActivationStartResult = ActivationRecord | RecoveryActivationNotNeeded;
+
+export function isRecoveryActivationNotNeeded(
+  result: ActivationStartResult,
+): result is RecoveryActivationNotNeeded {
+  return "kind" in result && result.kind === "not-needed";
+}
+
 interface ActivationRow {
   activation_id: string;
   agent_id: string;
@@ -128,6 +151,121 @@ interface UndeclaredEpisodeRow {
   trigger_kind: "incident" | "owner-handoff" | null;
   created_at_ms: number;
   updated_at_ms: number;
+}
+
+/**
+ * Start the next activation after its ownership claim is durable. Callers use
+ * this inside their existing write transaction so recovery fencing and all
+ * failed-activation obligations move with the activation atomically.
+ */
+export function startOwnedActivationInTransaction(
+  database: DatabaseSync,
+  ownership: AgentRunOwnership,
+  now: number,
+): RecoveryActivationNotNeeded | undefined {
+  if (!database.isTransaction) throw new Error("Activation start requires an active SQLite transaction");
+  const current = database.prepare(`SELECT activation_id, run_id, fencing_epoch,
+      activation_sequence, phase, ended_outcome
+    FROM agent_activations WHERE agent_id = ?
+    ORDER BY activation_sequence DESC LIMIT 1`).get(ownership.agentId) as {
+      activation_id: string;
+      run_id: string;
+      fencing_epoch: number;
+      activation_sequence: number;
+      phase: "open" | "ended";
+      ended_outcome: "completed" | "failed" | "cancelled" | null;
+    } | undefined;
+  if (current?.phase === "open") {
+    if (current.run_id === ownership.runId && Number(current.fencing_epoch) === ownership.epoch) return;
+    throw new WorkflowProtocolError(
+      "ActivationAlreadyOpen",
+      `Agent ${ownership.agentId} already has open activation ${current.activation_id}`,
+    );
+  }
+
+  if (current?.ended_outcome === "failed" && resolveRecoveryReplacementIfWorkIsGone(database, {
+    failedActivationId: current.activation_id,
+    ownership,
+    now,
+  })) {
+    return { kind: "not-needed", failedActivationId: current.activation_id };
+  }
+
+  const recoveredHuman = database.prepare(`SELECT tool_call_id FROM human_interrupts
+    WHERE agent_id = ? AND status IN ('pending', 'response-bound', 'result-pending')
+    ORDER BY created_at_ms DESC LIMIT 1`).get(ownership.agentId) as { tool_call_id: string } | undefined;
+  const recoveredOperations = current?.ended_outcome === "failed"
+    ? database.prepare(`SELECT dependency_id FROM activation_dependencies
+        WHERE activation_id = ? AND dependency_kind = 'operation'
+        ORDER BY dependency_id`).all(current.activation_id) as Array<{ dependency_id: string }>
+    : [];
+  const recoveredOutgoingRequests = current?.ended_outcome === "failed"
+    ? database.prepare(`SELECT request_id FROM workflow_requests
+        WHERE requester_activation_id = ?
+          AND (status IN ('open', 'answered')
+            OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))
+        ORDER BY request_id`).all(current.activation_id) as Array<{ request_id: string }>
+    : [];
+
+  database.prepare(`INSERT INTO agent_activations (
+      activation_id, agent_id, run_id, fencing_epoch, activation_sequence,
+      revision, turn_sequence, phase, open_state, ended_outcome,
+      failure_error, failure_exit_code, interrupt_turn_sequence,
+      interrupt_requested_at_ms, created_at_ms, updated_at_ms
+    ) VALUES (?, ?, ?, ?, ?, 1, 1, 'open', ?, NULL, NULL, NULL, NULL, NULL, ?, ?)`)
+    .run(
+      ownership.runId,
+      ownership.agentId,
+      ownership.runId,
+      ownership.epoch,
+      Number(current?.activation_sequence ?? 0) + 1,
+      recoveredHuman || recoveredOperations.length > 0 || recoveredOutgoingRequests.length > 0
+        ? "waiting"
+        : "active",
+      now,
+      now,
+    );
+
+  if (current?.ended_outcome === "failed") {
+    const recovery = database.prepare(`SELECT state FROM activation_recoveries
+      WHERE failed_activation_id = ?`).get(current.activation_id) as { state: string } | undefined;
+    if (recovery?.state === "launching") {
+      activateRecoveryReplacement(database, {
+        failedActivationId: current.activation_id,
+        replacementRunId: ownership.runId,
+        replacementFencingEpoch: ownership.epoch,
+        replacementActivationId: ownership.runId,
+        now,
+      });
+    } else if (recovery?.state === "pending" || recovery?.state === "blocked-policy") {
+      database.prepare(`UPDATE activation_recoveries
+        SET state = 'resolved', detail = 'Manual resume superseded automatic recovery', updated_at_ms = ?
+        WHERE failed_activation_id = ? AND state IN ('pending', 'blocked-policy')`).run(now, current.activation_id);
+    }
+    database.prepare(`UPDATE workflow_requests SET requester_activation_id = ?
+      WHERE requester_activation_id = ? AND (status IN ('open', 'answered')
+        OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))`)
+      .run(ownership.runId, current.activation_id);
+    database.prepare(`UPDATE workflow_requests SET responder_activation_id = ?
+      WHERE responder_activation_id = ? AND status = 'open'`)
+      .run(ownership.runId, current.activation_id);
+  }
+  if (recoveredHuman) {
+    database.prepare(`UPDATE human_interrupts SET activation_id = ?, updated_at_ms = ?
+      WHERE agent_id = ? AND tool_call_id = ?`)
+      .run(ownership.runId, now, ownership.agentId, recoveredHuman.tool_call_id);
+  }
+  for (const operation of recoveredOperations) {
+    database.prepare(`INSERT INTO activation_dependencies (
+      activation_id, dependency_kind, dependency_id, dependency_agent_id, created_at_ms
+    ) VALUES (?, 'operation', ?, NULL, ?)`)
+      .run(ownership.runId, operation.dependency_id, now);
+  }
+  if (recoveredOperations.length > 0) {
+    database.prepare("DELETE FROM activation_dependencies WHERE activation_id = ? AND dependency_kind = 'operation'")
+      .run(current!.activation_id);
+  }
+  return undefined;
 }
 
 export class ActivationLifecycleStore {
@@ -244,6 +382,7 @@ export class ActivationLifecycleStore {
       ) STRICT;
 
     `);
+    initializeActivationRecoverySchema(this.#database);
     const episodeColumns = this.#database.prepare("PRAGMA table_info(undeclared_settlement_episodes)").all() as Array<{ name: string }>;
     if (!episodeColumns.some((column) => column.name === "notice_text")) {
       this.#database.exec(`ALTER TABLE undeclared_settlement_episodes ADD COLUMN notice_text TEXT NOT NULL DEFAULT '${UNDECLARED_SETTLEMENT_NOTICE_TEXT.replace(/'/g, "''")}'`);
@@ -260,6 +399,17 @@ export class ActivationLifecycleStore {
   }
 
   start(ownership: AgentRunOwnership, now: number): ActivationRecord {
+    const result = this.startRecovery(ownership, now);
+    if (isRecoveryActivationNotNeeded(result)) {
+      throw new WorkflowProtocolError(
+        "RecoveryActivationClaimed",
+        `Automatic recovery for ${result.failedActivationId} no longer has durable work`,
+      );
+    }
+    return result;
+  }
+
+  startRecovery(ownership: AgentRunOwnership, now: number): ActivationStartResult {
     return this.#withImmediateTransaction(() => {
       this.#assertCurrentOwnership(ownership);
       this.#assertSubagent(ownership);
@@ -276,59 +426,8 @@ export class ActivationLifecycleStore {
           `Agent ${ownership.agentId} already has open activation ${current.activation_id}`,
         );
       }
-      const sequence = Number(current?.activation_sequence ?? 0) + 1;
-      const recoveredHuman = this.#unresolvedHumanInterrupt(ownership.agentId);
-      const recoveredOperations = current?.ended_outcome === "failed"
-        ? this.#database.prepare(`
-            SELECT dependency_id FROM activation_dependencies
-            WHERE activation_id = ? AND dependency_kind = 'operation'
-            ORDER BY dependency_id
-          `).all(current.activation_id) as Array<{ dependency_id: string }>
-        : [];
-      this.#database.prepare(`
-        INSERT INTO agent_activations (
-          activation_id, agent_id, run_id, fencing_epoch, activation_sequence,
-          revision, turn_sequence, phase, open_state, ended_outcome,
-          failure_error, failure_exit_code, interrupt_turn_sequence,
-          interrupt_requested_at_ms, created_at_ms, updated_at_ms
-        ) VALUES (?, ?, ?, ?, ?, 1, 1, 'open', ?, NULL, NULL, NULL, NULL, NULL, ?, ?)
-      `).run(
-        ownership.runId,
-        ownership.agentId,
-        ownership.runId,
-        ownership.epoch,
-        sequence,
-        recoveredHuman || recoveredOperations.length > 0 ? "waiting" : "active",
-        now,
-        now,
-      );
-      if (current?.ended_outcome === "failed") {
-        this.#database.prepare(`UPDATE workflow_requests
-          SET requester_activation_id = ?
-          WHERE requester_activation_id = ? AND (status IN ('open', 'answered')
-            OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))`
-        ).run(ownership.runId, current.activation_id);
-        this.#database.prepare(`UPDATE workflow_requests
-          SET responder_activation_id = ?
-          WHERE responder_activation_id = ? AND status = 'open'`
-        ).run(ownership.runId, current.activation_id);
-      }
-      if (recoveredHuman) {
-        this.#database.prepare(`
-          UPDATE human_interrupts SET activation_id = ?, updated_at_ms = ?
-          WHERE agent_id = ? AND tool_call_id = ?
-        `).run(ownership.runId, now, ownership.agentId, recoveredHuman.tool_call_id);
-      }
-      for (const operation of recoveredOperations) {
-        this.#database.prepare(`
-          INSERT INTO activation_dependencies (
-            activation_id, dependency_kind, dependency_id, dependency_agent_id, created_at_ms
-          ) VALUES (?, 'operation', ?, NULL, ?)
-        `).run(ownership.runId, operation.dependency_id, now);
-      }
-      if (recoveredOperations.length > 0) {
-        this.#database.prepare("DELETE FROM activation_dependencies WHERE activation_id = ? AND dependency_kind = 'operation'").run(current!.activation_id);
-      }
+      const outcome = startOwnedActivationInTransaction(this.#database, ownership, now);
+      if (outcome) return outcome;
       return this.#requireCurrent(ownership.agentId, ownership.workflowOwnerId);
     });
   }
@@ -440,6 +539,11 @@ export class ActivationLifecycleStore {
         this.#recordUndeclaredSettlement(row, now, actorRole);
       } else if (declaredDependencies.length > 0) {
         this.#declareUndeclaredDependencies(row.agent_id, declaredDependencies, now);
+        resolveActiveRecovery(this.#database, {
+          activationId: row.activation_id,
+          now,
+          detail: "Replacement made a durable declared settlement",
+        });
       }
       this.#database.prepare(`
         UPDATE agent_activations
@@ -507,6 +611,11 @@ export class ActivationLifecycleStore {
         INSERT INTO human_attention (agent_id, tool_call_id, created_at_ms)
         VALUES (?, ?, ?)
       `).run(row.agent_id, toolCallId, now);
+      resolveActiveRecovery(this.#database, {
+        activationId: row.activation_id,
+        now,
+        detail: "Replacement made a durable Human settlement",
+      });
       this.#database.prepare(`
         UPDATE agent_activations
         SET open_state = 'waiting', revision = revision + 1,
@@ -585,6 +694,9 @@ export class ActivationLifecycleStore {
       if (!interrupt || interrupt.status !== "result-pending") {
         throw new WorkflowProtocolError("HumanInterruptResponseMissing", `Human Interrupt ${toolCallId} has no pending result`);
       }
+      // Recovery projection delivery is retryable until context observation.
+      // Reconciliation may therefore resume the same result more than once.
+      if (row.open_state === "active") return mapHumanInterrupt(interrupt);
       if (row.open_state !== "waiting") throw this.#invalidTransition(row, "replay Human Interrupt result");
       this.#database.prepare(`
         UPDATE agent_activations
@@ -609,6 +721,13 @@ export class ActivationLifecycleStore {
         WHERE agent_id = ? AND tool_call_id = ? AND status = 'result-pending'
       `).run(now, ownership.agentId, toolCallId);
       if (Number(result.changes) === 0) return undefined;
+      const consumed = this.#humanInterrupt(ownership.agentId, toolCallId)!;
+      recordRecoveryContinuationEvidence(this.#database, {
+        activationId: consumed.activation_id,
+        evidenceKind: "human-tool-result",
+        evidenceId: toolCallId,
+        now,
+      });
       // result-pending is the durable authorization fence. Pi may persist the
       // already-returned result after cancellation releases this run's lease.
       this.#satisfyUndeclaredDependency(ownership.agentId, "human", toolCallId, now);
@@ -624,6 +743,15 @@ export class ActivationLifecycleStore {
       FROM human_interrupts WHERE agent_id = ?
       ORDER BY updated_at_ms DESC, tool_call_id DESC LIMIT 1
     `).get(agent.agentId) as HumanInterruptRow | undefined;
+    return row ? mapHumanInterrupt(row) : undefined;
+  }
+
+  inspectHumanInterruptToolCall(
+    agent: AgentReference,
+    toolCallId: string,
+  ): HumanInterruptRecord | undefined {
+    this.#assertAgentReference(agent);
+    const row = this.#humanInterrupt(agent.agentId, toolCallId);
     return row ? mapHumanInterrupt(row) : undefined;
   }
 
@@ -746,6 +874,16 @@ export class ActivationLifecycleStore {
             updated_at_ms = ?
         WHERE activation_id = ?
       `).run(failure.error, failure.exitCode ?? null, now, row.activation_id);
+      exhaustRecoveryForReplacement(this.#database, {
+        activationId: row.activation_id,
+        now,
+        detail: `Replacement failed: ${failure.error}`,
+      });
+      recordRecoveryEpisodeForFailedActivation(this.#database, {
+        activationId: row.activation_id,
+        agentId: row.agent_id,
+        now,
+      });
       const released = this.#database.prepare(`
         DELETE FROM ownership
         WHERE resource_id = ? AND owner_id = ? AND fencing_epoch = ?

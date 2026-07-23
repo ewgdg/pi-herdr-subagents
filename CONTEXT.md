@@ -41,8 +41,20 @@ The ability to resolve an Agent's identity and status, exchange messages with it
 _Avoid_: Discovery, control authority
 
 **Spawner**:
-The Agent that directly creates another Agent. A Spawner has bounded lifecycle control over its direct children, but not over further descendants or the Workflow itself.
+The Agent that directly creates another Agent. A Spawner has bounded lifecycle control over its direct children, but not over further descendants or the Workflow itself. When its direct child has `approval-required` delegation policy, it decides that child's Delegated Activation Approvals; for a first activation, it is the prospective child's grandparent rather than its direct Spawner.
 _Avoid_: Workflow Owner, session parent
+
+**Activation Intent**:
+The concise human-readable purpose of one activation. It accompanies the detailed actionable message, orients the activated Agent, and serves as the tab and active-work label. It is specific to the activation rather than the durable Agent.
+_Avoid_: Agent name, detailed task message, generated message excerpt
+
+**Delegated Activation Approval**:
+The one-use typed decision required when an Agent with `approval-required` delegation policy attempts to activate a direct child. The requester's Spawner receives the actionable approval notice and approves or declines the exact held activation so duplicate work can be prevented.
+_Avoid_: Self-approval, Moderator approval, standing authorization, ordinary Request Answer
+
+**Approval Notice**:
+The single actionable projection of a pending Delegated Activation Approval, addressed to the requester's Spawner through Deferred Delivery. It points to the canonical approval, has no independent outcome, and may reactivate the same Spawner Agent when no Agent Run is live.
+_Avoid_: Deferred Approval Notice, Request, proxy authorization
 
 **Child Control**:
 The bounded, non-transferable authority to inspect, interrupt, cancel, resume, and message an Agent directly created by the Spawner. It cannot declare the child complete, alter its identity or transcript, or rewrite its Agent Definition or capability configuration; the Workflow Owner independently retains control.
@@ -85,7 +97,7 @@ The sender's declared action after durable message acceptance: `continue` permit
 _Avoid_: Generic wait operation, delivery status, implicit auto-exit
 
 **Human Interrupt**:
-The durable pause created when an ordinary Subagent calls `agent_ask_user({ question })`. The required plain-text question is canonical in that tool call and is not parsed or semantically validated. The call atomically checkpoints the session, records one pending interrupt identified internally by the tool-call ID, enters `waiting(human)`, and settles. The human answers normally in that Subagent's pane; submission durably binds the input and clears `DECIDE`, but the interrupt remains a response-bound recovery obligation until resume commits the original tool call's result. An unclear response still resolves that interaction, so the Subagent asks again with a new call when needed. Workflow Owners and Moderators cannot create Human Interrupts. While awaiting response, other actionable inputs remain queued and do not wake the Subagent. Human-wait duration alone never escalates.
+The durable pause created when an ordinary Subagent calls `agent_ask_user({ question })` as the sole tool call in its assistant message. The required plain-text question is canonical in that tool call and is not parsed or semantically validated. The call atomically checkpoints the session, records one pending interrupt identified internally by the tool-call ID, enters `waiting(human)`, and settles. The human answers normally in that Subagent's pane; submission durably binds the input and clears `DECIDE`, but the interrupt remains a response-bound recovery obligation until resume commits the original tool call's result. An unclear response still resolves that interaction, so the Subagent asks again with a new call when needed. Workflow Owners and Moderators cannot create Human Interrupts. While awaiting response, other actionable inputs remain queued and do not wake the Subagent. Human-wait duration alone never escalates.
 _Avoid_: Agent Request, concurrently mutable dependency, model-decided resolution, generic wait marker
 
 **Operation Dependency**:
@@ -237,7 +249,7 @@ An unresolved incoming or outgoing Request preserved after an Agent activation e
 _Avoid_: Orphaned Request, automatic Answer, activation-local Request
 
 **Automatic Recovery**:
-Runtime-driven creation of exactly one replacement activation after failure when the Subagent retains recovery-pending Requests, a pending Human Interrupt or response-bound result awaiting resume, an Undeclared Settlement episode, or accepted pending inputs. A pending Human Interrupt continues to surface `DECIDE`; a bound result remains a recovery obligation without `DECIDE`; a preserved Undeclared Settlement episode receives no additional correction allowance. The episode ends when the replacement reaches durable declared settlement or completion; another failure exhausts automatic recovery and creates an Operational Incident for Moderator review. The retry count is not configurable by this protocol. Exhaustion does not abandon recovery, terminate Request obligations, or prune descendants.
+Runtime-driven creation of exactly one replacement activation after failure when the Subagent retains recovery-pending Requests, a pending Human Interrupt or response-bound result awaiting resume, an Undeclared Settlement episode, accepted pending inputs, or an unresolved operation dependency. A pending Human Interrupt continues to surface `DECIDE`; a bound result remains a recovery obligation without `DECIDE`; a preserved Undeclared Settlement episode receives no additional correction allowance. Deferred-only accepted input crosses a mechanical projection release so its Inbox Batch starts the useful turn without creating an Agent settlement. Before Herdr creation, recovery durably records a unique workspace/label/cwd provisional pane intent; Herdr `tab create --label` uses that exact identity because generated pane ids are not predictable. A returned pane id is only an acknowledgement: restart discovers an ambiguous or unacknowledged create through exact label/cwd matching, adopts it, and atomically promotes the intent into recovery claim, ownership, and the `prepared` checkpoint. Missing panes retire the intent for retry; ambiguous identity, claim loss, failed close, and unavailable discovery retain the fence and never close another run's pane. Replacement pane checkpoints durably distinguish preparation, dispatch intent, and command-submission evidence: a pre-bootstrap prepared or dispatching pane may be closed and its exact absence confirmed before returning the same launch claim to pending, while unavailable liveness retains the fence for bounded Owner-live reconciliation. Child bootstrap is the sole activation acknowledgement; a durably dispatched locator may be retained and reattached. When replacement startup confirms a canonical Human tool result or Inbox Batch persisted before failure, one durable continuation fence wakes the model without duplicating that evidence; an unconsumed scheduler projection remains retryable across process restart. The episode ends when the replacement reaches durable declared settlement or completion; another failure exhausts automatic recovery and creates an Operational Incident for Moderator review. The retry count is not configurable by this protocol. Exhaustion does not abandon recovery, terminate Request obligations, or prune descendants.
 _Avoid_: Unbounded restart, automatic abandonment, recovery without pending work
 
 **Recovery Abandonment**:

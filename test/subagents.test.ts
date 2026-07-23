@@ -8,7 +8,10 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import {
   cleanupSubagentsForShutdown,
+  handleAgentRunWatcherCompletion,
+  handleRequestReactivationWatcherCompletion,
   selectCompletionApi,
+  shouldDeliverAgentRunCompletion,
   shouldDeliverSubagentCompletion,
   shouldPreserveSubagentsOnShutdown,
   shouldSuppressAgentRunWatcherResult,
@@ -1535,6 +1538,45 @@ describe("subagent-done.ts", () => {
     }
   });
 
+  it("releases deferred-only recovery at startup without an empty provider turn", async () => {
+    const key = Symbol.for("pi-herdr-subagents.child-workflow-bootstrap");
+    const prior = (globalThis as Record<PropertyKey, unknown>)[key];
+    const events: string[] = [];
+    try {
+      (globalThis as Record<PropertyKey, unknown>)[key] = {
+        workflow: {},
+        humanInterruptActorRole: "ordinary",
+        sessionStarted() {},
+        async waitUntilReady() {},
+        currentHumanInterrupt() { return undefined; },
+        bindHumanResponse() { return undefined; },
+        confirmHumanResponseResult() { return undefined; },
+        pendingUndeclaredNotice() { return undefined; },
+        releaseAutomaticRecoveryDeferredProjection() {
+          events.push("mechanical-release");
+          return { state: { kind: "waiting" } };
+        },
+        releaseDeferredSignals() { events.push("deferred-projected"); },
+        claimAutomaticRecoveryContinuation() { events.push("continuation-checked"); return false; },
+      };
+      const { api, eventHandlers, sentMessages } = createMockExtensionApi();
+      subagentDoneExtension(api);
+      const sessionStart = eventHandlers.get("session_start")?.[0];
+      assert.ok(sessionStart);
+
+      await sessionStart({}, {
+        sessionManager: { getEntries: () => [], getSessionFile: () => null },
+        ui: { setWidget() {}, notify() {} },
+      });
+
+      assert.deepEqual(events, ["mechanical-release", "deferred-projected", "continuation-checked"]);
+      assert.equal(sentMessages.some(({ message }) => message.customType === "automatic_recovery_continuation"), false);
+    } finally {
+      if (prior === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key];
+      else (globalThis as Record<PropertyKey, unknown>)[key] = prior;
+    }
+  });
+
   it("reconciles Human tool-result evidence during context before the next model turn", async () => {
     const key = Symbol.for("pi-herdr-subagents.child-workflow-bootstrap");
     const prior = (globalThis as Record<PropertyKey, unknown>)[key];
@@ -1582,6 +1624,172 @@ describe("subagent-done.ts", () => {
     }
   });
 
+  it("keeps the Human projection fenced across marker-triggered extension events", async () => {
+    const key = Symbol.for("pi-herdr-subagents.child-workflow-bootstrap");
+    const prior = (globalThis as Record<PropertyKey, unknown>)[key];
+    let status: "result-pending" | "consumed" = "result-pending";
+    const events: string[] = [];
+    const entries: any[] = [
+      { message: { role: "assistant", content: [{
+        type: "toolCall", id: "ask-event-order", name: "agent_ask_user", arguments: { question: "Continue?" },
+      }] } },
+      { customType: "agent_human_interrupt_response", data: {
+        toolCallId: "ask-event-order",
+        responseInputId: "input-event-order",
+        response: "continue",
+        timestamp: 1_700_000_000_150,
+      } },
+    ];
+    try {
+      (globalThis as Record<PropertyKey, unknown>)[key] = {
+        workflow: {},
+        humanInterruptActorRole: "ordinary",
+        sessionStarted() {},
+        async waitUntilReady() {},
+        currentHumanInterrupt() {
+          return { toolCallId: "ask-event-order", status, responseInputId: "input-event-order" };
+        },
+        humanInterruptByToolCall() {
+          return { toolCallId: "ask-event-order", status, responseInputId: "input-event-order" };
+        },
+        bindHumanResponse() { return undefined; },
+        resumeHumanResponseResult() { events.push("resume"); },
+        confirmHumanResponseResult() {
+          events.push("confirm");
+          if (status !== "result-pending") return undefined;
+          status = "consumed";
+          return { status };
+        },
+        releaseAutomaticRecoveryDeferredProjection() { return undefined; },
+        releaseDeferredSignals() { events.push("release"); },
+        claimAutomaticRecoveryContinuation() { return false; },
+        confirmDirectSignalDelivery() { return false; },
+        pendingUndeclaredNotice() { return undefined; },
+      };
+      const { api, eventHandlers, sentMessages } = createMockExtensionApi();
+      api.sendMessage = (message: unknown, options: unknown) => {
+        events.push("send");
+        sentMessages.push({ message, options });
+      };
+      subagentDoneExtension(api);
+      const sessionStart = eventHandlers.get("session_start")?.[0];
+      const beforeAgentStart = eventHandlers.get("before_agent_start")?.[0];
+      const contextHandler = eventHandlers.get("context")?.[0];
+      const beforeProviderRequest = eventHandlers.get("before_provider_request")?.[0];
+      assert.ok(sessionStart && beforeAgentStart && contextHandler && beforeProviderRequest);
+      const idleContext = {
+        isIdle: () => true,
+        sessionManager: { getEntries: () => entries, getSessionFile: () => null },
+        ui: { setWidget() {}, notify() {} },
+      };
+
+      await sessionStart({}, idleContext);
+      await Promise.resolve();
+      const [sent] = sentMessages;
+      const activeContext = { ...idleContext, isIdle: () => false };
+      events.push("before_agent_start");
+      await beforeAgentStart({}, activeContext);
+      events.push("context");
+      const projected = await contextHandler({ messages: [
+        entries[0].message,
+        { role: "custom", ...sent.message, timestamp: 1_700_000_000_151 },
+      ] }, activeContext);
+      beforeProviderRequest();
+      events.push("provider");
+
+      assert.equal(sentMessages.length, 1, "one marker must produce one scheduled provider turn");
+      assert.equal(projected.messages.filter((message: any) => message.role === "toolResult").length, 1);
+      assert.deepEqual(events, [
+        "resume",
+        "send",
+        "before_agent_start",
+        "context",
+        "confirm",
+        "release",
+        "provider",
+      ]);
+    } finally {
+      if (prior === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key];
+      else (globalThis as Record<PropertyKey, unknown>)[key] = prior;
+    }
+  });
+
+  it("projects exactly one recovered Human result through the extension context handler", async () => {
+    const key = Symbol.for("pi-herdr-subagents.child-workflow-bootstrap");
+    const prior = (globalThis as Record<PropertyKey, unknown>)[key];
+    let status: "result-pending" | "consumed" = "result-pending";
+    const entries: any[] = [{
+      customType: "agent_human_interrupt_response",
+      data: {
+        toolCallId: "ask-context",
+        responseInputId: "input-context",
+        response: "canonical answer",
+        timestamp: 1_700_000_000_200,
+      },
+    }];
+    const marker = {
+      role: "custom",
+      customType: "human_interrupt_recovery_continuation",
+      content: "",
+      display: false,
+      details: {
+        projectionId: "human-interrupt-result:ask-context:input-context",
+        toolCallId: "ask-context",
+        responseInputId: "input-context",
+        response: "canonical answer",
+        timestamp: 1_700_000_000_200,
+      },
+      timestamp: 1_700_000_000_201,
+    };
+    const providerMessages: any[] = [
+      { role: "assistant", content: [{ type: "toolCall", id: "ask-context", name: "agent_ask_user", arguments: {} }] },
+      marker,
+      { ...marker, timestamp: 1_700_000_000_202 },
+    ];
+    try {
+      (globalThis as Record<PropertyKey, unknown>)[key] = {
+        workflow: {},
+        async waitUntilReady() {},
+        currentHumanInterrupt() {
+          return { toolCallId: "ask-context", status, responseInputId: "input-context" };
+        },
+        bindHumanResponse() { return undefined; },
+        resumeHumanResponseResult() {},
+        confirmHumanResponseResult() {
+          if (status !== "result-pending") return undefined;
+          status = "consumed";
+          return { status };
+        },
+        releaseDeferredSignals() {},
+        confirmDirectSignalDelivery() { return false; },
+        pendingUndeclaredNotice() { return undefined; },
+      };
+      const { api, eventHandlers } = createMockExtensionApi();
+      subagentDoneExtension(api);
+      const context = eventHandlers.get("context")?.[0];
+      assert.ok(context);
+
+      const result = await context(
+        { messages: providerMessages },
+        { sessionManager: { getEntries: () => entries } },
+      );
+
+      assert.equal(status, "consumed");
+      assert.equal(result.messages.filter((message: any) => message.role === "custom").length, 0);
+      assert.deepEqual(result.messages.filter((message: any) => message.role === "toolResult"), [{
+        role: "toolResult",
+        toolCallId: "ask-context",
+        toolName: "agent_ask_user",
+        content: [{ type: "text", text: "canonical answer" }],
+        isError: false,
+        timestamp: 1_700_000_000_200,
+      }]);
+    } finally {
+      if (prior === undefined) delete (globalThis as Record<PropertyKey, unknown>)[key];
+      else (globalThis as Record<PropertyKey, unknown>)[key] = prior;
+    }
+  });
+
   it("registers agent_ask_user only after child startup resolves the durable role", async () => {
     const key = Symbol.for("pi-herdr-subagents.child-workflow-bootstrap");
     const prior = (globalThis as Record<PropertyKey, unknown>)[key];
@@ -1595,6 +1803,8 @@ describe("subagent-done.ts", () => {
           currentHumanInterrupt() { return undefined; },
           bindHumanResponse() { return undefined; },
           confirmHumanResponseResult() { return undefined; },
+          releaseAutomaticRecoveryDeferredProjection() { return undefined; },
+          claimAutomaticRecoveryContinuation() { return false; },
           pendingUndeclaredNotice() { return undefined; },
         };
         const { api, eventHandlers, registeredTools } = createMockExtensionApi();
@@ -1643,6 +1853,8 @@ describe("subagent-done.ts", () => {
         currentHumanInterrupt() { return undefined; },
         bindHumanResponse() { return undefined; },
         confirmHumanResponseResult() { return undefined; },
+        releaseAutomaticRecoveryDeferredProjection() { return undefined; },
+        claimAutomaticRecoveryContinuation() { return false; },
         releaseDeferredSignals() {},
         confirmDirectSignalDelivery() { return false; },
         pendingUndeclaredNotice() { return undefined; },
@@ -2436,6 +2648,18 @@ describe("tool registration", () => {
     assert.match(command, /PI_SUBAGENT_ID='resume'/);
   });
 
+  it("sets the durable named Agent identity for automatic recovery", () => {
+    const command = (subagentsModule as any).__test__.buildAutomaticRecoveryReactivationCommand({
+      environment: ["PI_SUBAGENT_ID='recovered'"],
+      member: { agentDefinition: "reviewer" },
+      policy: { denyTools: ["subagent"] },
+      sessionPath: "/sessions/recovered.jsonl",
+    });
+
+    assert.match(command, /PI_SUBAGENT_AGENT='reviewer'/);
+    assert.match(command, /--session '\/sessions\/recovered\.jsonl'/);
+  });
+
   it("renders partial subagent tool-call args without throwing", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
@@ -2660,6 +2884,167 @@ describe("subagent parent lifecycle", () => {
       ui: { runStarted() { events.push("started"); } },
     });
     assert.deepEqual(events, ["started", "checked", "removed"]);
+  });
+
+  it("suppresses a recovery-pending watcher failure and launches its replacement while the Owner is live", async () => {
+    const events: string[] = [];
+    const ownership = {
+      workflowOwnerId: "owner",
+      agentId: "worker",
+      runId: "failed-run",
+      resourceId: "agent-run:owner:worker",
+      epoch: 1,
+    };
+    const run = { abortController: undefined as AbortController | undefined };
+    let terminated = false;
+    await superviseLegacyAgentRun(run, {
+      supervisor: {
+        async watch() {
+          events.push("watched");
+          return { exitCode: 1, errorMessage: "worker disappeared", termination: "confirmed" as const };
+        },
+      },
+      ownership: {
+        watchCompleted(_run, result) {
+          return handleAgentRunWatcherCompletion({
+            isCancellationOwnedRun() { return false; },
+            wasProtocolCompleted() { return false; },
+            runTerminated(candidate, confirmed, failure) {
+              assert.equal(candidate, ownership);
+              assert.equal(confirmed, true);
+              assert.equal(failure.error, "worker disappeared");
+              events.push("terminated");
+              terminated = true;
+            },
+            isRecoveryOwnedFailedRun(candidate) {
+              assert.equal(candidate, ownership);
+              if (terminated) events.push("recovery-pending");
+              return terminated;
+            },
+          }, ownership, result, () => events.push("replacement-launched"));
+        },
+      },
+      resultRelay: {
+        completed() { assert.fail("recovery-pending failure must not fabricate a result"); },
+        suppressed() { events.push("suppressed"); },
+        failed() { assert.fail("watch completed normally"); },
+      },
+      ui: { runStarted() { events.push("started"); } },
+    });
+
+    assert.deepEqual(events, ["started", "watched", "terminated", "recovery-pending", "replacement-launched", "suppressed"]);
+  });
+
+  it("suppresses a failed Request reactivation and starts one live-Owner replacement", async () => {
+    const ownership = {
+      workflowOwnerId: "owner",
+      agentId: "worker",
+      runId: "request-reactivation",
+      resourceId: "agent-run:owner:worker",
+      epoch: 2,
+    };
+    let replacements = 0;
+    let terminated = false;
+    const relays: string[] = [];
+    await superviseLegacyAgentRun({ abortController: undefined }, {
+      supervisor: {
+        async watch() {
+          return { exitCode: 1, errorMessage: "resumed Request run failed", termination: "confirmed" as const };
+        },
+      },
+      ownership: {
+        watchCompleted(_run, result) {
+          return handleRequestReactivationWatcherCompletion({
+            isCancellationOwnedRun() { return false; },
+            wasProtocolCompleted() { return false; },
+            runTerminated(candidate, confirmed, failure) {
+              assert.equal(candidate, ownership);
+              assert.equal(confirmed, true);
+              assert.equal(failure.error, "resumed Request run failed");
+              terminated = true;
+            },
+            isRecoveryOwnedFailedRun(candidate) {
+              assert.equal(candidate, ownership);
+              return terminated;
+            },
+          }, ownership, result, () => { replacements += 1; });
+        },
+      },
+      resultRelay: {
+        completed() { relays.push("completed"); },
+        suppressed() { relays.push("suppressed"); },
+        failed() { assert.fail("watch completed normally"); },
+      },
+      ui: { runStarted() {} },
+    });
+
+    assert.equal(replacements, 1);
+    assert.deepEqual(relays, ["suppressed"]);
+  });
+
+  it("performs final durable recovery arbitration before legacy result wake", () => {
+    let recoveryOwned = false;
+    let resultMessages = 0;
+    let wakes = 0;
+    const ownership = {
+      workflowOwnerId: "owner",
+      agentId: "worker",
+      runId: "failed-run",
+      resourceId: "agent-run:owner:worker",
+      epoch: 1,
+    };
+    const bootstrap = {
+      isCancellationOwnedRun() { return false; },
+      wasProtocolCompleted() { return false; },
+      isRecoveryOwnedFailedRun() { return recoveryOwned; },
+      runTerminated() {},
+    };
+    const running = {
+      workflowOwnership: ownership,
+      lifecycle: { delivery: "pending" as const },
+    };
+
+    const watcherWouldRelay = handleAgentRunWatcherCompletion(
+      bootstrap,
+      ownership,
+      { termination: "confirmed", exitCode: 1 },
+      () => assert.fail("recovery was not yet claimed at watcher reconciliation"),
+    );
+    assert.equal(watcherWouldRelay, true);
+
+    recoveryOwned = true; // Owner claim interleaves after watcher reconciliation.
+    if (shouldDeliverAgentRunCompletion(running, bootstrap)) {
+      resultMessages += 1;
+      wakes += 1;
+    }
+
+    assert.equal(shouldDeliverAgentRunCompletion(running, bootstrap), false);
+    assert.equal(resultMessages, 0, "no subagent_result may escape durable recovery ownership");
+    assert.equal(wakes, 0, "suppressed legacy relay must not trigger an Owner turn");
+  });
+
+  it("relays a watcher failure when no durable recovery episode is pending", async () => {
+    const ownership = { workflowOwnerId: "owner", agentId: "worker", runId: "failed-run", resourceId: "agent-run:owner:worker", epoch: 1 };
+    const relays: string[] = [];
+    await superviseLegacyAgentRun({ abortController: undefined }, {
+      supervisor: { async watch() { return { exitCode: 1, termination: "confirmed" as const }; } },
+      ownership: {
+        watchCompleted(_run, result) {
+          return handleAgentRunWatcherCompletion({
+            isCancellationOwnedRun() { return false; },
+            wasProtocolCompleted() { return false; },
+            runTerminated() { relays.push("terminated"); },
+            isRecoveryOwnedFailedRun() { return false; },
+          }, ownership, result, () => assert.fail("non-recovery failure must not launch a replacement"));
+        },
+      },
+      resultRelay: {
+        completed() { relays.push("completed"); },
+        failed() { assert.fail("watch completed normally"); },
+      },
+      ui: { runStarted() {} },
+    });
+    assert.deepEqual(relays, ["terminated", "completed"]);
   });
 
   it("relays legacy Agent Run supervision failures once", async () => {
@@ -3750,6 +4135,22 @@ describe("herdr.ts", () => {
         result: { pane: { pane_id: "w1:p1", agent: "pi", agent_status: "paused" } },
       }), "w1:p1");
       assert.deepEqual(result, { kind: "present", agent: "pi", agentStatus: "unknown" });
+    });
+
+    it("parses exact pane labels and cwd for durable recovery discovery", () => {
+      const result = __herdrTest__.parseHerdrPaneListOutput(JSON.stringify({
+        result: {
+          panes: [
+            { pane_id: "w1:p-recovery", workspace_id: "w1", label: "pi-recovery-intent", cwd: "/repo" },
+            { pane_id: "w1:p-other", workspace_id: "w1", label: "pi-recovery-other", cwd: "/repo" },
+            { pane_id: "w2:p-same-label", workspace_id: "w2", label: "pi-recovery-intent", cwd: "/repo" },
+          ],
+        },
+      }), "w1");
+      assert.deepEqual(result, [
+        { paneId: "w1:p-recovery", workspaceId: "w1", tabId: undefined, label: "pi-recovery-intent", cwd: "/repo", foregroundCwd: undefined },
+        { paneId: "w1:p-other", workspaceId: "w1", tabId: undefined, label: "pi-recovery-other", cwd: "/repo", foregroundCwd: undefined },
+      ]);
     });
   });
 });

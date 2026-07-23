@@ -53,6 +53,7 @@ export interface DirectSignalRuntimeOptions {
   projectInboxBatch?: (batch: InboxBatch) => void;
   hasProjectedMessage?: (messageId: string) => boolean;
   wakeRecipient?: () => void;
+  onAutomaticRecoveryRequested?: () => void | Promise<void>;
   now?: () => number;
   preparedRouter?: RecipientInboxRouter;
   preparedRouterCommitted?: boolean;
@@ -72,6 +73,7 @@ export class DirectSignalRuntime {
   #projectInboxBatch: ((batch: InboxBatch) => void) | undefined;
   #hasProjectedMessage: ((messageId: string) => boolean) | undefined;
   #wakeRecipient: (() => void) | undefined;
+  #onAutomaticRecoveryRequested: (() => void | Promise<void>) | undefined;
   readonly #now: () => number;
   readonly #store: DirectSignalStore;
   #router: RecipientInboxRouter | undefined;
@@ -93,6 +95,7 @@ export class DirectSignalRuntime {
     this.#projectInboxBatch = options.projectInboxBatch;
     this.#hasProjectedMessage = options.hasProjectedMessage;
     this.#wakeRecipient = options.wakeRecipient;
+    this.#onAutomaticRecoveryRequested = options.onAutomaticRecoveryRequested;
     this.#now = options.now ?? Date.now;
     this.#preparedRouter = options.preparedRouter;
     this.#preparedRouterCommitted = options.preparedRouterCommitted === true;
@@ -110,6 +113,7 @@ export class DirectSignalRuntime {
           projectInboxBatch: this.#projectInboxBatch!,
           hasProjectedMessage: this.#hasProjectedMessage,
           wakeRecipient: this.#wakeRecipient,
+          onAutomaticRecoveryRequested: this.#onAutomaticRecoveryRequested,
         });
         if (!this.#ownership) throw new Error("Prepared Recipient Inbox Router requires Agent Run ownership");
         this.#preparedRouter.activatePrepared(this.#ownership, !this.#preparedRouterCommitted);
@@ -124,6 +128,7 @@ export class DirectSignalRuntime {
         projectInboxBatch: this.#projectInboxBatch!,
         hasProjectedMessage: this.#hasProjectedMessage,
         wakeRecipient: this.#wakeRecipient,
+        onAutomaticRecoveryRequested: this.#onAutomaticRecoveryRequested,
         now: this.#now,
       });
       await router.start();
@@ -144,12 +149,14 @@ export class DirectSignalRuntime {
     projectInboxBatch(batch: InboxBatch): void;
     hasProjectedMessage?(messageId: string): boolean;
     wakeRecipient?: () => void;
+    onAutomaticRecoveryRequested?: () => void | Promise<void>;
     onTerminalCompletion?: () => void;
   }): void {
     this.#assertOpen();
     this.#projectInboxBatch = input.projectInboxBatch;
     this.#hasProjectedMessage = input.hasProjectedMessage;
     this.#wakeRecipient = input.wakeRecipient;
+    this.#onAutomaticRecoveryRequested = input.onAutomaticRecoveryRequested;
     this.#onTerminalCompletion = input.onTerminalCompletion;
     this.#router?.configureDelivery(input);
   }

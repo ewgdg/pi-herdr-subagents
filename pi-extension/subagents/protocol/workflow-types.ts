@@ -74,6 +74,7 @@ export type WorkflowProtocolErrorCode =
   | "ActivationCancellationUnauthorized"
   | "ActivationCancellationConflict"
   | "CancellationInDoubt"
+  | "RecoveryActivationClaimed"
   | "UnknownRequest";
 
 export class WorkflowProtocolError extends Error {

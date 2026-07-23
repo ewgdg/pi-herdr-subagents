@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { WorkflowProtocolError, type AgentRunOwnership } from "./workflow-types.ts";
+import { resolveActiveRecovery } from "./activation-recovery.ts";
 
 export type CompletionSource =
   | { kind: "standalone"; toolCallId: string }
@@ -104,6 +105,11 @@ export function commitMechanicalCompletion(
   database.prepare(`UPDATE agent_activations SET phase = 'ended', open_state = NULL, ended_outcome = 'completed',
     failure_error = NULL, failure_exit_code = NULL, revision = revision + 1,
     interrupt_turn_sequence = NULL, interrupt_requested_at_ms = NULL, updated_at_ms = ? WHERE activation_id = ?`).run(completedAtMs, activation.activation_id);
+  resolveActiveRecovery(database, {
+    activationId: activation.activation_id,
+    now: completedAtMs,
+    detail: "Replacement completed",
+  });
   database.prepare("DELETE FROM recipient_inbox_routers WHERE agent_id = ? AND run_id = ? AND fencing_epoch = ?").run(ownership.agentId, ownership.runId, ownership.epoch);
   const released = database.prepare("DELETE FROM ownership WHERE resource_id = ? AND owner_id = ? AND fencing_epoch = ?").run(resourceId, ownership.runId, ownership.epoch);
   if (Number(released.changes) !== 1) throw new WorkflowProtocolError("OwnershipLost", `Agent Run no longer owns ${ownership.agentId}`);

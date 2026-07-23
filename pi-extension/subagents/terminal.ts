@@ -9,6 +9,9 @@ import {
   readHerdrScreen,
   readHerdrScreenAsync,
   inspectHerdrPane,
+  getHerdrPaneCreationContext,
+  listHerdrPanes,
+  listHerdrTabs,
   renameHerdrTab,
   renameHerdrWorkspace,
   sendHerdrCommand,
@@ -17,6 +20,19 @@ import {
 
 export type PaneId = string;
 export type SplitDirection = "right" | "down";
+
+export interface RecoveryPaneDiscoveryLocator {
+  workspaceId: string;
+  label: string;
+  cwd: string;
+  surface?: string;
+}
+
+export type RecoveryPaneDiscovery =
+  | { kind: "present"; surface: string }
+  | { kind: "missing" }
+  | { kind: "unavailable"; error: string }
+  | { kind: "ambiguous"; error: string };
 
 const SETUP_HINT = "Start pi inside herdr (`herdr`, then run `pi`).";
 
@@ -50,6 +66,66 @@ export function getInheritedPiEnvironment(
 export function createSubagentPane(name: string): PaneId {
   assertTerminalAvailable();
   return createHerdrSurface(name);
+}
+
+export function getSubagentPaneCreationContext(): { workspaceId: string; cwd: string } {
+  assertTerminalAvailable();
+  return getHerdrPaneCreationContext();
+}
+
+export function createRecoveryPane(
+  label: string,
+  locator: Pick<RecoveryPaneDiscoveryLocator, "workspaceId" | "cwd">,
+): PaneId {
+  assertTerminalAvailable();
+  return createHerdrSurface(label, locator);
+}
+
+/** Discover by the durable label/cwd identity, never by a guessed pane id. */
+export async function discoverRecoveryPane(
+  locator: RecoveryPaneDiscoveryLocator,
+): Promise<RecoveryPaneDiscovery> {
+  assertTerminalAvailable();
+  let panes;
+  try {
+    panes = await listHerdrPanes(locator.workspaceId);
+  } catch (error) {
+    return { kind: "unavailable", error: (error as Error).message };
+  }
+  let tabLabels = new Map<string, string>();
+  if (!locator.surface && panes.some((pane) => !pane.label && pane.tabId)) {
+    try {
+      tabLabels = new Map(
+        (await listHerdrTabs(locator.workspaceId))
+          .flatMap((tab) => tab.label ? [[tab.tabId, tab.label] as const] : []),
+      );
+    } catch (error) {
+      return { kind: "unavailable", error: (error as Error).message };
+    }
+  }
+  const candidates = panes.filter((pane) => {
+    const label = pane.label ?? (pane.tabId ? tabLabels.get(pane.tabId) : undefined);
+    if (label !== locator.label) return false;
+    const paneCwd = pane.cwd ?? pane.foregroundCwd;
+    return paneCwd === locator.cwd;
+  });
+  if (candidates.length === 0) {
+    // A missing label/cwd match is safe absence only because pane list itself
+    // was authoritative. A known surface with a changed identity is a fence,
+    // not permission to close a different pane.
+    if (locator.surface && panes.some((pane) => pane.paneId === locator.surface)) {
+      return { kind: "ambiguous", error: "Durable recovery pane identity no longer matches its label/cwd" };
+    }
+    return { kind: "missing" };
+  }
+  if (candidates.length !== 1) {
+    return { kind: "ambiguous", error: `Found ${candidates.length} panes with the exact recovery identity` };
+  }
+  const [candidate] = candidates;
+  if (locator.surface && candidate.paneId !== locator.surface) {
+    return { kind: "ambiguous", error: "Durable recovery pane surface does not match its exact label identity" };
+  }
+  return { kind: "present", surface: candidate.paneId };
 }
 
 /** Split the current herdr pane and return the child pane ID. */

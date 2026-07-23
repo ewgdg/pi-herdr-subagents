@@ -8,7 +8,7 @@ import {
   type AgentRunOwnership,
 } from "./workflow-types.ts";
 
-const CHECKPOINT_STATE_KEY = "agent-run-checkpoint";
+export const AGENT_RUN_CHECKPOINT_STATE_KEY = "agent-run-checkpoint";
 
 export class AgentRunOwnershipStore {
   readonly #coordination: SQLiteCoordinationStore;
@@ -71,7 +71,7 @@ export class AgentRunOwnershipStore {
   writeCheckpoint(ownership: AgentRunOwnership, value: string): void {
     if (!this.#coordination.writeFencedState(
       toCoordinationToken(ownership),
-      CHECKPOINT_STATE_KEY,
+      AGENT_RUN_CHECKPOINT_STATE_KEY,
       value,
     )) {
       throw new WorkflowProtocolError(
@@ -81,8 +81,21 @@ export class AgentRunOwnershipStore {
     }
   }
 
+  compareAndSetCheckpoint(
+    ownership: AgentRunOwnership,
+    expectedValue: string,
+    value: string,
+  ): boolean {
+    return this.#coordination.compareAndSetFencedState(
+      toCoordinationToken(ownership),
+      AGENT_RUN_CHECKPOINT_STATE_KEY,
+      expectedValue,
+      value,
+    );
+  }
+
   readCheckpoint(agent: AgentReference): { value: string; fencingEpoch: number } | undefined {
-    return this.#coordination.readFencedState(resourceIdFor(agent), CHECKPOINT_STATE_KEY);
+    return this.#coordination.readFencedState(resourceIdFor(agent), AGENT_RUN_CHECKPOINT_STATE_KEY);
   }
 }
 

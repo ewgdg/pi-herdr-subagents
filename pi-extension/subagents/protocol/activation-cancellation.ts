@@ -755,6 +755,12 @@ export class ActivationCancellationStore {
       if (Number(ended.changes) !== 1) {
         throw new WorkflowProtocolError("StaleLifecycleTransition", `Cancellation lost activation ${operation.activation_id}`);
       }
+      // Deliberate cancellation owns its existing obligation transformations;
+      // it ends a replacement's automatic-recovery episode without retrying it.
+      this.#database.prepare(`UPDATE activation_recoveries
+        SET state = 'resolved', detail = 'Replacement cancelled', updated_at_ms = ?
+        WHERE replacement_activation_id = ? AND state = 'active'`
+      ).run(now, operation.activation_id);
       this.#database.prepare(`DELETE FROM recipient_inbox_routers
         WHERE agent_id = ? AND run_id = ? AND fencing_epoch = ?`
       ).run(operation.target_agent_id, operation.run_id, operation.fencing_epoch);

@@ -10,6 +10,7 @@ import {
   type FramedIpcServer,
 } from "../coordination/framed-ipc.ts";
 import { resolveCanonicalSignal, signalDeliveryTiming } from "./direct-signal-transcript.ts";
+import { AUTOMATIC_RECOVERY_SCHEDULE_TYPE } from "./activation-recovery-notification.ts";
 import { CompletionRejectedError, type CompletionBlocker } from "./completion-gate.ts";
 import { DirectSignalStore } from "./sqlite-message-store.ts";
 import {
@@ -39,6 +40,7 @@ export interface RecipientInboxRouterOptions {
   projectInboxBatch(batch: InboxBatch): void;
   hasProjectedMessage?(messageId: string): boolean;
   wakeRecipient?: () => void;
+  onAutomaticRecoveryRequested?: () => void | Promise<void>;
   now: () => number;
 }
 
@@ -149,6 +151,7 @@ export class RecipientInboxRouter {
     projectInboxBatch(batch: InboxBatch): void;
     hasProjectedMessage?(messageId: string): boolean;
     wakeRecipient?: () => void;
+    onAutomaticRecoveryRequested?: () => void | Promise<void>;
   }): void {
     this.#options = { ...this.#options, ...input };
     this.#schedule();
@@ -177,6 +180,15 @@ export class RecipientInboxRouter {
   }
 
   async #handle(connection: FramedIpcConnection, frame: FramedIpcMessage): Promise<void> {
+    if (frame.type === AUTOMATIC_RECOVERY_SCHEDULE_TYPE) {
+      const candidate = frame.payload as { workflowOwnerId?: unknown };
+      if (candidate.workflowOwnerId === this.#options.workflowOwnerId
+        && this.#options.recipient.agentId === this.#options.workflowOwnerId) {
+        await this.#options.onAutomaticRecoveryRequested?.();
+      }
+      connection.end();
+      return;
+    }
     if (frame.type === INBOX_SCHEDULE_TYPE) {
       const candidate = frame.payload as { workflowOwnerId?: unknown; recipientAgentId?: unknown };
       if (candidate.workflowOwnerId === this.#options.workflowOwnerId
