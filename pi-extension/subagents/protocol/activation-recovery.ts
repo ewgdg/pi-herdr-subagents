@@ -1072,7 +1072,7 @@ export function serializePreparedRecoveryCheckpoint(input: {
 function hasRecoveryPendingWork(database: DatabaseSync, activationId: string, agentId: string): boolean {
   const request = database.prepare(`SELECT 1 FROM workflow_requests WHERE
     (responder_activation_id = ? AND status = 'open') OR
-    (requester_activation_id = ? AND (status IN ('open', 'answered') OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued')))
+    (requester_activation_id = ? AND (status IN ('open', 'answered') OR (status = 'orphaned' AND orphan_notice_delivery_status = 'accepted')))
     LIMIT 1`).get(activationId, activationId);
   if (request) return true;
   if (database.prepare("SELECT 1 FROM pending_message_pointers WHERE recipient_agent_id = ? LIMIT 1").get(agentId)) return true;

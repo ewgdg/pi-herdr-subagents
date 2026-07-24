@@ -175,7 +175,7 @@ export class RecipientInboxRouter {
     return newlyDelivered;
   }
 
-  releaseDeferred(): void {
+  reevaluateInboxEligibility(): void {
     this.#schedule();
   }
 
@@ -271,8 +271,8 @@ export class RecipientInboxRouter {
 
   #deliverEligible(): void {
     if (this.#closed) return;
-    const pending = this.#store.listPending(this.#options.recipient);
-    for (const pointer of pending) {
+    const pendingPointers = this.#store.listPending(this.#options.recipient);
+    for (const pointer of pendingPointers) {
       if (this.#options.hasProjectedMessage?.(pointer.messageId)) {
         this.confirmDelivery(pointer.messageId);
       }
@@ -288,10 +288,10 @@ export class RecipientInboxRouter {
     });
     const lifecycle = this.#store.recipientLifecycle(this.#options.recipient);
     if (lifecycle === "ended" || lifecycle === "interrupted" || lifecycle === "waiting-human") return;
-    const queued = this.#store.listPending(this.#options.recipient);
+    const pending = this.#store.listPending(this.#options.recipient);
     const eligible = (lifecycle === "active"
-      ? queued.filter((pointer) => pointer.deliveryTiming === "steer" || pointer.reactivatesRecipient)
-      : queued).filter((pointer) => !this.#projectedMessageIds.has(pointer.messageId));
+      ? pending.filter((pointer) => pointer.deliveryTiming === "steer" || pointer.reactivatesRecipient)
+      : pending).filter((pointer) => !this.#projectedMessageIds.has(pointer.messageId));
     if (eligible.length === 0) return;
 
     const pointers = new Map(eligible.map((pointer) => [pointer.messageId, pointer]));
@@ -344,7 +344,7 @@ export class RecipientInboxRouter {
       pointer.senderAgentId,
     );
     const record = this.#store.inspectMessage(this.#options.workflowOwnerId, pointer.messageId);
-    if (!record) throw new Error(`Queued Message ${pointer.messageId} is missing`);
+    if (!record) throw new Error(`Accepted Message ${pointer.messageId} is missing`);
     return {
       kind: record.kind,
       messageId: pointer.messageId,

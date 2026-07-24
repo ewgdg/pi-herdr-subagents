@@ -1472,7 +1472,7 @@ describe("subagent-done.ts", () => {
       pendingUndeclaredNotice() {
         return delivered ? undefined : { episodeId: "episode-1", noticeId: "notice-1", noticeText: "Correct this settlement." };
       },
-      queueUndeclaredNotice() { return { episodeId: "episode-1" }; },
+      acceptUndeclaredNotice() { return { episodeId: "episode-1" }; },
       confirmUndeclaredNotice(episodeId: string) { delivered = true; confirmed.push(episodeId); return true; },
     };
     const pi = { sendMessage(message: any, options: unknown) { sent.push({ message, options }); } };
@@ -1501,7 +1501,7 @@ describe("subagent-done.ts", () => {
     const sent: unknown[] = [];
     const bootstrap = {
       pendingUndeclaredNotice() { return { episodeId: "episode-1", noticeId: "notice-1", noticeText: "Correct this settlement." }; },
-      queueUndeclaredNotice() { return { episodeId: "episode-1" }; },
+      acceptUndeclaredNotice() { return { episodeId: "episode-1" }; },
       confirmUndeclaredNotice() { return true; },
     };
     const pi = { sendMessage(message: unknown) { sent.push(message); } };
@@ -1511,7 +1511,7 @@ describe("subagent-done.ts", () => {
     assert.equal(sent.length, 1);
   });
 
-  it("releases Deferred Signals after the durable agent_settled lifecycle boundary", async () => {
+  it("reevaluates inbox eligibility after the durable agent_settled lifecycle boundary", async () => {
     const key = Symbol.for("pi-herdr-subagents.child-workflow-bootstrap");
     const prior = (globalThis as Record<PropertyKey, unknown>)[key];
     const calls: string[] = [];
@@ -1522,7 +1522,7 @@ describe("subagent-done.ts", () => {
       bindHumanResponse() { return undefined; },
       confirmHumanResponseResult() { return undefined; },
       currentTurnSettled(interrupted: boolean) { calls.push(`settled:${interrupted}`); },
-      releaseDeferredSignals() { calls.push("released"); },
+      reevaluateInboxEligibility() { calls.push("released"); },
       pendingUndeclaredNotice() { return undefined; },
     };
     try {
@@ -1556,7 +1556,7 @@ describe("subagent-done.ts", () => {
           events.push("mechanical-release");
           return { state: { kind: "waiting" } };
         },
-        releaseDeferredSignals() { events.push("deferred-projected"); },
+        reevaluateInboxEligibility() { events.push("deferred-projected"); },
         claimAutomaticRecoveryContinuation() { events.push("continuation-checked"); return false; },
       };
       const { api, eventHandlers, sentMessages } = createMockExtensionApi();
@@ -1595,7 +1595,7 @@ describe("subagent-done.ts", () => {
         resultPending = false;
         return { status: "consumed" };
       },
-      releaseDeferredSignals() { calls.push("released"); },
+      reevaluateInboxEligibility() { calls.push("released"); },
       confirmDirectSignalDelivery() { return false; },
       pendingUndeclaredNotice() { return undefined; },
     };
@@ -1661,7 +1661,7 @@ describe("subagent-done.ts", () => {
           return { status };
         },
         releaseAutomaticRecoveryDeferredProjection() { return undefined; },
-        releaseDeferredSignals() { events.push("release"); },
+        reevaluateInboxEligibility() { events.push("release"); },
         claimAutomaticRecoveryContinuation() { return false; },
         confirmDirectSignalDelivery() { return false; },
         pendingUndeclaredNotice() { return undefined; },
@@ -1760,7 +1760,7 @@ describe("subagent-done.ts", () => {
           status = "consumed";
           return { status };
         },
-        releaseDeferredSignals() {},
+        reevaluateInboxEligibility() {},
         confirmDirectSignalDelivery() { return false; },
         pendingUndeclaredNotice() { return undefined; },
       };
@@ -1855,7 +1855,7 @@ describe("subagent-done.ts", () => {
         confirmHumanResponseResult() { return undefined; },
         releaseAutomaticRecoveryDeferredProjection() { return undefined; },
         claimAutomaticRecoveryContinuation() { return false; },
-        releaseDeferredSignals() {},
+        reevaluateInboxEligibility() {},
         confirmDirectSignalDelivery() { return false; },
         pendingUndeclaredNotice() { return undefined; },
       };

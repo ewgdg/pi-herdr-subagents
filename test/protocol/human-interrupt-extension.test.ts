@@ -55,7 +55,7 @@ describe("Human Interrupt Pi extension", () => {
         status = "consumed";
         return { toolCallId, status, responseInputId };
       },
-      releaseDeferredSignals() { releases += 1; },
+      reevaluateInboxEligibility() { releases += 1; },
     };
     const pi = {
       on(event: string, handler: unknown) { if (event === "input") inputHandler = handler; },
@@ -104,7 +104,7 @@ describe("Human Interrupt Pi extension", () => {
         return { toolCallId, status: "response-bound", responseInputId: inputId };
       },
       confirmHumanResponseResult() { return undefined; },
-      releaseDeferredSignals() {},
+      reevaluateInboxEligibility() {},
     } as never);
     assert.deepEqual(calls, [["ask-1", "input-1"]]);
   });
@@ -144,7 +144,7 @@ describe("Human Interrupt Pi extension", () => {
         status = "consumed";
         return { toolCallId, status, responseInputId };
       },
-      releaseDeferredSignals() { lifecycle.push("released"); },
+      reevaluateInboxEligibility() { lifecycle.push("released"); },
     };
     const pi = {
       on(event: string, handler: unknown) { if (event === "input") inputHandler = handler; },
@@ -213,7 +213,7 @@ describe("Human Interrupt Pi extension", () => {
       prepareHumanResponseResult() { events.push("prepare"); status = "result-pending"; },
       resumeHumanResponseResult() { events.push("resume"); },
       confirmHumanResponseResult() { events.push("confirm"); status = "consumed"; return { status }; },
-      releaseDeferredSignals() { events.push("release"); },
+      reevaluateInboxEligibility() { events.push("release"); },
     };
     const context = {
       isIdle: () => idle,
@@ -276,7 +276,7 @@ describe("Human Interrupt Pi extension", () => {
       prepareHumanResponseResult() { assert.fail("result-pending input must not be prepared again"); },
       resumeHumanResponseResult() {},
       confirmHumanResponseResult() { assert.fail("send invocation must not consume the result"); },
-      releaseDeferredSignals() {},
+      reevaluateInboxEligibility() {},
     };
     const context = { sessionManager: { getEntries: () => entries } };
     const failingPi = { sendMessage() { attempts += 1; throw new Error("injected send failure"); } };
@@ -324,7 +324,7 @@ describe("Human Interrupt Pi extension", () => {
         currentHumanInterrupt() { return { toolCallId: "ask-new", status: "pending" }; },
         humanInterruptByToolCall() { return { toolCallId: "ask-cancelled", status: "terminal" }; },
         confirmHumanResponseResult() { assert.fail("terminal result must not be consumed"); },
-        releaseDeferredSignals() {},
+        reevaluateInboxEligibility() {},
       } as never,
     );
 

@@ -37,7 +37,7 @@ export function registerAgentCancelTool(
           ? " before delivery"
           : receipt.delivery === "notice-delivered"
             ? "; its cancellation notice is delivered"
-            : "; its cancellation notice is queued";
+            : "; its cancellation notice is accepted";
         return {
           content: [{ type: "text", text: `Request ${receipt.requestId} cancelled${delivery}.` }],
           details: receipt,

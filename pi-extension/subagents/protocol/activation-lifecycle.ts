@@ -45,7 +45,7 @@ export interface UndeclaredSettlementEpisode {
   noticeText: string;
   agentId: string;
   status: "open" | "closed";
-  noticeQueued: boolean;
+  noticeAccepted: boolean;
   noticeDelivered: boolean;
   repeatTriggered: boolean;
   triggerKind?: "incident" | "owner-handoff";
@@ -147,7 +147,7 @@ interface UndeclaredEpisodeRow {
   episode_id: string;
   agent_id: string;
   status: "open" | "closed";
-  notice_queued: number;
+  notice_accepted: number;
   notice_delivered: number;
   notice_text: string;
   declared_waiting: number;
@@ -207,7 +207,7 @@ export function startOwnedActivationInTransaction(
     ? database.prepare(`SELECT request_id FROM workflow_requests
         WHERE requester_activation_id = ?
           AND (status IN ('open', 'answered')
-            OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))
+            OR (status = 'orphaned' AND orphan_notice_delivery_status = 'accepted'))
         ORDER BY request_id`).all(current.activation_id) as Array<{ request_id: string }>
     : [];
 
@@ -248,7 +248,7 @@ export function startOwnedActivationInTransaction(
     }
     database.prepare(`UPDATE workflow_requests SET requester_activation_id = ?
       WHERE requester_activation_id = ? AND (status IN ('open', 'answered')
-        OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))`)
+        OR (status = 'orphaned' AND orphan_notice_delivery_status = 'accepted'))`)
       .run(ownership.runId, current.activation_id);
     database.prepare(`UPDATE workflow_requests SET responder_activation_id = ?
       WHERE responder_activation_id = ? AND status = 'open'`)
@@ -373,7 +373,7 @@ export class ActivationLifecycleStore {
         episode_id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL REFERENCES workflow_agents(agent_id),
         status TEXT NOT NULL CHECK (status IN ('open', 'closed')),
-        notice_queued INTEGER NOT NULL DEFAULT 0 CHECK (notice_queued IN (0, 1)),
+        notice_accepted INTEGER NOT NULL DEFAULT 0 CHECK (notice_accepted IN (0, 1)),
         notice_delivered INTEGER NOT NULL DEFAULT 0 CHECK (notice_delivered IN (0, 1)),
         notice_text TEXT NOT NULL,
         declared_waiting INTEGER NOT NULL DEFAULT 0 CHECK (declared_waiting IN (0, 1)),
@@ -401,9 +401,6 @@ export class ActivationLifecycleStore {
     const episodeColumns = this.#database.prepare("PRAGMA table_info(undeclared_settlement_episodes)").all() as Array<{ name: string }>;
     if (!episodeColumns.some((column) => column.name === "notice_text")) {
       this.#database.exec(`ALTER TABLE undeclared_settlement_episodes ADD COLUMN notice_text TEXT NOT NULL DEFAULT '${UNDECLARED_SETTLEMENT_NOTICE_TEXT.replace(/'/g, "''")}'`);
-    }
-    if (!episodeColumns.some((column) => column.name === "notice_queued")) {
-      this.#database.exec("ALTER TABLE undeclared_settlement_episodes ADD COLUMN notice_queued INTEGER NOT NULL DEFAULT 0");
     }
   }
 
@@ -791,12 +788,12 @@ export class ActivationLifecycleStore {
     return Number(result.changes) === 1;
   }
 
-  queueUndeclaredNotice(agent: AgentReference, episodeId: string, now: number): UndeclaredSettlementEpisode | undefined {
+  acceptUndeclaredNotice(agent: AgentReference, episodeId: string, now: number): UndeclaredSettlementEpisode | undefined {
     this.#assertAgentReference(agent);
     return this.#withImmediateTransaction(() => {
       const result = this.#database.prepare(`
         UPDATE undeclared_settlement_episodes
-        SET notice_queued = 1, updated_at_ms = ?
+        SET notice_accepted = 1, updated_at_ms = ?
         WHERE episode_id = ? AND agent_id = ? AND status = 'open' AND notice_delivered = 0
       `).run(now, episodeId, agent.agentId);
       if (Number(result.changes) !== 1) return undefined;
@@ -807,7 +804,7 @@ export class ActivationLifecycleStore {
   inspectUndeclaredEpisode(agent: AgentReference): UndeclaredSettlementEpisode | undefined {
     this.#assertAgentReference(agent);
     const row = this.#database.prepare(`
-      SELECT episode_id, agent_id, status, notice_queued, notice_delivered,
+      SELECT episode_id, agent_id, status, notice_accepted, notice_delivered,
              notice_text, declared_waiting, repeat_triggered, trigger_kind,
              created_at_ms, updated_at_ms
       FROM undeclared_settlement_episodes WHERE agent_id = ?
@@ -1131,7 +1128,7 @@ export class ActivationLifecycleStore {
       FROM workflow_requests
       WHERE requester_activation_id = ?
         AND (status IN ('open', 'answered')
-          OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))
+          OR (status = 'orphaned' AND orphan_notice_delivery_status = 'accepted'))
       ORDER BY dependency_kind, dependency_id
     `).all(activationId, activationId) as unknown as DependencyRow[];
     if (rows.length === 0) return [{ kind: "undeclared", dependencyId: UNDECLARED_DEPENDENCY_ID }];
@@ -1150,7 +1147,7 @@ export class ActivationLifecycleStore {
       FROM workflow_requests
       WHERE requester_activation_id = ?
         AND (status IN ('open', 'answered')
-          OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))
+          OR (status = 'orphaned' AND orphan_notice_delivery_status = 'accepted'))
     `).all(activationId, activationId) as unknown as DependencyRow[];
   }
 
@@ -1184,7 +1181,7 @@ export class ActivationLifecycleStore {
 
   #openUndeclaredEpisode(agentId: string): UndeclaredEpisodeRow | undefined {
     return this.#database.prepare(`
-      SELECT episode_id, agent_id, status, notice_queued, notice_delivered,
+      SELECT episode_id, agent_id, status, notice_accepted, notice_delivered,
              notice_text, declared_waiting, repeat_triggered, trigger_kind,
              created_at_ms, updated_at_ms
       FROM undeclared_settlement_episodes
@@ -1201,7 +1198,7 @@ export class ActivationLifecycleStore {
     if (!existing) {
       this.#database.prepare(`
         INSERT INTO undeclared_settlement_episodes (
-          episode_id, agent_id, status, notice_queued, notice_delivered,
+          episode_id, agent_id, status, notice_accepted, notice_delivered,
           notice_text, declared_waiting, repeat_triggered, trigger_kind,
           created_at_ms, updated_at_ms
         ) VALUES (?, ?, 'open', 0, 0, ?, 0, 0, NULL, ?, ?)
@@ -1311,7 +1308,7 @@ function mapUndeclaredEpisode(row: UndeclaredEpisodeRow): UndeclaredSettlementEp
     noticeText: row.notice_text,
     agentId: row.agent_id,
     status: row.status,
-    noticeQueued: Number(row.notice_queued) === 1,
+    noticeAccepted: Number(row.notice_accepted) === 1,
     noticeDelivered: Number(row.notice_delivered) === 1,
     repeatTriggered: Number(row.repeat_triggered) === 1,
     ...(row.trigger_kind ? { triggerKind: row.trigger_kind } : {}),

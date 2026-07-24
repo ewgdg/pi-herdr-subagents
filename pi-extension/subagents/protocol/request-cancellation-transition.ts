@@ -8,7 +8,7 @@ interface OpenRequestRow {
   responder_agent_id: string;
   requester_activation_id: string | null;
   message_id: string | null;
-  delivery_status: "bound" | "queued" | "delivered" | "suppressed" | null;
+  delivery_status: "bound" | "accepted" | "delivered" | "suppressed" | null;
   projection_claimed: number | null;
   projection_committed: number | null;
   in_reply_to_request_id: string | null;
@@ -60,7 +60,7 @@ export function cancelOpenRequestInTransaction(
   const updateParameters = input.requesterActivationId
     ? [input.cancelledAtMs, input.requestId, input.requesterAgentId, input.requesterActivationId]
     : [input.cancelledAtMs, input.requestId, input.requesterAgentId];
-  if (request.delivery_status === "queued"
+  if (request.delivery_status === "accepted"
     && Number(request.projection_claimed) === 0
     && Number(request.projection_committed) === 0
     && request.in_reply_to_request_id === null) {
@@ -69,7 +69,7 @@ export function cancelOpenRequestInTransaction(
     ).run(input.requestId, request.responder_agent_id);
     if (Number(removed.changes) !== 1) throw new Error(`Pending pointer is missing for Request ${input.requestId}`);
     const suppressed = database.prepare(`UPDATE direct_signal_messages SET delivery_status = 'suppressed'
-      WHERE message_id = ? AND delivery_status = 'queued'
+      WHERE message_id = ? AND delivery_status = 'accepted'
         AND projection_claimed = 0 AND projection_committed = 0`
     ).run(input.requestId);
     if (Number(suppressed.changes) !== 1) throw new Error(`Request ${input.requestId} could not be suppressed`);
@@ -82,12 +82,12 @@ export function cancelOpenRequestInTransaction(
     return { requestId: input.requestId, status: "cancelled", delivery: "suppressed" };
   }
 
-  const queuedMustBePreserved = request.delivery_status === "queued"
+  const acceptedMustBePreserved = request.delivery_status === "accepted"
     && (Number(request.projection_claimed) === 1 || request.in_reply_to_request_id !== null);
-  if (request.delivery_status !== "delivered" && !queuedMustBePreserved) {
+  if (request.delivery_status !== "delivered" && !acceptedMustBePreserved) {
     throw new Error(`Open Request ${input.requestId} has invalid delivery state ${request.delivery_status}`);
   }
-  if (queuedMustBePreserved && !database.prepare(
+  if (acceptedMustBePreserved && !database.prepare(
     "SELECT 1 FROM pending_message_pointers WHERE message_id = ? AND recipient_agent_id = ?",
   ).get(input.requestId, request.responder_agent_id)) {
     throw new Error(`Pending pointer is missing for projected Request ${input.requestId}`);
@@ -108,7 +108,7 @@ export function cancelOpenRequestInTransaction(
     delivery_timing, response_required, in_reply_to_request_id, acceptance_sequence,
     delivery_status, created_at_ms, accepted_at_ms, delivered_at_ms,
     protocol_notice_kind, canonical_request_id
-  ) VALUES (?, ?, ?, ?, ?, 'steer', 0, NULL, ?, 'queued', ?, ?, NULL,
+  ) VALUES (?, ?, ?, ?, ?, 'steer', 0, NULL, ?, 'accepted', ?, ?, NULL,
     'request-cancelled', ?)`
   ).run(
     input.noticeMessageId,
@@ -143,7 +143,7 @@ export function cancelOpenRequestInTransaction(
     : [input.cancelledAtMs, input.noticeMessageId, noticePayload, input.requestId, input.requesterAgentId];
   const cancelled = database.prepare(`UPDATE workflow_requests
     SET status = 'cancelled', cancelled_at_ms = ?, cancellation_notice_message_id = ?,
-      cancellation_notice_payload = ?, cancellation_notice_delivery_status = 'queued'
+      cancellation_notice_payload = ?, cancellation_notice_delivery_status = 'accepted'
     WHERE request_id = ? AND status = 'open' AND requester_agent_id = ?
       ${updateActivationPredicate}`
   ).run(...noticeUpdateParameters);
@@ -151,7 +151,7 @@ export function cancelOpenRequestInTransaction(
   return {
     requestId: input.requestId,
     status: "cancelled",
-    delivery: "notice-queued",
+    delivery: "notice-accepted",
     noticeMessageId: input.noticeMessageId,
   };
 }

@@ -30,9 +30,9 @@ export interface InboxBatch {
   messages: DirectSignalMessage[];
 }
 
-export interface QueuedSignalReceipt {
+export interface DurableAcceptanceReceipt {
   /** Initial spawned Requests are already represented in the child JSONL. */
-  status: "queued" | "delivered";
+  status: "accepted" | "delivered";
   messageId: string;
   recipientAgentId: string;
   acceptanceSequence: number;
@@ -50,7 +50,7 @@ export interface DirectSignalRecord {
   onAccepted: "continue" | "complete";
   inReplyToRequestId?: string;
   acceptanceSequence?: number;
-  deliveryStatus: "bound" | "queued" | "delivered" | "suppressed";
+  deliveryStatus: "bound" | "accepted" | "delivered" | "suppressed";
   protocolNoticeKind?: "request-cancelled" | "request-orphaned";
   canonicalRequestId?: string;
   createdAtMs: number;
@@ -71,14 +71,14 @@ export interface RequestRecord {
   cancellationNotice?: {
     messageId: string;
     message: string;
-    deliveryStatus: "queued" | "delivered";
+    deliveryStatus: "accepted" | "delivered";
     deliveredAtMs?: number;
   };
   orphanedAtMs?: number;
   orphanNotice?: {
     messageId: string;
     message: string;
-    deliveryStatus: "queued" | "delivered";
+    deliveryStatus: "accepted" | "delivered";
     deliveredAtMs?: number;
   };
 }
@@ -86,7 +86,7 @@ export interface RequestRecord {
 export interface RequestCancellationReceipt {
   requestId: string;
   status: "cancelled";
-  delivery: "suppressed" | "notice-queued" | "notice-delivered";
+  delivery: "suppressed" | "notice-accepted" | "notice-delivered";
   noticeMessageId?: string;
 }
 
@@ -129,11 +129,11 @@ export interface SignalAcceptRequest {
 
 export interface SignalReceiptReply {
   accepted: boolean;
-  receipt?: QueuedSignalReceipt;
+  receipt?: DurableAcceptanceReceipt;
   error?: { code?: string; message: string; blockers?: import("./completion-gate.ts").CompletionBlocker[] };
 }
 
 export interface AcceptedSignal {
-  receipt: QueuedSignalReceipt;
+  receipt: DurableAcceptanceReceipt;
   delivery: "schedule";
 }

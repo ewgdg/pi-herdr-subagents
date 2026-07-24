@@ -4,7 +4,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
-import type { InboxBatch } from "./direct-signal.ts";
+import type { DurableAcceptanceReceipt, InboxBatch } from "./direct-signal.ts";
 import {
   WorkflowBootstrap,
   type AutomaticRecoveryRunReconciliation,
@@ -125,18 +125,18 @@ export function registerAgentSendTool(
       messageId: string;
       sourceEntryId: string;
       context: ExtensionContext;
-    }): Promise<{ status: "queued" | "delivered"; messageId: string; recipientAgentId: string; acceptanceSequence: number }>;
+    }): Promise<DurableAcceptanceReceipt>;
     reconcileSpawnedInitialRequest?(input: {
       agent: string;
       name?: string;
       message: string;
       sourceEntryId: string;
       context: ExtensionContext;
-    }): Promise<{ status: "queued" | "delivered"; messageId: string; recipientAgentId: string; acceptanceSequence: number } | undefined>;
+    }): Promise<DurableAcceptanceReceipt | undefined>;
     prepareEndedRecipient?(input: {
       request: import("./direct-signal-types.ts").SignalAcceptRequest;
       context: ExtensionContext;
-    }): Promise<import("./direct-signal-types.ts").QueuedSignalReceipt>;
+    }): Promise<DurableAcceptanceReceipt>;
   } = {},
 ): void {
   if (!enabled) return;
@@ -149,11 +149,11 @@ export function registerAgentSendTool(
     label: "Send Message",
     description:
       "Send a Signal or Request to an addressable Agent, or Answer a Request. " +
-      "A successful result is only a durable queued receipt; it does not claim that the recipient understood or acted on the message." +
+      "A successful result is only a Durable Acceptance Receipt; it does not claim that the recipient understood or acted on the message." +
       ownerHint,
     promptSnippet:
       "Send a Signal or Request to a known Agent, or Answer a Request ID. " +
-      "An Answer derives its return route and timing from the Request. The result is a durable queued receipt, not a read receipt.",
+      "An Answer derives its return route and timing from the Request. The result is a Durable Acceptance Receipt, not a read receipt.",
     parameters: AgentSendParams,
     async execute(toolCallId, params, _signal, _onUpdate, context) {
       await workflowBootstrap.waitUntilReady(context);
@@ -244,7 +244,7 @@ export function registerAgentSendTool(
         content: [{
           type: "text",
           text:
-            `Message ${receipt.messageId} queued for Agent ${receipt.recipientAgentId} ` +
+            `Message ${receipt.messageId} accepted for Agent ${receipt.recipientAgentId} ` +
             `(acceptance sequence ${receipt.acceptanceSequence}).`,
         }],
         details: receipt,

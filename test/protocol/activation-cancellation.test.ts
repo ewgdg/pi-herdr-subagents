@@ -657,7 +657,7 @@ describe("Activation Cancellation", () => {
     assert.equal(messages.inspectRequest(setup.runtime.workflow.ownerAgentId, "prunable-outgoing-request")?.status, "cancelled");
     assert.equal(messages.inspectRequest(setup.runtime.workflow.ownerAgentId, "requester-outgoing-request")?.status, "cancelled");
     assert.equal(messages.inspectRequest(setup.runtime.workflow.ownerAgentId, "prunable-incoming-request")?.status, "orphaned");
-    assert.equal(messages.inspectMessage(setup.runtime.workflow.ownerAgentId, "signal-only-edge")?.deliveryStatus, "queued");
+    assert.equal(messages.inspectMessage(setup.runtime.workflow.ownerAgentId, "signal-only-edge")?.deliveryStatus, "accepted");
 
     const cancellation = messages.cancelRequest({
       requester: rootRuntime.agent(seed.agentId), requestId: "seed-dependency-request",
@@ -762,7 +762,7 @@ describe("Activation Cancellation", () => {
     const outgoingOpen = messages.inspectRequest(setup.runtime.workflow.ownerAgentId, "outgoing-open")!;
     const outgoingAnswered = messages.inspectRequest(setup.runtime.workflow.ownerAgentId, "outgoing-answered")!;
     assert.equal(incoming.status, "orphaned");
-    assert.equal(incoming.orphanNotice?.deliveryStatus, "queued");
+    assert.equal(incoming.orphanNotice?.deliveryStatus, "accepted");
     const orphanProjection = setup.runtime.inspectTarget({ request: "incoming-open" }) as any;
     assert.equal(orphanProjection.status, "orphaned");
     assert.equal(orphanProjection.requesterDependency, "unresolved");
@@ -771,7 +771,7 @@ describe("Activation Cancellation", () => {
     assert.equal(outgoingOpen.status, "cancelled");
     assert.equal(outgoingAnswered.status, "answered");
     assert.equal(outgoingAnswered.answerMessageId, "answer-undelivered");
-    assert.equal(messages.inspectMessage(setup.runtime.workflow.ownerAgentId, "answer-undelivered")?.deliveryStatus, "queued");
+    assert.equal(messages.inspectMessage(setup.runtime.workflow.ownerAgentId, "answer-undelivered")?.deliveryStatus, "accepted");
     assert.equal(messages.inspectRequest(setup.runtime.workflow.ownerAgentId, "answer-undelivered")?.status, "orphaned");
 
     const ownerNotices = messages.listPending(setup.runtime.owner()).filter((pointer) => pointer.protocolNoticeKind === "request-orphaned");
@@ -976,7 +976,7 @@ describe("Activation Cancellation", () => {
       sourceId: "acceptance-wins-answer-race",
     });
     assert.equal(winningMessages.inspectRequest(acceptanceWins.runtime.workflow.ownerAgentId, "incoming-for-accepted-answer")?.status, "answered");
-    assert.equal(winningMessages.inspectMessage(acceptanceWins.runtime.workflow.ownerAgentId, "accepted-answer-and-request")?.deliveryStatus, "queued");
+    assert.equal(winningMessages.inspectMessage(acceptanceWins.runtime.workflow.ownerAgentId, "accepted-answer-and-request")?.deliveryStatus, "accepted");
     assert.equal(winningMessages.inspectRequest(acceptanceWins.runtime.workflow.ownerAgentId, "accepted-answer-and-request")?.status, "cancelled");
   });
 
@@ -1002,7 +1002,7 @@ describe("Activation Cancellation", () => {
       /Pending pointer is missing/,
     );
     assert.equal(messages.inspectRequest(setup.runtime.workflow.ownerAgentId, "broken-outgoing-request")?.status, "open");
-    assert.equal(messages.inspectMessage(setup.runtime.workflow.ownerAgentId, "broken-outgoing-request")?.deliveryStatus, "queued");
+    assert.equal(messages.inspectMessage(setup.runtime.workflow.ownerAgentId, "broken-outgoing-request")?.deliveryStatus, "accepted");
     assert.equal(setup.runtime.inspectActivation(setup.runtime.agent(setup.child.agentId))?.state.kind, "active");
   });
 

@@ -773,9 +773,9 @@ export class WorkflowControlPlane {
     return this.#activations.confirmUndeclaredNotice(agent, episodeId, this.#now());
   }
 
-  queueUndeclaredNotice(agent: AgentReference, episodeId: string): UndeclaredSettlementEpisode | undefined {
+  acceptUndeclaredNotice(agent: AgentReference, episodeId: string): UndeclaredSettlementEpisode | undefined {
     this.#assertReference(agent);
-    return this.#activations.queueUndeclaredNotice(agent, episodeId, this.#now());
+    return this.#activations.acceptUndeclaredNotice(agent, episodeId, this.#now());
   }
 
   inspectUndeclaredEpisode(agent: AgentReference): UndeclaredSettlementEpisode | undefined {

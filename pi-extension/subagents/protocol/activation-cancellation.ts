@@ -110,7 +110,7 @@ interface RequestTransformationRow {
   request_id: string;
   requester_agent_id: string;
   responder_agent_id: string;
-  delivery_status: "bound" | "queued" | "delivered" | "suppressed";
+  delivery_status: "bound" | "accepted" | "delivered" | "suppressed";
   in_reply_to_request_id: string | null;
 }
 
@@ -826,12 +826,12 @@ export class ActivationCancellationStore {
       ORDER BY r.request_id`
     ).all(operation.activation_id) as unknown as RequestTransformationRow[];
     for (const request of rows) {
-      if (request.delivery_status === "queued" && request.in_reply_to_request_id === null) {
+      if (request.delivery_status === "accepted" && request.in_reply_to_request_id === null) {
         const pointer = this.#database.prepare("DELETE FROM pending_message_pointers WHERE message_id = ?")
           .run(request.request_id);
         if (Number(pointer.changes) !== 1) throw new Error(`Pending pointer is missing for incoming Request ${request.request_id}`);
         const suppressed = this.#database.prepare(`UPDATE direct_signal_messages SET delivery_status = 'suppressed'
-          WHERE message_id = ? AND delivery_status = 'queued'`
+          WHERE message_id = ? AND delivery_status = 'accepted'`
         ).run(request.request_id);
         if (Number(suppressed.changes) !== 1) throw new Error(`Incoming Request ${request.request_id} could not be suppressed`);
       }
@@ -847,7 +847,7 @@ export class ActivationCancellationStore {
       });
       const orphaned = this.#database.prepare(`UPDATE workflow_requests
         SET status = 'orphaned', orphaned_at_ms = ?, orphaned_by_cancellation_operation_id = ?,
-            orphan_notice_message_id = ?, orphan_notice_payload = ?, orphan_notice_delivery_status = 'queued'
+            orphan_notice_message_id = ?, orphan_notice_payload = ?, orphan_notice_delivery_status = 'accepted'
         WHERE request_id = ? AND status = 'open' AND responder_activation_id = ?`
       ).run(now, operation.operation_id, noticeMessageId, payload, request.request_id, operation.activation_id);
       if (Number(orphaned.changes) !== 1) throw new Error(`Incoming Request ${request.request_id} lost orphan arbitration`);
@@ -870,7 +870,7 @@ export class ActivationCancellationStore {
       in_reply_to_request_id, acceptance_sequence, delivery_status,
       created_at_ms, accepted_at_ms, delivered_at_ms,
       activation_notice_kind, activation_notice_request_id
-    ) VALUES (?, ?, ?, ?, ?, 'steer', 0, 'continue', 0, NULL, ?, 'queued', ?, ?, NULL,
+    ) VALUES (?, ?, ?, ?, ?, 'steer', 0, 'continue', 0, NULL, ?, 'accepted', ?, ?, NULL,
       'request-orphaned', ?)`
     ).run(
       input.noticeMessageId,

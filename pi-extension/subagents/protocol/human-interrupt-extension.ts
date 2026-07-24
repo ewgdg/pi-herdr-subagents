@@ -85,7 +85,7 @@ export class HumanInterruptInputBridge {
     for (const toolCallId of completedHumanInterruptToolCalls(entries)) {
       this.#awaitingResultPersistence.delete(toolCallId);
       if (workflowBootstrap.confirmHumanResponseResult(toolCallId)) {
-        workflowBootstrap.releaseDeferredSignals();
+        workflowBootstrap.reevaluateInboxEligibility();
       }
     }
     for (const response of humanInterruptResponses(entries)) {
@@ -139,7 +139,7 @@ export class HumanInterruptInputBridge {
     if (interrupt?.status === "result-pending"
       && projection.projectedToolCallIds.includes(interrupt.toolCallId)) {
       confirmedCurrentProjection = Boolean(workflowBootstrap.confirmHumanResponseResult(interrupt.toolCallId));
-      if (confirmedCurrentProjection) workflowBootstrap.releaseDeferredSignals();
+      if (confirmedCurrentProjection) workflowBootstrap.reevaluateInboxEligibility();
     }
     const currentProjectionId = interrupt?.responseInputId
       ? humanInterruptRecoveryProjectionId(interrupt.toolCallId, interrupt.responseInputId)

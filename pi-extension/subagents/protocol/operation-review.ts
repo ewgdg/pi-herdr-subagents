@@ -668,7 +668,7 @@ export class OperationReviewStore {
           SELECT 1 FROM workflow_requests
           WHERE requester_activation_id = agent_activations.activation_id
             AND (status IN ('open', 'answered')
-              OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))
+              OR (status = 'orphaned' AND orphan_notice_delivery_status = 'accepted'))
         )
     `).run(now, row.current_activation_id);
   }

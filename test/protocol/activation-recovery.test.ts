@@ -39,7 +39,7 @@ function persistLaunchPolicy(databasePath: string, agentId: string): void {
 }
 
 describe("automatic activation recovery", () => {
-  it("closes a stale episode when its only queued Request is cancelled before claim", async () => {
+  it("closes a stale episode when its only accepted Request is cancelled before claim", async () => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime } = scenario.createOwner();
     const session = scenario.childSession(runtime, "stale-worker");
@@ -83,7 +83,7 @@ describe("automatic activation recovery", () => {
         endpoint: "stale-worker-router",
         acceptedAtMs: scenario.clock.now(),
       });
-      runtime.confirmAgentRunExit(failed, { error: "worker failed while request was queued" });
+      runtime.confirmAgentRunExit(failed, { error: "worker failed while request was accepted" });
       assert.equal(runtime.controlPlane.inspectActivationRecovery(reference)?.state, "pending");
 
       assert.equal(messages.cancelRequest({
@@ -102,7 +102,7 @@ describe("automatic activation recovery", () => {
     }
   });
 
-  it("resolves a claimed replacement when its last queued Request is cancelled before activation start", async () => {
+  it("resolves a claimed replacement when its last accepted Request is cancelled before activation start", async () => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime } = scenario.createOwner();
     const session = scenario.childSession(runtime, "claim-cancel-worker");
@@ -146,7 +146,7 @@ describe("automatic activation recovery", () => {
         endpoint: "claim-cancel-worker-router",
         acceptedAtMs: scenario.clock.now(),
       });
-      runtime.confirmAgentRunExit(failed, { error: "worker failed while Request was queued" });
+      runtime.confirmAgentRunExit(failed, { error: "worker failed while Request was accepted" });
       const claim = runtime.controlPlane.claimRecoveryRun(failed.ownership.runId, "claim-cancel-replacement")!;
       assert.equal(claim.recovery.state, "launching");
 
@@ -480,7 +480,7 @@ describe("automatic activation recovery", () => {
       assert.equal(runtime.inspectUndeclaredEpisode(reference), undefined,
         "useful work must retain the unused correction allowance");
       assert.equal(runtime.controlPlane.inspectActivationRecovery(reference)?.state, "resolved");
-      inbox.releaseDeferred();
+      inbox.reevaluateInboxEligibility();
       await new Promise((resolve) => setTimeout(resolve, 0));
       assert.equal(projected.flatMap((batch) => batch.messages).length, 1, "settlement must not project or wake a duplicate turn");
     } finally {
@@ -522,7 +522,7 @@ describe("automatic activation recovery", () => {
         replacement.ownership,
         toolCallId,
       ),
-      releaseDeferredSignals() {},
+      reevaluateInboxEligibility() {},
     } as never);
     assert.equal(runtime.inspectHumanInterrupt(reference)?.status, "consumed",
       "replacement startup confirms the canonical transcript result");

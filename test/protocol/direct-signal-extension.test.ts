@@ -21,7 +21,7 @@ describe("direct Signal Pi transcript projection", () => {
         async waitUntilReady() {}, async startDirectSignalRouter() {},
         async sendDirectMessage() {
           if (blocked) throw new CompletionRejectedError([{ kind: "operation-dependency", dependencyId: "tool-1" }]);
-          return { status: "queued", messageId: "message-1", recipientAgentId: "recipient", acceptanceSequence: 1 };
+          return { status: "accepted", messageId: "message-1", recipientAgentId: "recipient", acceptanceSequence: 1 };
         },
         async closeDirectSignalRouter() {},
       } as never);
@@ -56,7 +56,7 @@ describe("direct Signal Pi transcript projection", () => {
     const params = { target: { agent: "recipient" }, message: "final", onAccepted: "complete" as const };
     registerAgentSendTool({ registerTool(value: unknown) { tool = value; }, sendMessage() {} } as never, {
       async waitUntilReady() {}, async startDirectSignalRouter() {},
-      async sendDirectMessage() { return { status: "queued", messageId: "message-1", recipientAgentId: "recipient", acceptanceSequence: 1 }; },
+      async sendDirectMessage() { return { status: "accepted", messageId: "message-1", recipientAgentId: "recipient", acceptanceSequence: 1 }; },
       async closeDirectSignalRouter() { throw new Error("cleanup failed"); },
     } as never);
     const originalWarn = console.warn;

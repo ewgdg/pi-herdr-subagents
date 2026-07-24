@@ -27,7 +27,7 @@ describe("agent_cancel Pi extension", () => {
       async waitUntilReady() { calls.push("ready"); },
       async cancelRequest(requestId: string) {
         calls.push(requestId);
-        return { requestId, status: "cancelled", delivery: "notice-queued", noticeMessageId: "notice-1" };
+        return { requestId, status: "cancelled", delivery: "notice-accepted", noticeMessageId: "notice-1" };
       },
       async cancelActivation(agentId: string, sourceId: string) {
         calls.push(agentId, sourceId);
@@ -45,7 +45,7 @@ describe("agent_cancel Pi extension", () => {
     assert.deepEqual(result.details, {
       requestId: "request-1",
       status: "cancelled",
-      delivery: "notice-queued",
+      delivery: "notice-accepted",
       noticeMessageId: "notice-1",
     });
 

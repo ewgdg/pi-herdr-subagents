@@ -168,7 +168,7 @@ export function triggerAutomaticRecoveryContinuation(
 /** Reconcile the transcript before retrying; sendMessage alone is not delivery. */
 export function emitUndeclaredSettlementNotice(
   pi: Pick<ExtensionAPI, "sendMessage">,
-  workflowBootstrap: Pick<WorkflowBootstrap, "pendingUndeclaredNotice" | "queueUndeclaredNotice" | "confirmUndeclaredNotice">,
+  workflowBootstrap: Pick<WorkflowBootstrap, "pendingUndeclaredNotice" | "acceptUndeclaredNotice" | "confirmUndeclaredNotice">,
   entries: unknown[],
   inFlight = new Set<string>(),
 ): void {
@@ -180,9 +180,9 @@ export function emitUndeclaredSettlementNotice(
     return;
   }
   if (inFlight.has(episode.noticeId)) return;
-  // The episode remains durably queued until transcript evidence confirms it.
+  // The episode remains durably accepted until transcript evidence confirms it.
   // This process-local fence prevents duplicate projections before that evidence.
-  if (!workflowBootstrap.queueUndeclaredNotice(episode.episodeId)) return;
+  if (!workflowBootstrap.acceptUndeclaredNotice(episode.episodeId)) return;
   inFlight.add(episode.noticeId);
   try {
     pi.sendMessage({
@@ -329,7 +329,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (workflowBootstrap.workflow) {
         if (workflowBootstrap.releaseAutomaticRecoveryDeferredProjection()) {
-          workflowBootstrap.releaseDeferredSignals();
+          workflowBootstrap.reevaluateInboxEligibility();
         }
         triggerAutomaticRecoveryContinuation(pi, workflowBootstrap);
       }
@@ -448,7 +448,7 @@ export default function (pi: ExtensionAPI) {
       await humanInterruptBridge.reconcile(ctx, workflowBootstrap, pi);
       if (!legacyCompletionRequested) {
         workflowBootstrap.currentTurnSettled(latestAgentRunWasAborted);
-        workflowBootstrap.releaseDeferredSignals();
+        workflowBootstrap.reevaluateInboxEligibility();
         emitUndeclaredSettlementNotice(pi, workflowBootstrap, ctx.sessionManager.getEntries(), undeclaredNoticeDeliveries);
       }
     }

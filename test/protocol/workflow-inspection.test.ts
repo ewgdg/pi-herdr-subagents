@@ -158,7 +158,7 @@ describe("Workflow inspection", () => {
     });
     assert.equal(projection.status, "open");
     assert.equal(projection.answer, null);
-    assert.deepEqual(projection.delivery, { request: "queued", answer: "not-created" });
+    assert.deepEqual(projection.delivery, { request: "accepted", answer: "not-created" });
     assert.equal(projection.requesterDependency, "unresolved");
     assert.equal(projection.requesterLifecycleDependency, "waiting");
     assert.equal(JSON.stringify(projection).includes("SECRET"), false);
@@ -166,7 +166,7 @@ describe("Workflow inspection", () => {
     const writer = new DatabaseSync(runtime.workflow.databasePath); test.after(() => writer.close());
     writer.exec("BEGIN IMMEDIATE");
     writer.prepare("UPDATE direct_signal_messages SET delivery_status = 'delivered', delivered_at_ms = 10 WHERE message_id = ?").run(request.messageId);
-    assert.equal((runtime.inspectTarget({ request: request.messageId }) as any).delivery.request, "queued", "joined read sees the last committed snapshot during a concurrent write");
+    assert.equal((runtime.inspectTarget({ request: request.messageId }) as any).delivery.request, "accepted", "joined read sees the last committed snapshot during a concurrent write");
     writer.exec("COMMIT");
     assert.equal((runtime.inspectTarget({ request: request.messageId }) as any).delivery.request, "delivered");
   });
@@ -228,7 +228,7 @@ describe("Workflow inspection", () => {
     assert.equal(projection.answer, null);
     assert.equal(projection.requesterDependency, "satisfied");
     assert.equal(projection.requesterLifecycleDependency, "not-waiting");
-    assert.deepEqual(projection.cancellation, { noticeMessageId: "cancellation-notice", delivery: "queued" });
+    assert.deepEqual(projection.cancellation, { noticeMessageId: "cancellation-notice", delivery: "accepted" });
     assert.equal(projection.callerAuthority.cancelRequest, false, "terminal Requests cannot be cancelled again through projected authority");
     assert.equal(JSON.stringify(projection).includes("SECRET"), false);
 

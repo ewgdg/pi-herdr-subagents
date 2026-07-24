@@ -119,7 +119,7 @@ describe("Request cancellation", () => {
 
     await assert.rejects(setup.ownerMessages.cancelRequest(request.messageId), /Pending pointer is missing/);
     assert.equal(setup.ownerMessages.inspectRequest(request.messageId)?.status, "open");
-    assert.equal(setup.ownerMessages.inspectMessage(request.messageId)?.deliveryStatus, "queued");
+    assert.equal(setup.ownerMessages.inspectMessage(request.messageId)?.deliveryStatus, "accepted");
   });
 
   it("queues exactly one correlated runtime-authored Steer notice after delivery and wakes a waiting responder", async (test) => {
@@ -131,7 +131,7 @@ describe("Request cancellation", () => {
 
     const result = await setup.ownerMessages.cancelRequest(request.messageId);
     assert.equal(result.status, "cancelled");
-    assert.equal(result.delivery, "notice-queued");
+    assert.equal(result.delivery, "notice-accepted");
     assert.ok(result.noticeMessageId);
     assert.deepEqual(await setup.ownerMessages.cancelRequest(request.messageId), result);
 
@@ -167,16 +167,16 @@ describe("Request cancellation", () => {
     await waitFor(() => setup.responderBatches.some((batch) => batch.messages.some((message) => message.messageId === request.messageId)));
 
     const result = await setup.ownerMessages.cancelRequest(request.messageId);
-    assert.equal(result.delivery, "notice-queued");
+    assert.equal(result.delivery, "notice-accepted");
     assert.ok(result.noticeMessageId);
-    assert.equal(setup.ownerMessages.inspectMessage(request.messageId)?.deliveryStatus, "queued");
+    assert.equal(setup.ownerMessages.inspectMessage(request.messageId)?.deliveryStatus, "accepted");
     assert.equal(setup.responderMessages.listPending(setup.ownerRuntime.agent(setup.responder.agentId))
       .some((pointer) => pointer.messageId === request.messageId), true,
     "a projected Request must remain confirmable instead of disappearing from under the recipient transcript");
     await waitFor(() => setup.responderBatches.some((batch) => batch.messages.some((message) => message.messageId === result.noticeMessageId)));
   });
 
-  it("delivers a queued cancellation notice after the responder Router restarts", async (test) => {
+  it("delivers a accepted cancellation notice after the responder Router restarts", async (test) => {
     const setup = await cancellationScenario(test);
     const request = await sendRequest(setup);
     await waitFor(() => setup.responderBatches.some((batch) => batch.messages.some((message) => message.messageId === request.messageId)));
@@ -184,7 +184,7 @@ describe("Request cancellation", () => {
     await setup.responderMessages.close();
 
     const result = await setup.ownerMessages.cancelRequest(request.messageId);
-    assert.equal(result.delivery, "notice-queued");
+    assert.equal(result.delivery, "notice-accepted");
     const recoveredBatches: InboxBatch[] = [];
     const restarted = closeAfter(test, new DirectSignalRuntime({
       controlPlane: setup.responderRuntime.controlPlane,
@@ -203,7 +203,7 @@ describe("Request cancellation", () => {
     await waitFor(() => setup.responderBatches.some((batch) => batch.messages.some((message) => message.messageId === request.messageId)));
     await setup.responderMessages.close();
     const cancellation = await setup.ownerMessages.cancelRequest(request.messageId);
-    assert.equal(cancellation.delivery, "notice-queued");
+    assert.equal(cancellation.delivery, "notice-accepted");
 
     const recoveredBatches: InboxBatch[] = [];
     const restarted = closeAfter(test, new DirectSignalRuntime({
@@ -237,14 +237,14 @@ describe("Request cancellation", () => {
     assert.equal(ambiguousPointer?.projectionCommitted, false);
     assert.equal(
       setup.ownerMessages.inspectMessage(request.messageId)?.deliveryStatus,
-      "queued",
+      "accepted",
       "the transcript-persisted Request has not reached SQLite delivery confirmation",
     );
 
     const cancellation = await setup.ownerMessages.cancelRequest(request.messageId);
-    assert.equal(cancellation.delivery, "notice-queued");
+    assert.equal(cancellation.delivery, "notice-accepted");
     assert.ok(cancellation.noticeMessageId);
-    assert.equal(setup.ownerMessages.inspectMessage(request.messageId)?.deliveryStatus, "queued");
+    assert.equal(setup.ownerMessages.inspectMessage(request.messageId)?.deliveryStatus, "accepted");
 
     const recoveredBatches: InboxBatch[] = [];
     const restarted = closeAfter(test, new DirectSignalRuntime({
@@ -276,7 +276,7 @@ describe("Request cancellation", () => {
       noticeMessageId: "notice-with-lost-schedule-hint",
       cancelledAtMs: setup.scenario.clock.now(),
     });
-    assert.equal(result.delivery, "notice-queued");
+    assert.equal(result.delivery, "notice-accepted");
 
     await waitFor(() => setup.responderBatches.flatMap((batch) => batch.messages)
       .some((message) => message.messageId === result.noticeMessageId));

@@ -17,7 +17,7 @@ import type {
   DirectSignalRecord,
   InboxBatch,
   PendingMessagePointer,
-  QueuedSignalReceipt,
+  DurableAcceptanceReceipt,
   RequestCancellationReceipt,
   RequestRecord,
   SignalAcceptRequest,
@@ -32,7 +32,7 @@ export type {
   DirectSignalRecord,
   InboxBatch,
   PendingMessagePointer,
-  QueuedSignalReceipt,
+  DurableAcceptanceReceipt,
   RequestRecord,
   RequestCancellationReceipt,
   SignalDeliveryTiming,
@@ -82,7 +82,7 @@ export class DirectSignalRuntime {
   #routerStartup: Promise<void> | undefined;
   #closePromise: Promise<void> | undefined;
   #closed = false;
-  readonly #acceptanceReconciliations = new Map<string, Promise<QueuedSignalReceipt | undefined>>();
+  readonly #acceptanceReconciliations = new Map<string, Promise<DurableAcceptanceReceipt | undefined>>();
   #acceptanceRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #acceptanceRetryDelayMs = ACCEPTANCE_RETRY_INITIAL_DELAY_MS;
   readonly #acceptanceResolutionWaiters = new Set<AcceptanceResolutionWaiter>();
@@ -169,8 +169,8 @@ export class DirectSignalRuntime {
     deliveryTiming?: SignalDeliveryTiming;
     responseRequired?: boolean;
     onAccepted: "continue" | "complete";
-    prepareEndedRecipient?: (request: SignalAcceptRequest) => Promise<QueuedSignalReceipt>;
-  }): Promise<QueuedSignalReceipt> {
+    prepareEndedRecipient?: (request: SignalAcceptRequest) => Promise<DurableAcceptanceReceipt>;
+  }): Promise<DurableAcceptanceReceipt> {
     this.#assertOpen();
     assertNonEmpty(input.message, "Message");
     assertNonEmpty(input.sourceEntryId, "Message source entry ID");
@@ -316,7 +316,7 @@ export class DirectSignalRuntime {
     return result;
   }
 
-  async #reconcileBoundMessage(bound: DirectSignalRecord): Promise<QueuedSignalReceipt | undefined> {
+  async #reconcileBoundMessage(bound: DirectSignalRecord): Promise<DurableAcceptanceReceipt | undefined> {
     const sender = this.#controlPlane.currentAgent;
     const observed = this.#store.inspectMessage(sender.workflowOwnerId, bound.messageId);
     if (observed?.deliveryStatus !== "bound") {
@@ -396,7 +396,7 @@ export class DirectSignalRuntime {
     message: string;
     sourceEntryId: string;
     deliveryTiming?: SignalDeliveryTiming;
-  }): Promise<QueuedSignalReceipt> {
+  }): Promise<DurableAcceptanceReceipt> {
     return this.sendMessage({
       target: { agentId: input.target.agentId, workflowOwnerId: input.target.workflowOwnerId },
       message: input.message,
@@ -441,7 +441,7 @@ export class DirectSignalRuntime {
       noticeMessageId: this.#allocateMessageId(),
       cancelledAtMs: this.#now(),
     });
-    if (receipt.delivery === "notice-queued") {
+    if (receipt.delivery === "notice-accepted") {
       const request = this.#store.inspectRequest(requester.workflowOwnerId, requestId)!;
       const route = this.#store.readRouter(this.#controlPlane.agent(request.responderAgentId));
       if (route) {
@@ -470,9 +470,9 @@ export class DirectSignalRuntime {
     return this.#router?.confirmDelivery(messageId) ?? false;
   }
 
-  releaseDeferred(): void {
+  reevaluateInboxEligibility(): void {
     this.#assertOpen();
-    this.#router?.releaseDeferred();
+    this.#router?.reevaluateInboxEligibility();
   }
 
   close(options: { preserveRouterRegistration?: boolean } = {}): Promise<void> {
@@ -592,9 +592,9 @@ function createReceiptWaiter(connection: FramedIpcConnection): { promise: Promis
   return { promise, cancel: () => resolveOnce(undefined) };
 }
 
-function receiptFor(record: DirectSignalRecord): QueuedSignalReceipt {
+function receiptFor(record: DirectSignalRecord): DurableAcceptanceReceipt {
   if (record.acceptanceSequence === undefined) throw new Error(`Message ${record.messageId} is not durably accepted`);
-  return { status: "queued", messageId: record.messageId, recipientAgentId: record.recipientAgentId, acceptanceSequence: record.acceptanceSequence };
+  return { status: "accepted", messageId: record.messageId, recipientAgentId: record.recipientAgentId, acceptanceSequence: record.acceptanceSequence };
 }
 
 function replyError(error: SignalReceiptReply["error"]): Error {

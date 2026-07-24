@@ -128,7 +128,7 @@ function collectCompletionBlockers(database: DatabaseSync, agentId: string, acti
   }
   for (const row of database.prepare(`SELECT request_id FROM workflow_requests
     WHERE requester_activation_id = ? AND (status IN ('open', 'answered')
-      OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))
+      OR (status = 'orphaned' AND orphan_notice_delivery_status = 'accepted'))
     ORDER BY request_id`).all(activationId) as Array<{ request_id: string }>) blockers.push({ kind: "outgoing-request", requestId: row.request_id });
   for (const row of database.prepare("SELECT message_id FROM pending_message_pointers WHERE recipient_agent_id = ? ORDER BY acceptance_sequence").all(agentId) as Array<{ message_id: string }>) blockers.push({ kind: "accepted-undelivered-input", messageId: row.message_id });
   for (const row of database.prepare("SELECT tool_call_id, status FROM human_interrupts WHERE agent_id = ? AND status IN ('pending','response-bound','result-pending') ORDER BY tool_call_id").all(agentId) as Array<{ tool_call_id: string; status: string }>) blockers.push({ kind: "human-interrupt", toolCallId: row.tool_call_id, status: row.status });

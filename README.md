@@ -277,7 +277,7 @@ remain. The Workflow Owner cannot complete.
 relay until its dedicated migration. Protocol-completed activations shut down
 gracefully without selecting or relaying a second legacy result.
 
-Only the Agent addressed by a Request may answer it. The first queued Answer closes the Request; retrying that same Answer is idempotent. An Answer can also set `responseRequired: true` to create its own Request atomically. A Request becomes resolved only when its Answer is committed to the requester’s inbox; unresolved Requests remain durable Agent dependencies.
+Only the Agent addressed by a Request may answer it. The first accepted Answer closes the Request; retrying that same Answer is idempotent. An Answer can also set `responseRequired: true` to create its own Request atomically. A Request becomes resolved only when its Answer is committed to the requester’s inbox; unresolved Requests remain durable Agent dependencies.
 
 ## agent_cancel — Request or Activation Cancellation
 

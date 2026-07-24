@@ -582,7 +582,7 @@ describe("Operation Review", () => {
       kind: "resolved",
       evidence: {
         kind: "same-message-identity-probe",
-        detail: "The original Message Identity is durably queued",
+        detail: "The original Message Identity is durably accepted",
       },
     }));
     assert.equal(

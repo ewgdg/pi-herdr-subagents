@@ -559,7 +559,7 @@ type RunningSubagent = LegacyRunningSubagent;
 
 interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
-  pendingRequestReactivations: Map<string, Promise<import("./protocol/direct-signal-types.ts").QueuedSignalReceipt>>;
+  pendingRequestReactivations: Map<string, Promise<import("./protocol/direct-signal-types.ts").DurableAcceptanceReceipt>>;
   automaticRecoveryLaunches: Map<string, Promise<void>>;
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
@@ -2012,7 +2012,7 @@ async function finalizeCommittedRequestReactivation(input: {
 async function reactivateEndedRecipientForRequest(
   request: import("./protocol/direct-signal-types.ts").SignalAcceptRequest,
   context: ExtensionContext,
-): Promise<import("./protocol/direct-signal-types.ts").QueuedSignalReceipt> {
+): Promise<import("./protocol/direct-signal-types.ts").DurableAcceptanceReceipt> {
   const key = `${request.senderAgentId}:${request.sourceEntryId}`;
   const existing = runtime.pendingRequestReactivations.get(key);
   if (existing) return existing;
@@ -2587,7 +2587,7 @@ function subagentsExtensionWithOptions(
       runtime.workflowBootstrap.sessionStarted(ctx);
       if (runtime.workflowBootstrap.workflow) {
         runtime.workflowBootstrap.currentTurnSettled(latestAgentRunWasAborted);
-        runtime.workflowBootstrap.releaseDeferredSignals();
+        runtime.workflowBootstrap.reevaluateInboxEligibility();
       }
       latestAgentRunWasAborted = false;
     });

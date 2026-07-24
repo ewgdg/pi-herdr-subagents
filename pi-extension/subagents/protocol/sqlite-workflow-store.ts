@@ -103,13 +103,13 @@ export class SQLiteWorkflowStore {
         cancelled_at_ms INTEGER,
         cancellation_notice_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
         cancellation_notice_payload TEXT,
-        cancellation_notice_delivery_status TEXT CHECK (cancellation_notice_delivery_status IN ('queued', 'delivered')),
+        cancellation_notice_delivery_status TEXT CHECK (cancellation_notice_delivery_status IN ('accepted', 'delivered')),
         cancellation_notice_delivered_at_ms INTEGER,
         orphaned_at_ms INTEGER,
         orphaned_by_cancellation_operation_id TEXT,
         orphan_notice_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
         orphan_notice_payload TEXT,
-        orphan_notice_delivery_status TEXT CHECK (orphan_notice_delivery_status IN ('queued', 'delivered')),
+        orphan_notice_delivery_status TEXT CHECK (orphan_notice_delivery_status IN ('accepted', 'delivered')),
         orphan_notice_delivered_at_ms INTEGER,
         CHECK ((status IN ('open', 'cancelled') AND answer_message_id IS NULL)
           OR (status IN ('answered', 'resolved') AND answer_message_id IS NOT NULL)
@@ -121,7 +121,7 @@ export class SQLiteWorkflowStore {
             AND ((cancellation_notice_message_id IS NULL AND cancellation_notice_payload IS NULL
                 AND cancellation_notice_delivery_status IS NULL AND cancellation_notice_delivered_at_ms IS NULL)
               OR (cancellation_notice_message_id IS NOT NULL AND cancellation_notice_payload IS NOT NULL
-                AND ((cancellation_notice_delivery_status = 'queued' AND cancellation_notice_delivered_at_ms IS NULL)
+                AND ((cancellation_notice_delivery_status = 'accepted' AND cancellation_notice_delivered_at_ms IS NULL)
                   OR (cancellation_notice_delivery_status = 'delivered' AND cancellation_notice_delivered_at_ms IS NOT NULL)))))),
         CHECK ((status != 'orphaned' AND orphaned_at_ms IS NULL
             AND orphaned_by_cancellation_operation_id IS NULL
@@ -130,7 +130,7 @@ export class SQLiteWorkflowStore {
           OR (status = 'orphaned' AND orphaned_at_ms IS NOT NULL
             AND orphaned_by_cancellation_operation_id IS NOT NULL
             AND orphan_notice_message_id IS NOT NULL AND orphan_notice_payload IS NOT NULL
-            AND ((orphan_notice_delivery_status = 'queued' AND orphan_notice_delivered_at_ms IS NULL)
+            AND ((orphan_notice_delivery_status = 'accepted' AND orphan_notice_delivered_at_ms IS NULL)
               OR (orphan_notice_delivery_status = 'delivered' AND orphan_notice_delivered_at_ms IS NOT NULL))))
       ) STRICT;
 
@@ -195,13 +195,13 @@ export class SQLiteWorkflowStore {
           cancelled_at_ms INTEGER,
           cancellation_notice_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
           cancellation_notice_payload TEXT,
-          cancellation_notice_delivery_status TEXT CHECK (cancellation_notice_delivery_status IN ('queued', 'delivered')),
+          cancellation_notice_delivery_status TEXT CHECK (cancellation_notice_delivery_status IN ('accepted', 'delivered')),
           cancellation_notice_delivered_at_ms INTEGER,
           orphaned_at_ms INTEGER,
           orphaned_by_cancellation_operation_id TEXT,
           orphan_notice_message_id TEXT UNIQUE REFERENCES direct_signal_messages(message_id),
           orphan_notice_payload TEXT,
-          orphan_notice_delivery_status TEXT CHECK (orphan_notice_delivery_status IN ('queued', 'delivered')),
+          orphan_notice_delivery_status TEXT CHECK (orphan_notice_delivery_status IN ('accepted', 'delivered')),
           orphan_notice_delivered_at_ms INTEGER,
           CHECK ((status IN ('open', 'cancelled') AND answer_message_id IS NULL)
             OR (status IN ('answered', 'resolved') AND answer_message_id IS NOT NULL)
@@ -213,7 +213,7 @@ export class SQLiteWorkflowStore {
               AND ((cancellation_notice_message_id IS NULL AND cancellation_notice_payload IS NULL
                   AND cancellation_notice_delivery_status IS NULL AND cancellation_notice_delivered_at_ms IS NULL)
                 OR (cancellation_notice_message_id IS NOT NULL AND cancellation_notice_payload IS NOT NULL
-                  AND ((cancellation_notice_delivery_status = 'queued' AND cancellation_notice_delivered_at_ms IS NULL)
+                  AND ((cancellation_notice_delivery_status = 'accepted' AND cancellation_notice_delivered_at_ms IS NULL)
                     OR (cancellation_notice_delivery_status = 'delivered' AND cancellation_notice_delivered_at_ms IS NOT NULL)))))),
           CHECK ((status != 'orphaned' AND orphaned_at_ms IS NULL
               AND orphaned_by_cancellation_operation_id IS NULL
@@ -222,7 +222,7 @@ export class SQLiteWorkflowStore {
             OR (status = 'orphaned' AND orphaned_at_ms IS NOT NULL
               AND orphaned_by_cancellation_operation_id IS NOT NULL
               AND orphan_notice_message_id IS NOT NULL AND orphan_notice_payload IS NOT NULL
-              AND ((orphan_notice_delivery_status = 'queued' AND orphan_notice_delivered_at_ms IS NULL)
+              AND ((orphan_notice_delivery_status = 'accepted' AND orphan_notice_delivered_at_ms IS NULL)
                 OR (orphan_notice_delivery_status = 'delivered' AND orphan_notice_delivered_at_ms IS NOT NULL))))
         ) STRICT;
       `);

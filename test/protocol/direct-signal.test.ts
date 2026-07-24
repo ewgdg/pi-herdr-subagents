@@ -200,7 +200,7 @@ describe("direct Signal protocol scenarios", () => {
         assert.deepEqual(await senderSignals.reconcilePendingAcceptances(), {
           terminalCompletion: onAccepted === "complete",
         });
-        assert.equal(senderSignals.inspectMessage(messageId)?.deliveryStatus, "queued");
+        assert.equal(senderSignals.inspectMessage(messageId)?.deliveryStatus, "accepted");
         assert.deepEqual(ownerRuntime.inspectActivation(senderReference)?.state,
           onAccepted === "complete"
             ? { kind: "ended", outcome: "completed" }
@@ -237,7 +237,7 @@ describe("direct Signal protocol scenarios", () => {
     const recipientSignals = directSignalRuntime(test, { controlPlane: recipientRuntime.controlPlane, ownership: recipientRun.ownership, projectInboxBatch() {} });
     await recipientSignals.start();
     assert.deepEqual(await reconciliation, { terminalCompletion: false });
-    await waitFor(() => senderSignals.inspectMessage("late-router-message")?.deliveryStatus === "queued");
+    await waitFor(() => senderSignals.inspectMessage("late-router-message")?.deliveryStatus === "accepted");
     assert.equal(senderSignals.inspectMessage("late-router-message")?.messageId, "late-router-message");
   });
 
@@ -278,7 +278,7 @@ describe("direct Signal protocol scenarios", () => {
       projectInboxBatch() {},
     });
     await recipientSignals.start();
-    await waitFor(() => ownerSignals.inspectMessage("late-owner-router-message")?.deliveryStatus === "queued");
+    await waitFor(() => ownerSignals.inspectMessage("late-owner-router-message")?.deliveryStatus === "accepted");
   });
 
   it("automatically reconciles a durable bound acceptance operation with its original identity", async (test) => {
@@ -298,7 +298,7 @@ describe("direct Signal protocol scenarios", () => {
     store.close();
     const senderSignals = directSignalRuntime(test, { controlPlane: senderRuntime.controlPlane, ownership: run.ownership });
     assert.deepEqual(await senderSignals.reconcilePendingAcceptances(), { terminalCompletion: false });
-    assert.equal(senderSignals.listMessages().find((message) => message.messageId === "reconcile-message")?.deliveryStatus, "queued");
+    assert.equal(senderSignals.listMessages().find((message) => message.messageId === "reconcile-message")?.deliveryStatus, "accepted");
     assert.deepEqual(ownerRuntime.inspectActivation(ownerRuntime.agent(sender.agentId))?.state, { kind: "active" });
   });
 
@@ -361,7 +361,7 @@ describe("direct Signal protocol scenarios", () => {
     const senderSignals = directSignalRuntime(test, { controlPlane: senderRuntime.controlPlane, ownership: run.ownership, allocateMessageId: () => scenario.identities.next() });
     const sourceEntryId = scenario.transcripts.appendAgentSend(senderSession, { targetAgentId: ownerRuntime.workflow.ownerAgentId, message: "lost terminal receipt", onAccepted: "complete" });
     const receipt = await senderSignals.sendMessage({ target: { agentId: ownerRuntime.workflow.ownerAgentId }, message: "lost terminal receipt", sourceEntryId, onAccepted: "complete" });
-    assert.equal(receipt.status, "queued");
+    assert.equal(receipt.status, "accepted");
     assert.equal(ownerRuntime.inspectActivation(ownerRuntime.agent(sender.agentId))?.state.kind, "ended");
   });
 
@@ -384,7 +384,7 @@ describe("direct Signal protocol scenarios", () => {
     workerSignals.confirmDelivery(request.messageId);
     const answerSource = scenario.transcripts.appendAgentSend(workerSession, { targetRequestId: request.messageId, message: "finished", onAccepted: "complete" });
     const answer = await workerSignals.sendMessage({ target: { requestId: request.messageId }, message: "finished", sourceEntryId: answerSource, onAccepted: "complete" });
-    assert.equal(answer.status, "queued");
+    assert.equal(answer.status, "accepted");
     assert.deepEqual(ownerRuntime.inspectActivation(ownerRuntime.agent(worker.agentId))?.state, { kind: "ended", outcome: "completed" });
   });
 
@@ -506,7 +506,7 @@ describe("direct Signal protocol scenarios", () => {
     const answer = await responderMessages.sendMessage({
       target: { requestId: request.messageId }, message: "answer", sourceEntryId: answerSource,
     });
-    await waitFor(() => requesterMessages.inspectMessage(answer.messageId)?.deliveryStatus === "queued");
+    await waitFor(() => requesterMessages.inspectMessage(answer.messageId)?.deliveryStatus === "accepted");
     requesterMessages.confirmDelivery(answer.messageId);
     assert.equal(ownerRuntime.inspectUndeclaredEpisode(ownerRuntime.agent(requester.agentId))?.status, "closed");
 
@@ -656,7 +656,7 @@ describe("direct Signal protocol scenarios", () => {
     const answer = await responderMessages.sendMessage({
       target: { requestId: first.messageId }, message: "first answer", sourceEntryId: answerSource,
     });
-    await waitFor(() => requesterMessages.inspectMessage(answer.messageId)?.deliveryStatus === "queued");
+    await waitFor(() => requesterMessages.inspectMessage(answer.messageId)?.deliveryStatus === "accepted");
     assert.equal(ownerRuntime.inspectActivation(ownerRuntime.agent(requester.agentId))?.state.kind, "waiting");
     assert.equal(requesterMessages.confirmDelivery(answer.messageId), true);
     assert.equal(wakeCount, 1);
@@ -801,12 +801,12 @@ describe("direct Signal protocol scenarios", () => {
       sourceEntryId,
     });
     await waitFor(() => batches.length === 1);
-    recipientSignals.releaseDeferred();
+    recipientSignals.reevaluateInboxEligibility();
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(batches.length, 1, "unconfirmed projection must not be injected twice in one Router run");
     assert.equal(recipientSignals.confirmDelivery(receipt.messageId), true);
 
-    assert.equal(receipt.status, "queued");
+    assert.equal(receipt.status, "accepted");
     assert.equal(receipt.recipientAgentId, recipient.agentId);
     assert.equal(receipt.acceptanceSequence, 1);
     assert.deepEqual(batches, [{
@@ -836,7 +836,7 @@ describe("direct Signal protocol scenarios", () => {
     ownerRuntime.close();
   });
 
-  it("releases queued inputs once at the normal Human tool-result boundary", async (test) => {
+  it("reevaluates accepted inputs once at the normal Human tool-result boundary", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
     const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
@@ -862,12 +862,12 @@ describe("direct Signal protocol scenarios", () => {
       allocateMessageId: () => scenario.identities.next(),
     });
     const sourceEntryId = scenario.transcripts.appendAgentSend(senderSession, {
-      targetAgentId: recipient.agentId, message: "QUEUED_UNTIL_HUMAN_RESUME",
+      targetAgentId: recipient.agentId, message: "PENDING_UNTIL_HUMAN_RESUME",
     });
 
     await senderSignals.sendSignal({
       target: senderRuntime.agent(recipient.agentId),
-      message: "QUEUED_UNTIL_HUMAN_RESUME",
+      message: "PENDING_UNTIL_HUMAN_RESUME",
       sourceEntryId,
     });
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -877,24 +877,24 @@ describe("direct Signal protocol scenarios", () => {
     ownerRuntime.bindHumanResponse(recipientRun, "ask-1", "input-1");
     ownerRuntime.prepareHumanResponseResult(recipientRun, "ask-1");
     const pendingResultSource = scenario.transcripts.appendAgentSend(senderSession, {
-      targetAgentId: recipient.agentId, message: "QUEUED_DURING_RESULT_PENDING",
+      targetAgentId: recipient.agentId, message: "PENDING_DURING_RESULT_PENDING",
     });
     await senderSignals.sendSignal({
       target: senderRuntime.agent(recipient.agentId),
-      message: "QUEUED_DURING_RESULT_PENDING",
+      message: "PENDING_DURING_RESULT_PENDING",
       sourceEntryId: pendingResultSource,
     });
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(batches.length, 0, "InboxBatch must not precede original tool-result evidence");
 
     assert.equal(ownerRuntime.confirmHumanResponseResult(recipientRun, "ask-1")?.status, "consumed");
-    recipientSignals.releaseDeferred();
+    recipientSignals.reevaluateInboxEligibility();
     await waitFor(() => batches.length === 1);
     assert.deepEqual(
       batches[0].messages.map((message) => message.message),
-      ["QUEUED_UNTIL_HUMAN_RESUME", "QUEUED_DURING_RESULT_PENDING"],
+      ["PENDING_UNTIL_HUMAN_RESUME", "PENDING_DURING_RESULT_PENDING"],
     );
-    recipientSignals.releaseDeferred();
+    recipientSignals.reevaluateInboxEligibility();
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(batches.length, 1, "eligible input must release exactly once");
 
@@ -938,11 +938,11 @@ describe("direct Signal protocol scenarios", () => {
       allocateMessageId: () => scenario.identities.next(),
     });
     const sourceEntryId = scenario.transcripts.appendAgentSend(senderSession, {
-      targetAgentId: recipient.agentId, message: "QUEUED_UNTIL_REPLAYED_RESULT",
+      targetAgentId: recipient.agentId, message: "PENDING_UNTIL_REPLAYED_RESULT",
     });
     await senderSignals.sendSignal({
       target: senderRuntime.agent(recipient.agentId),
-      message: "QUEUED_UNTIL_REPLAYED_RESULT",
+      message: "PENDING_UNTIL_REPLAYED_RESULT",
       sourceEntryId,
     });
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -953,9 +953,9 @@ describe("direct Signal protocol scenarios", () => {
     assert.equal(batches.length, 0, "InboxBatch must not precede replayed tool-result evidence");
 
     assert.equal(ownerRuntime.confirmHumanResponseResult(recoveredRecipientRun, "ask-1")?.status, "consumed");
-    recipientSignals.releaseDeferred();
+    recipientSignals.reevaluateInboxEligibility();
     await waitFor(() => batches.length === 1);
-    recipientSignals.releaseDeferred();
+    recipientSignals.reevaluateInboxEligibility();
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(batches.length, 1, "recovery must not duplicate the eligible release");
 
@@ -1023,8 +1023,8 @@ describe("direct Signal protocol scenarios", () => {
     const secondAnswer = await secondMessages.sendMessage({
       target: { requestId: firstRequest.messageId }, message: "second answer", sourceEntryId: secondAnswerSource,
     });
-    await waitFor(() => firstMessages.inspectMessage(secondAnswer.messageId)?.deliveryStatus === "queued");
-    await waitFor(() => secondMessages.inspectMessage(firstAnswer.messageId)?.deliveryStatus === "queued");
+    await waitFor(() => firstMessages.inspectMessage(secondAnswer.messageId)?.deliveryStatus === "accepted");
+    await waitFor(() => secondMessages.inspectMessage(firstAnswer.messageId)?.deliveryStatus === "accepted");
     assert.equal(firstMessages.confirmDelivery(secondAnswer.messageId), true);
     assert.equal(secondMessages.confirmDelivery(firstAnswer.messageId), true);
     assert.equal(firstMessages.inspectRequest(firstRequest.messageId)?.status, "resolved");
@@ -1223,7 +1223,7 @@ describe("direct Signal protocol scenarios", () => {
     });
 
     assert.equal(preparations, 1);
-    assert.equal(receipt.status, "queued");
+    assert.equal(receipt.status, "accepted");
     assert.deepEqual(runtime.inspectActivation(runtime.agent(recipient.agentId))?.state, {
       kind: "waiting", dependencies: [{ kind: "operation", dependencyId: "acceptance:pre-reactivation" }],
     });
@@ -1546,7 +1546,7 @@ describe("direct Signal protocol scenarios", () => {
       messageId: message.messageId,
       deliveryStatus: message.deliveryStatus,
       acceptanceSequence: message.acceptanceSequence,
-    })), [{ messageId: first.messageId, deliveryStatus: "queued", acceptanceSequence: 1 }]);
+    })), [{ messageId: first.messageId, deliveryStatus: "accepted", acceptanceSequence: 1 }]);
 
     await senderSignals.close();
     store.unregisterRouter(runtime.agent(recipient.agentId), endpoint);
@@ -1655,14 +1655,21 @@ describe("direct Signal protocol scenarios", () => {
     });
     assert.equal(batches.length, 0);
     assert.deepEqual([first.acceptanceSequence, second.acceptanceSequence], [1, 2]);
+    assert.equal(ownerSignals.inspectMessage(first.messageId)?.deliveryStatus, "accepted");
+    assert.equal(ownerSignals.inspectMessage(second.messageId)?.deliveryStatus, "accepted");
 
     ownerRuntime.settleActivation(recipientRun);
-    recipientSignals.releaseDeferred();
+    recipientSignals.reevaluateInboxEligibility();
     await waitFor(() => batches.length === 1);
     assert.equal(batches[0].deliveryTiming, "deferred");
     assert.deepEqual(batches[0].messages.map((message) => message.messageId), [first.messageId, second.messageId]);
     assert.deepEqual(batches[0].messages.map((message) => message.message), ["first deferred", "second deferred"]);
-    for (const message of batches[0].messages) assert.equal(recipientSignals.confirmDelivery(message.messageId), true);
+    assert.equal(ownerSignals.inspectMessage(first.messageId)?.deliveryStatus, "accepted");
+    assert.equal(ownerSignals.inspectMessage(second.messageId)?.deliveryStatus, "accepted");
+    assert.equal(recipientSignals.confirmDelivery(first.messageId), true);
+    assert.equal(recipientSignals.confirmDelivery(second.messageId), true);
+    assert.equal(ownerSignals.inspectMessage(first.messageId)?.deliveryStatus, "delivered");
+    assert.equal(ownerSignals.inspectMessage(second.messageId)?.deliveryStatus, "delivered");
     assert.deepEqual(recipientSignals.listPending(recipientRuntime.agent(recipient.agentId)), []);
 
     await ownerSignals.close();
@@ -1695,6 +1702,8 @@ describe("direct Signal protocol scenarios", () => {
     const deferred = await ownerSignals.sendSignal({
       target: ownerRuntime.agent(recipient.agentId), message: "deferred", sourceEntryId: deferredSource, deliveryTiming: "deferred",
     });
+    assert.equal(ownerSignals.inspectMessage(deferred.messageId)?.deliveryStatus, "accepted");
+    assert.equal(batches.length, 0, "accepted Deferred work remains ineligible while the recipient is active");
     const steerSource = scenario.transcripts.appendAgentSend(ownerSession, {
       targetAgentId: recipient.agentId, message: "steer", timing: "steer",
     });
@@ -1703,12 +1712,15 @@ describe("direct Signal protocol scenarios", () => {
     });
     await waitFor(() => batches.length === 1);
     assert.deepEqual(batches[0].messages.map((message) => message.messageId), [steer.messageId]);
+    assert.equal(ownerSignals.inspectMessage(deferred.messageId)?.deliveryStatus, "accepted");
     assert.equal(recipientSignals.confirmDelivery(steer.messageId), true);
     ownerRuntime.settleActivation(recipientRun);
-    recipientSignals.releaseDeferred();
+    recipientSignals.reevaluateInboxEligibility();
     await waitFor(() => batches.length === 2);
     assert.deepEqual(batches[1].messages.map((message) => message.messageId), [deferred.messageId]);
+    assert.equal(ownerSignals.inspectMessage(deferred.messageId)?.deliveryStatus, "accepted");
     assert.equal(recipientSignals.confirmDelivery(deferred.messageId), true);
+    assert.equal(ownerSignals.inspectMessage(deferred.messageId)?.deliveryStatus, "delivered");
 
     await ownerSignals.close();
     await recipientSignals.close();
@@ -1760,7 +1772,7 @@ describe("direct Signal protocol scenarios", () => {
     ownerRuntime.close();
   });
 
-  it("retains a queued pointer when projection fails and recovers it after restart", async (test) => {
+  it("retains a pending pointer when projection fails and recovers it after restart", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime: ownerRuntime } = scenario.createOwner();
     const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
@@ -1782,7 +1794,7 @@ describe("direct Signal protocol scenarios", () => {
     );
     const receipt = await ownerSignals.sendSignal({ target: ownerRuntime.agent(recipient.agentId), message: "recover me", sourceEntryId });
     await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(failingRouter.inspectMessage(receipt.messageId)?.deliveryStatus, "queued");
+    assert.equal(failingRouter.inspectMessage(receipt.messageId)?.deliveryStatus, "accepted");
     await failingRouter.close();
     const recovered: InboxBatch[] = [];
     const recoveredRouter = directSignalRuntime(test, {

@@ -26,7 +26,7 @@ import {
 import {
   DirectSignalRuntime,
   type InboxBatch,
-  type QueuedSignalReceipt,
+  type DurableAcceptanceReceipt,
 } from "./direct-signal.ts";
 import {
   awaitProvisionalSpawnCommit,
@@ -456,7 +456,7 @@ export class WorkflowBootstrap {
     message: string;
     sourceEntryId: string;
     deliveryTiming?: "steer" | "deferred";
-  }): Promise<QueuedSignalReceipt> {
+  }): Promise<DurableAcceptanceReceipt> {
     const controlPlane = this.#requireControlPlane();
     return this.#directSignalRuntime().sendSignal({
       target: controlPlane.agent(input.targetAgentId),
@@ -474,7 +474,7 @@ export class WorkflowBootstrap {
     responseRequired?: boolean;
     onAccepted: "continue" | "complete";
     prepareEndedRecipient?: Parameters<DirectSignalRuntime["sendMessage"]>[0]["prepareEndedRecipient"];
-  }): Promise<QueuedSignalReceipt> {
+  }): Promise<DurableAcceptanceReceipt> {
     return this.#directSignalRuntime().sendMessage(input);
   }
 
@@ -518,8 +518,8 @@ export class WorkflowBootstrap {
     return this.#directSignalRuntime().confirmDelivery(messageId);
   }
 
-  releaseDeferredSignals(): void {
-    this.#directSignals?.releaseDeferred();
+  reevaluateInboxEligibility(): void {
+    this.#directSignals?.reevaluateInboxEligibility();
   }
 
   async closeDirectSignalRouter(): Promise<void> {
@@ -647,9 +647,9 @@ export class WorkflowBootstrap {
     return controlPlane.confirmUndeclaredNotice(controlPlane.currentAgent, episodeId);
   }
 
-  queueUndeclaredNotice(episodeId: string) {
+  acceptUndeclaredNotice(episodeId: string) {
     const controlPlane = this.#requireControlPlane();
-    return controlPlane.queueUndeclaredNotice(controlPlane.currentAgent, episodeId);
+    return controlPlane.acceptUndeclaredNotice(controlPlane.currentAgent, episodeId);
   }
 
   requestInterruption(ownership: AgentRunOwnership): InterruptionRequest {

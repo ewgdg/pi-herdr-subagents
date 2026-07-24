@@ -164,7 +164,7 @@ describe("canonical activation lifecycle scenarios", () => {
     runtime.close();
   });
 
-  it("retains an undeclared notice as queued until transcript evidence confirms delivery", async () => {
+  it("retains an undeclared notice as accepted until transcript evidence confirms delivery", async () => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime } = scenario.createOwner();
     const session = scenario.childSession(runtime, "worker");
@@ -174,8 +174,8 @@ describe("canonical activation lifecycle scenarios", () => {
     runtime.settleActivation(run);
 
     const episode = runtime.pendingUndeclaredNotice(reference)!;
-    assert.equal(episode.noticeQueued, false);
-    assert.equal(runtime.queueUndeclaredNotice(reference, episode.episodeId)?.noticeQueued, true);
+    assert.equal(episode.noticeAccepted, false);
+    assert.equal(runtime.acceptUndeclaredNotice(reference, episode.episodeId)?.noticeAccepted, true);
     assert.equal(runtime.inspectUndeclaredEpisode(reference)?.noticeDelivered, false);
     assert.equal(runtime.confirmUndeclaredNotice(reference, episode.episodeId), true);
     assert.equal(runtime.inspectUndeclaredEpisode(reference)?.noticeDelivered, true);

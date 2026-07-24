@@ -8,6 +8,7 @@ import {
 import type {
   AcceptedSignal,
   DirectSignalRecord,
+  DurableAcceptanceReceipt,
   PendingMessagePointer,
   RequestCancellationReceipt,
   RequestRecord,
@@ -30,7 +31,7 @@ interface MessageRow {
   on_accepted: "continue" | "complete";
   reactivates_recipient: number;
   in_reply_to_request_id: string | null; acceptance_sequence: number | null;
-  delivery_status: "bound" | "queued" | "delivered" | "suppressed"; created_at_ms: number;
+  delivery_status: "bound" | "accepted" | "delivered" | "suppressed"; created_at_ms: number;
   accepted_at_ms: number | null; delivered_at_ms: number | null;
   protocol_notice_kind: "request-cancelled" | null; canonical_request_id: string | null;
   activation_notice_kind: "request-orphaned" | null; activation_notice_request_id: string | null;
@@ -55,12 +56,12 @@ interface RequestRow {
   cancelled_at_ms: number | null;
   cancellation_notice_message_id: string | null;
   cancellation_notice_payload: string | null;
-  cancellation_notice_delivery_status: "queued" | "delivered" | null;
+  cancellation_notice_delivery_status: "accepted" | "delivered" | null;
   cancellation_notice_delivered_at_ms: number | null;
   orphaned_at_ms: number | null;
   orphan_notice_message_id: string | null;
   orphan_notice_payload: string | null;
-  orphan_notice_delivery_status: "queued" | "delivered" | null;
+  orphan_notice_delivery_status: "accepted" | "delivered" | null;
   orphan_notice_delivered_at_ms: number | null;
 }
 export interface SpawnedInitialRequestInput {
@@ -82,7 +83,7 @@ export interface SpawnedInitialRequestInput {
   createdAtMs: number;
 }
 
-export interface SpawnedInitialRequestReceipt extends QueuedSignalReceipt {
+export interface SpawnedInitialRequestReceipt extends DurableAcceptanceReceipt {
   childAgentId: string;
   runId: string;
   fencingEpoch: number;
@@ -107,7 +108,7 @@ export interface EndedRecipientRequestInput {
   acceptedAtMs: number;
 }
 
-export interface EndedRecipientRequestReceipt extends QueuedSignalReceipt {
+export interface EndedRecipientRequestReceipt extends DurableAcceptanceReceipt {
   ownership: AgentRunOwnership;
   committedByThisPreparation: boolean;
 }
@@ -273,7 +274,7 @@ export class DirectSignalStore {
     });
   }
 
-  reconcileAcceptedMessage(sender: AgentReference, messageId: string, ownership?: AgentRunOwnership): QueuedSignalReceipt | undefined {
+  reconcileAcceptedMessage(sender: AgentReference, messageId: string, ownership?: AgentRunOwnership): DurableAcceptanceReceipt | undefined {
     return this.#withTransaction(() => {
       this.#assertWorkflow(sender.workflowOwnerId);
       const message = this.#readMessage(messageId);
@@ -380,7 +381,7 @@ export class DirectSignalStore {
    */
   reconcileSpawnedInitialRequest(
     input: SpawnedInitialRequestReconciliation,
-  ): QueuedSignalReceipt | undefined {
+  ): DurableAcceptanceReceipt | undefined {
     this.#assertWorkflow(input.spawner.workflowOwnerId);
     const existing = this.#readMessageBySource(input.spawner.agentId, input.sourceEntryId);
     if (!existing) return undefined;
@@ -440,18 +441,18 @@ export class DirectSignalStore {
       const sequence = this.#nextAcceptanceSequence(input.recipient.agentId);
       if (existing) {
         this.#database.prepare(`UPDATE direct_signal_messages
-          SET acceptance_sequence = ?, delivery_status = 'queued', accepted_at_ms = ?, reactivates_recipient = 1
+          SET acceptance_sequence = ?, delivery_status = 'accepted', accepted_at_ms = ?, reactivates_recipient = 1
           WHERE message_id = ? AND delivery_status = 'bound'`).run(sequence, input.acceptedAtMs, existing.message_id);
       } else {
         this.#database.prepare(`INSERT INTO direct_signal_messages (message_id, sender_agent_id, recipient_agent_id, source_entry_id, payload_digest, delivery_timing, response_required, reactivates_recipient, in_reply_to_request_id, acceptance_sequence, delivery_status, created_at_ms, accepted_at_ms, delivered_at_ms)
-          VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, 'queued', ?, ?, NULL)`).run(input.request.messageId, input.request.senderAgentId, input.request.recipientAgentId, input.request.sourceEntryId, input.request.payloadDigest, input.request.deliveryTiming, input.request.inReplyToRequestId ?? null, sequence, input.acceptedAtMs, input.acceptedAtMs);
+          VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, 'accepted', ?, ?, NULL)`).run(input.request.messageId, input.request.senderAgentId, input.request.recipientAgentId, input.request.sourceEntryId, input.request.payloadDigest, input.request.deliveryTiming, input.request.inReplyToRequestId ?? null, sequence, input.acceptedAtMs, input.acceptedAtMs);
       }
       if (input.request.inReplyToRequestId) this.#claimAnswerSlot(input.request);
       this.#createRequest(input.request);
       this.#database.prepare(`INSERT INTO pending_message_pointers (message_id, sender_agent_id, recipient_agent_id, source_entry_id, payload_digest, delivery_timing, response_required, reactivates_recipient, in_reply_to_request_id, acceptance_sequence, accepted_at_ms)
         VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)`).run(input.request.messageId, input.request.senderAgentId, input.request.recipientAgentId, input.request.sourceEntryId, input.request.payloadDigest, input.request.deliveryTiming, input.request.inReplyToRequestId ?? null, sequence, input.acceptedAtMs);
       return {
-        status: "queued", messageId: input.request.messageId, recipientAgentId: input.recipient.agentId, acceptanceSequence: sequence,
+        status: "accepted", messageId: input.request.messageId, recipientAgentId: input.recipient.agentId, acceptanceSequence: sequence,
         ownership,
         committedByThisPreparation: true,
       };
@@ -509,7 +510,7 @@ export class DirectSignalStore {
 
       if (input.request.inReplyToRequestId) this.#claimAnswerSlot(input.request);
       const sequence = this.#nextAcceptanceSequence(input.recipient.agentId);
-      this.#database.prepare(`UPDATE direct_signal_messages SET acceptance_sequence = ?, delivery_status = 'queued', accepted_at_ms = ?, reactivates_recipient = ? WHERE message_id = ? AND delivery_status = 'bound'`).run(sequence, input.acceptedAtMs, reactivatesRecipient ? 1 : 0, input.request.messageId);
+      this.#database.prepare(`UPDATE direct_signal_messages SET acceptance_sequence = ?, delivery_status = 'accepted', accepted_at_ms = ?, reactivates_recipient = ? WHERE message_id = ? AND delivery_status = 'bound'`).run(sequence, input.acceptedAtMs, reactivatesRecipient ? 1 : 0, input.request.messageId);
       this.#database.prepare(`DELETE FROM activation_dependencies WHERE dependency_kind = 'operation'
         AND dependency_id = ? AND activation_id IN (SELECT activation_id FROM agent_activations WHERE agent_id = ?)`
       ).run(`acceptance:${input.request.messageId}`, input.request.senderAgentId);
@@ -533,7 +534,7 @@ export class DirectSignalStore {
           kind: "terminal-message", messageId: input.request.messageId, sourceEntryId: input.request.sourceEntryId,
         }, input.acceptedAtMs);
       }
-      return { receipt: { status: "queued", messageId: input.request.messageId, recipientAgentId: input.request.recipientAgentId, acceptanceSequence: sequence }, delivery: "schedule" };
+      return { receipt: { status: "accepted", messageId: input.request.messageId, recipientAgentId: input.request.recipientAgentId, acceptanceSequence: sequence }, delivery: "schedule" };
     });
   }
 
@@ -548,9 +549,9 @@ export class DirectSignalStore {
       if (Number(removed.changes) !== 1) throw new Error(`Pending pointer is missing for Message ${input.messageId}`);
       const delivered = this.#database.prepare(`UPDATE direct_signal_messages
         SET delivery_status = 'delivered', delivered_at_ms = ?, projection_claimed = 1, projection_committed = 1
-        WHERE message_id = ? AND delivery_status = 'queued'`
+        WHERE message_id = ? AND delivery_status = 'accepted'`
       ).run(input.deliveredAtMs, input.messageId);
-      if (Number(delivered.changes) !== 1) throw new Error(`Message ${input.messageId} could not transition from queued to delivered`);
+      if (Number(delivered.changes) !== 1) throw new Error(`Message ${input.messageId} could not transition from accepted to delivered`);
       if (input.ownership) {
         recordRecoveryContinuationEvidence(this.#database, {
           activationId: input.ownership.runId,
@@ -563,7 +564,7 @@ export class DirectSignalStore {
         const updated = this.#database.prepare(`UPDATE workflow_requests
           SET cancellation_notice_delivery_status = 'delivered', cancellation_notice_delivered_at_ms = ?
           WHERE request_id = ? AND status = 'cancelled' AND cancellation_notice_message_id = ?
-            AND cancellation_notice_delivery_status = 'queued'`
+            AND cancellation_notice_delivery_status = 'accepted'`
         ).run(input.deliveredAtMs, message.canonical_request_id, message.message_id);
         if (Number(updated.changes) !== 1) {
           throw new Error(`Cancellation notice ${message.message_id} no longer belongs to Request ${message.canonical_request_id}`);
@@ -573,7 +574,7 @@ export class DirectSignalStore {
         const updated = this.#database.prepare(`UPDATE workflow_requests
           SET orphan_notice_delivery_status = 'delivered', orphan_notice_delivered_at_ms = ?
           WHERE request_id = ? AND status = 'orphaned' AND orphan_notice_message_id = ?
-            AND orphan_notice_delivery_status = 'queued'`
+            AND orphan_notice_delivery_status = 'accepted'`
         ).run(input.deliveredAtMs, message.activation_notice_request_id, message.message_id);
         if (Number(updated.changes) !== 1) {
           throw new Error(`Orphan notice ${message.message_id} no longer belongs to Request ${message.activation_notice_request_id}`);
@@ -669,7 +670,7 @@ export class DirectSignalStore {
       for (const messageId of input.messageIds) {
         this.#database.prepare(`UPDATE direct_signal_messages
           SET projection_claimed = 0, projection_committed = 0
-          WHERE message_id = ? AND recipient_agent_id = ? AND delivery_status = 'queued'
+          WHERE message_id = ? AND recipient_agent_id = ? AND delivery_status = 'accepted'
             AND projection_claimed = 1 AND EXISTS (
               SELECT 1 FROM pending_message_pointers WHERE pending_message_pointers.message_id = direct_signal_messages.message_id
             )`
@@ -692,7 +693,7 @@ export class DirectSignalStore {
         SELECT 1 FROM direct_signal_messages m
         JOIN pending_message_pointers p ON p.message_id = m.message_id
         WHERE m.message_id = ? AND m.recipient_agent_id = ?
-          AND m.delivery_status = 'queued' AND m.projection_claimed = 0
+          AND m.delivery_status = 'accepted' AND m.projection_claimed = 0
       `).get(messageId, input.recipient.agentId)));
       if (selected.length === 0) return [];
 
@@ -700,7 +701,7 @@ export class DirectSignalStore {
         const projectionClaim = this.#database.prepare(`UPDATE direct_signal_messages
           SET projection_claimed = 1
           WHERE message_id = ? AND recipient_agent_id = ?
-            AND delivery_status = 'queued' AND projection_claimed = 0`
+            AND delivery_status = 'accepted' AND projection_claimed = 0`
         ).run(messageId, input.recipient.agentId);
         if (Number(projectionClaim.changes) !== 1) throw new Error(`Message ${messageId} lost its Inbox projection claim`);
       }
@@ -714,7 +715,7 @@ export class DirectSignalStore {
         SELECT 1 FROM direct_signal_messages m
         JOIN pending_message_pointers p ON p.message_id = m.message_id
         WHERE m.message_id = ? AND m.recipient_agent_id = ?
-          AND m.delivery_status = 'queued' AND m.projection_claimed = 1 AND m.projection_committed = 0
+          AND m.delivery_status = 'accepted' AND m.projection_claimed = 1 AND m.projection_committed = 0
       `).get(messageId, input.recipient.agentId)));
       if (selected.length === 0) return [];
 
@@ -726,7 +727,7 @@ export class DirectSignalStore {
         const projected = this.#database.prepare(`UPDATE direct_signal_messages
           SET projection_committed = 1
           WHERE message_id = ? AND recipient_agent_id = ?
-            AND delivery_status = 'queued' AND projection_claimed = 1 AND projection_committed = 0`
+            AND delivery_status = 'accepted' AND projection_claimed = 1 AND projection_committed = 0`
         ).run(messageId, input.recipient.agentId);
         if (Number(projected.changes) !== 1) throw new Error(`Message ${messageId} lost its Inbox projection commit`);
       }
@@ -827,7 +828,7 @@ export class DirectSignalStore {
         response_required INTEGER NOT NULL CHECK (response_required IN (0, 1)),
         on_accepted TEXT NOT NULL DEFAULT 'continue' CHECK (on_accepted IN ('continue', 'complete')),
         reactivates_recipient INTEGER NOT NULL DEFAULT 0 CHECK (reactivates_recipient IN (0, 1)), in_reply_to_request_id TEXT,
-        acceptance_sequence INTEGER, delivery_status TEXT NOT NULL CHECK (delivery_status IN ('bound', 'queued', 'delivered', 'suppressed')),
+        acceptance_sequence INTEGER, delivery_status TEXT NOT NULL CHECK (delivery_status IN ('bound', 'accepted', 'delivered', 'suppressed')),
         created_at_ms INTEGER NOT NULL, accepted_at_ms INTEGER, delivered_at_ms INTEGER,
         protocol_notice_kind TEXT CHECK (protocol_notice_kind IN ('request-cancelled')),
         canonical_request_id TEXT REFERENCES workflow_requests(request_id),
@@ -837,7 +838,7 @@ export class DirectSignalStore {
         projection_committed INTEGER NOT NULL DEFAULT 0 CHECK (projection_committed IN (0, 1)),
         UNIQUE (sender_agent_id, source_entry_id),
         CHECK ((delivery_status = 'bound' AND acceptance_sequence IS NULL AND accepted_at_ms IS NULL AND delivered_at_ms IS NULL)
-          OR (delivery_status = 'queued' AND acceptance_sequence IS NOT NULL AND accepted_at_ms IS NOT NULL AND delivered_at_ms IS NULL)
+          OR (delivery_status = 'accepted' AND acceptance_sequence IS NOT NULL AND accepted_at_ms IS NOT NULL AND delivered_at_ms IS NULL)
           OR (delivery_status = 'delivered' AND acceptance_sequence IS NOT NULL AND accepted_at_ms IS NOT NULL AND delivered_at_ms IS NOT NULL)
           OR (delivery_status = 'suppressed' AND acceptance_sequence IS NOT NULL AND accepted_at_ms IS NOT NULL AND delivered_at_ms IS NULL)),
         CHECK ((protocol_notice_kind IS NULL AND canonical_request_id IS NULL)
@@ -951,7 +952,7 @@ export class DirectSignalStore {
   #transferRecoveryRequests(previousActivationId: string, replacementActivationId: string): void {
     this.#database.prepare(`UPDATE workflow_requests SET requester_activation_id = ?
       WHERE requester_activation_id = ? AND (status IN ('open', 'answered')
-        OR (status = 'orphaned' AND orphan_notice_delivery_status = 'queued'))`
+        OR (status = 'orphaned' AND orphan_notice_delivery_status = 'accepted'))`
     ).run(replacementActivationId, previousActivationId);
     this.#database.prepare(`UPDATE workflow_requests SET responder_activation_id = ?
       WHERE responder_activation_id = ? AND status = 'open'`
@@ -1078,12 +1079,12 @@ function cancellationReceipt(row: RequestRow): RequestCancellationReceipt {
   return {
     requestId: row.request_id,
     status: "cancelled",
-    delivery: row.cancellation_notice_delivery_status === "delivered" ? "notice-delivered" : "notice-queued",
+    delivery: row.cancellation_notice_delivery_status === "delivered" ? "notice-delivered" : "notice-accepted",
     noticeMessageId: row.cancellation_notice_message_id,
   };
 }
 
-function receiptFor(row: MessageRow) { if (row.acceptance_sequence == null) throw new Error(`Unaccepted Message ${row.message_id} has no receipt`); return { status: row.delivery_status === "delivered" ? "delivered" as const : "queued" as const, messageId: row.message_id, recipientAgentId: row.recipient_agent_id, acceptanceSequence: Number(row.acceptance_sequence) }; }
+function receiptFor(row: MessageRow) { if (row.acceptance_sequence == null) throw new Error(`Unaccepted Message ${row.message_id} has no receipt`); return { status: row.delivery_status === "delivered" ? "delivered" as const : "accepted" as const, messageId: row.message_id, recipientAgentId: row.recipient_agent_id, acceptanceSequence: Number(row.acceptance_sequence) }; }
 function assertSameBinding(row: MessageRow, request: { sender: AgentReference; recipient: AgentReference; sourceEntryId: string; payloadDigest: string; deliveryTiming: SignalDeliveryTiming; responseRequired: boolean; inReplyToRequestId?: string; onAccepted?: "continue" | "complete" } | SignalAcceptRequest): void {
   const sender = "sender" in request ? request.sender.agentId : request.senderAgentId; const recipient = "recipient" in request ? request.recipient.agentId : request.recipientAgentId;
   const matches = row.sender_agent_id === sender && row.recipient_agent_id === recipient && row.source_entry_id === request.sourceEntryId && row.payload_digest === request.payloadDigest && row.delivery_timing === request.deliveryTiming && Number(row.response_required) === (request.responseRequired ? 1 : 0) && row.in_reply_to_request_id === (request.inReplyToRequestId ?? null) && row.on_accepted === (request.onAccepted ?? "continue");

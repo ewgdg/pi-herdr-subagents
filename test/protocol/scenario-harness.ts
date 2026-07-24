@@ -512,8 +512,8 @@ export class ControllableRuntimeAdapter {
     return this.#controlPlane.confirmUndeclaredNotice(reference, episodeId);
   }
 
-  queueUndeclaredNotice(reference: AgentReference, episodeId: string) {
-    return this.#controlPlane.queueUndeclaredNotice(reference, episodeId);
+  acceptUndeclaredNotice(reference: AgentReference, episodeId: string) {
+    return this.#controlPlane.acceptUndeclaredNotice(reference, episodeId);
   }
 
   inspectUndeclaredEpisode(reference: AgentReference) {
