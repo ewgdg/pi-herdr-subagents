@@ -2,7 +2,7 @@
 name: reviewer
 description: Code review agent - reviews changes for quality, security, and correctness
 tools: read, bash
-spawning: false
+delegation-policy: disabled
 auto-exit: true
 system-prompt: append
 ---

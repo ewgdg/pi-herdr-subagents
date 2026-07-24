@@ -25,6 +25,7 @@ describe("Spawned Initial Request", () => {
     const child = scenario.childSession(runtime, "worker");
     const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
       targetSpawn: { agent: "worker", name: "Worker" },
+      activationIntent: "Investigate failing test",
       message: "Investigate the failing test.",
     });
     const messageId = scenario.identities.next();
@@ -40,6 +41,7 @@ describe("Spawned Initial Request", () => {
       messageId,
       sourceEntryId,
       message: "Investigate the failing test.",
+      activationIntent: "Investigate failing test",
       agentDefinition: "worker",
       name: "Worker",
       launchPolicy,
@@ -51,6 +53,7 @@ describe("Spawned Initial Request", () => {
     assert.notEqual(receipt.messageId, sourceEntryId);
     assert.equal(runtime.directChildren(runtime.agent(runtime.workflow.ownerAgentId)).length, 1);
     assert.equal(runtime.inspect(runtime.agent(child.agentId)).spawnerAgentId, runtime.workflow.ownerAgentId);
+    assert.equal(runtime.inspect(runtime.agent(child.agentId)).delegationPolicy, "approval-required");
     assert.deepEqual(runtime.inspect(runtime.agent(child.agentId)).launchPolicy, launchPolicy);
     assert.equal(runtime.inspectActivation(runtime.agent(child.agentId))?.state.kind, "active");
     assert.deepEqual(runtime.listRequests(runtime.agent(runtime.workflow.ownerAgentId)), [{
@@ -64,11 +67,118 @@ describe("Spawned Initial Request", () => {
     assert.deepEqual(runtime.listPending(runtime.agent(child.agentId)), []);
   });
 
+  it("lets an autonomous ordinary Agent atomically spawn its direct child", async () => {
+    const scenario = await scenarioForTest();
+    const { runtime } = scenario.createOwner();
+    const parentSession = scenario.childSession(runtime, "autonomous-parent");
+    const parent = runtime.addAgent({
+      session: parentSession,
+      spawner: runtime.agent(runtime.workflow.ownerAgentId),
+      name: "Autonomous Parent",
+      delegationPolicy: "autonomous",
+    });
+    runtime.startAgentRun(runtime.agent(parent.agentId));
+    const parentRuntime = scenario.startAgent(runtime.workflow, parentSession);
+    const child = scenario.childSession(parentRuntime, "autonomous-child");
+    const sourceEntryId = scenario.transcripts.appendAgentSend(parentSession, {
+      targetSpawn: { agent: "worker", name: "Nested Worker" },
+      activationIntent: "Handle nested work",
+      message: "Handle nested work.",
+    });
+
+    const receipt = parentRuntime.spawnInitialRequest({
+      child,
+      runId: scenario.identities.next(),
+      messageId: scenario.identities.next(),
+      sourceEntryId,
+      message: "Handle nested work.",
+      activationIntent: "Handle nested work",
+      agentDefinition: "worker",
+      name: "Nested Worker",
+      routerEndpoint: "ready://nested-worker",
+    });
+
+    assert.equal(receipt.status, "delivered");
+    assert.equal(runtime.inspect(runtime.agent(child.agentId)).spawnerAgentId, parent.agentId);
+    parentRuntime.close();
+    runtime.close();
+  });
+
+  it("rejects an ordinary Spawned Initial Request when delegation policy requires approval", async () => {
+    const scenario = await scenarioForTest();
+    const { runtime } = scenario.createOwner();
+    const parentSession = scenario.childSession(runtime, "approval-parent");
+    const parent = runtime.addAgent({
+      session: parentSession,
+      spawner: runtime.agent(runtime.workflow.ownerAgentId),
+      name: "Approval Parent",
+    });
+    const parentRuntime = scenario.startAgent(runtime.workflow, parentSession);
+    const child = scenario.childSession(parentRuntime, "approval-child");
+    const sourceEntryId = scenario.transcripts.appendAgentSend(parentSession, {
+      targetSpawn: { agent: "worker", name: "Held Worker" },
+      activationIntent: "Held nested work",
+      message: "Held nested work.",
+    });
+
+    assert.throws(() => parentRuntime.spawnInitialRequest({
+      child,
+      runId: scenario.identities.next(),
+      messageId: scenario.identities.next(),
+      sourceEntryId,
+      message: "Held nested work.",
+      activationIntent: "Held nested work",
+      agentDefinition: "worker",
+      name: "Held Worker",
+      routerEndpoint: "ready://held-worker",
+    }), isProtocolError("DelegatedActivationApprovalRequired"));
+    assert.equal(runtime.descendants().some((agent) => agent.agentId === child.agentId), false);
+    assert.deepEqual(parentRuntime.listRequests(parentRuntime.agent(parent.agentId)), []);
+    parentRuntime.close();
+    runtime.close();
+  });
+
+  it("rejects an ordinary Spawned Initial Request when delegation policy is disabled", async () => {
+    const scenario = await scenarioForTest();
+    const { runtime } = scenario.createOwner();
+    const parentSession = scenario.childSession(runtime, "disabled-parent");
+    const parent = runtime.addAgent({
+      session: parentSession,
+      spawner: runtime.agent(runtime.workflow.ownerAgentId),
+      name: "Disabled Parent",
+      delegationPolicy: "disabled",
+    });
+    const parentRuntime = scenario.startAgent(runtime.workflow, parentSession);
+    const child = scenario.childSession(parentRuntime, "disabled-child");
+    const sourceEntryId = scenario.transcripts.appendAgentSend(parentSession, {
+      targetSpawn: { agent: "worker", name: "Blocked Worker" },
+      activationIntent: "Blocked nested work",
+      message: "Blocked nested work.",
+    });
+
+    assert.throws(() => parentRuntime.spawnInitialRequest({
+      child,
+      runId: scenario.identities.next(),
+      messageId: scenario.identities.next(),
+      sourceEntryId,
+      message: "Blocked nested work.",
+      activationIntent: "Blocked nested work",
+      agentDefinition: "worker",
+      name: "Blocked Worker",
+      routerEndpoint: "ready://blocked-worker",
+    }), isProtocolError("SpawnerDelegationDisabled"));
+    assert.equal(runtime.descendants().some((agent) => agent.agentId === child.agentId), false);
+    assert.deepEqual(parentRuntime.listRequests(parentRuntime.agent(parent.agentId)), []);
+    parentRuntime.close();
+    runtime.close();
+  });
+
   it("keeps Spawned Request identities Workflow-unique when Agents share a tool-call ID", async () => {
     const scenario = await scenarioForTest();
     const { session: owner, runtime } = scenario.createOwner();
     const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
       targetSpawn: { agent: "worker", name: "Worker" },
+      activationIntent: "Handle shared source identity",
       message: "Shared source identity.",
     });
     const clonedSpawner = scenario.cloneSession(runtime, owner, "cloned-spawner");
@@ -76,6 +186,7 @@ describe("Spawned Initial Request", () => {
       session: clonedSpawner,
       spawner: runtime.agent(runtime.workflow.ownerAgentId),
       name: "Cloned spawner",
+      delegationPolicy: "autonomous",
     });
     const clonedRuntime = scenario.startAgent(runtime.workflow, clonedSpawner);
     runtime.startAgentRun(runtime.agent(clonedSpawner.agentId));
@@ -87,6 +198,7 @@ describe("Spawned Initial Request", () => {
       messageId: scenario.identities.next(),
       sourceEntryId,
       message: "Shared source identity.",
+      activationIntent: "Handle shared source identity",
       agentDefinition: "worker",
       name: "Worker",
       routerEndpoint: "ready://owner-worker",
@@ -97,6 +209,7 @@ describe("Spawned Initial Request", () => {
       messageId: scenario.identities.next(),
       sourceEntryId,
       message: "Shared source identity.",
+      activationIntent: "Handle shared source identity",
       agentDefinition: "worker",
       name: "Worker",
       routerEndpoint: "ready://cloned-worker",
@@ -110,10 +223,10 @@ describe("Spawned Initial Request", () => {
     const { session: owner, runtime } = scenario.createOwner();
     const child = scenario.childSession(runtime, "worker");
     const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
-      targetSpawn: { agent: "worker", name: "Worker" }, message: "Reconcile me.",
+      targetSpawn: { agent: "worker", name: "Worker" }, activationIntent: "Reconcile spawned request", message: "Reconcile me.",
     });
     const receipt = runtime.spawnInitialRequest({
-      child, runId: "committed-run", messageId: scenario.identities.next(), sourceEntryId, message: "Reconcile me.",
+      child, runId: "committed-run", messageId: scenario.identities.next(), sourceEntryId, message: "Reconcile me.", activationIntent: "Reconcile spawned request",
       agentDefinition: "worker", name: "Worker", routerEndpoint: "prepared://worker",
     });
     const store = new DirectSignalStore(runtime.workflow.databasePath);
@@ -153,6 +266,7 @@ describe("Spawned Initial Request", () => {
     const child = scenario.childSession(runtime, "unready-worker");
     const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
       targetSpawn: { agent: "worker", name: "Unready worker" },
+      activationIntent: "Do not start unready worker",
       message: "Do not start.",
     });
 
@@ -162,6 +276,7 @@ describe("Spawned Initial Request", () => {
       messageId: scenario.identities.next(),
       sourceEntryId,
       message: "Do not start.",
+      activationIntent: "Do not start unready worker",
       agentDefinition: "worker",
       name: "Unready worker",
     }), isProtocolError("RecipientUnreachable"));
@@ -175,7 +290,7 @@ describe("Spawned Initial Request", () => {
     const { session: owner, runtime } = scenario.createOwner();
     const child = scenario.childSession(runtime, "rollback-worker");
     const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
-      targetSpawn: { agent: "worker", name: "Rollback worker" }, message: "Rollback this spawn.",
+      targetSpawn: { agent: "worker", name: "Rollback worker" }, activationIntent: "Rollback spawned worker", message: "Rollback this spawn.",
     });
     const messages = new DirectSignalStore(runtime.workflow.databasePath);
     messages.close();
@@ -188,7 +303,7 @@ describe("Spawned Initial Request", () => {
     `);
     try {
       assert.throws(() => runtime.spawnInitialRequest({
-        child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId, message: "Rollback this spawn.",
+        child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId, message: "Rollback this spawn.", activationIntent: "Rollback spawned worker",
         agentDefinition: "worker", name: "Rollback worker", routerEndpoint: "ready://rollback-worker",
       }), /forced spawned Request failure/);
     } finally {
@@ -204,10 +319,10 @@ describe("Spawned Initial Request", () => {
     const { session: owner, runtime } = scenario.createOwner();
     const child = scenario.childSession(runtime, "worker");
     const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
-      targetSpawn: { agent: "worker", name: "Worker" }, message: "Work once.",
+      targetSpawn: { agent: "worker", name: "Worker" }, activationIntent: "Work once", message: "Work once.",
     });
     const input = {
-      child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId, message: "Work once.",
+      child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId, message: "Work once.", activationIntent: "Work once",
       agentDefinition: "worker", name: "Worker", routerEndpoint: "ready://worker",
     };
 
@@ -229,21 +344,21 @@ describe("Spawned Initial Request", () => {
     const { session: owner, runtime } = scenario.createOwner();
     const child = scenario.childSession(runtime, "worker");
     const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
-      targetSpawn: { agent: "worker", name: "Worker" }, message: "Do this once.",
+      targetSpawn: { agent: "worker", name: "Worker", delegationPolicy: "autonomous" }, activationIntent: "Do this once", message: "Do this once.",
     });
 
     assert.equal(runtime.controlPlane.reconcileSpawnedInitialRequest({
-      sourceEntryId: "absent-source", agentDefinition: "worker", name: "Worker", message: "Do this once.",
-      capabilities: { spawning: true },
+      sourceEntryId: "absent-source", agentDefinition: "worker", name: "Worker", message: "Do this once.", activationIntent: "Do this once",
+      delegationPolicy: "autonomous",
     }), undefined);
 
     const receipt = runtime.spawnInitialRequest({
       child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId,
-      message: "Do this once.", agentDefinition: "worker", name: "Worker", routerEndpoint: "ready://worker",
+      message: "Do this once.", activationIntent: "Do this once", agentDefinition: "worker", name: "Worker", delegationPolicy: "autonomous", routerEndpoint: "ready://worker",
     });
     assert.deepEqual(runtime.controlPlane.reconcileSpawnedInitialRequest({
-      sourceEntryId, agentDefinition: "worker", name: "Worker", message: "Do this once.",
-      capabilities: { spawning: true },
+      sourceEntryId, agentDefinition: "worker", name: "Worker", message: "Do this once.", activationIntent: "Do this once",
+      delegationPolicy: "autonomous",
     }), {
       status: "delivered", messageId: receipt.messageId, recipientAgentId: child.agentId, acceptanceSequence: 1,
     });
@@ -256,11 +371,11 @@ describe("Spawned Initial Request", () => {
     runtime.controlPlane.startActivation(second);
     assert.equal(runtime.inspectActivation(runtime.agent(child.agentId))?.sequence, 2);
     assert.deepEqual(runtime.controlPlane.reconcileSpawnedInitialRequest({
-      sourceEntryId, agentDefinition: "worker", name: "Worker", message: "Do this once.", capabilities: { spawning: true },
+      sourceEntryId, agentDefinition: "worker", name: "Worker", message: "Do this once.", activationIntent: "Do this once", delegationPolicy: "autonomous",
     }), { status: "delivered", messageId: receipt.messageId, recipientAgentId: child.agentId, acceptanceSequence: 1 });
     assert.throws(() => runtime.controlPlane.reconcileSpawnedInitialRequest({
-      sourceEntryId, agentDefinition: "worker", name: "Worker", message: "Do this once.",
-      capabilities: { spawning: false },
+      sourceEntryId, agentDefinition: "worker", name: "Worker", message: "Do this once.", activationIntent: "Do this once",
+      delegationPolicy: "disabled",
     }), isProtocolError("MessageIdentityConflict"));
 
     for (const changed of [
@@ -268,7 +383,7 @@ describe("Spawned Initial Request", () => {
       { agentDefinition: "worker", name: "Other Worker", message: "Do this once." },
       { agentDefinition: "worker", name: "Worker", message: "Do something else." },
     ]) {
-      assert.throws(() => runtime.controlPlane.reconcileSpawnedInitialRequest({ sourceEntryId, ...changed, capabilities: { spawning: true } }), isProtocolError("MessageIdentityConflict"));
+      assert.throws(() => runtime.controlPlane.reconcileSpawnedInitialRequest({ sourceEntryId, ...changed, activationIntent: "Do this once", delegationPolicy: "autonomous" }), isProtocolError("MessageIdentityConflict"));
     }
   });
 
@@ -290,7 +405,8 @@ describe("Spawned Initial Request", () => {
 
     assert.throws(() => runtime.controlPlane.reconcileSpawnedInitialRequest({
       sourceEntryId, agentDefinition: "worker", name: "Worker", message: "Ordinary Request.",
-      capabilities: { spawning: true },
+      activationIntent: "Ordinary request",
+      delegationPolicy: "autonomous",
     }), isProtocolError("MessageIdentityConflict"));
   });
 
@@ -299,10 +415,10 @@ describe("Spawned Initial Request", () => {
     const { session: owner, runtime } = scenario.createOwner();
     const child = scenario.childSession(runtime, "worker");
     const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
-      targetSpawn: { agent: "worker", name: "Worker" }, message: "Persist identity.",
+      targetSpawn: { agent: "worker", name: "Worker" }, activationIntent: "Persist identity", message: "Persist identity.",
     });
     runtime.spawnInitialRequest({
-      child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId, message: "Persist identity.",
+      child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId, message: "Persist identity.", activationIntent: "Persist identity",
       agentDefinition: "worker", name: "Worker", routerEndpoint: "ready://worker",
     });
 
@@ -316,10 +432,10 @@ describe("Spawned Initial Request", () => {
     const { session: owner, runtime } = scenario.createOwner();
     const child = scenario.childSession(runtime, "worker");
     const initialSource = scenario.transcripts.appendAgentSend(owner, {
-      targetSpawn: { agent: "worker", name: "Worker" }, message: "Initial work.",
+      targetSpawn: { agent: "worker", name: "Worker" }, activationIntent: "Initial work", message: "Initial work.",
     });
     runtime.spawnInitialRequest({
-      child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId: initialSource, message: "Initial work.",
+      child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId: initialSource, message: "Initial work.", activationIntent: "Initial work",
       agentDefinition: "worker", name: "Worker", routerEndpoint: "ready://worker",
     });
     const childRuntime = scenario.startAgent(runtime.workflow, child);
@@ -368,10 +484,10 @@ describe("Spawned Initial Request", () => {
     const { session: owner, runtime } = scenario.createOwner();
     const child = scenario.childSession(runtime, "worker");
     const initialSource = scenario.transcripts.appendAgentSend(owner, {
-      targetSpawn: { agent: "worker", name: "Worker" }, message: "Initial work.",
+      targetSpawn: { agent: "worker", name: "Worker" }, activationIntent: "Initial work", message: "Initial work.",
     });
     runtime.spawnInitialRequest({
-      child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId: initialSource, message: "Initial work.",
+      child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId: initialSource, message: "Initial work.", activationIntent: "Initial work",
       agentDefinition: "worker", name: "Worker", routerEndpoint: "ready://worker",
     });
     const peerSession = scenario.childSession(runtime, "peer");
@@ -418,48 +534,44 @@ describe("Spawned Initial Request", () => {
     const { session: owner, runtime } = scenario.createOwner();
     const child = scenario.childSession(runtime, "worker");
     const initialSource = scenario.transcripts.appendAgentSend(owner, {
-      targetSpawn: { agent: "worker", name: "Worker" }, message: "Initial work.",
+      targetSpawn: { agent: "worker", name: "Worker" }, activationIntent: "Initial work", message: "Initial work.",
     });
     runtime.spawnInitialRequest({
-      child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId: initialSource, message: "Initial work.",
+      child, runId: scenario.identities.next(), messageId: scenario.identities.next(), sourceEntryId: initialSource, message: "Initial work.", activationIntent: "Initial work",
       agentDefinition: "worker", name: "Worker", routerEndpoint: "ready://worker",
     });
-    const childRuntime = scenario.startAgent(runtime.workflow, child);
     const firstOwnership = runtime.currentAgentRun(runtime.agent(child.agentId))!;
-    const firstRouter = new DirectSignalRuntime({
-      controlPlane: childRuntime.controlPlane, ownership: firstOwnership,
-      projectInboxBatch() {}, hasProjectedMessage() { return true; }, now: scenario.clock.now,
-    });
     const ownerMessages = new DirectSignalRuntime({
       controlPlane: runtime.controlPlane, allocateMessageId: () => scenario.identities.next(),
       projectInboxBatch() {}, now: scenario.clock.now,
     });
     try {
-      await firstRouter.start();
-      await firstRouter.close();
       runtime.controlPlane.failAgentRun(firstOwnership, { error: "ended before a new Request" });
-      const replacement = runtime.controlPlane.acquireAgentRun(runtime.agent(child.agentId), scenario.identities.next());
-      runtime.controlPlane.startActivation(replacement);
-      const replacementRouter = new DirectSignalRuntime({
-        controlPlane: childRuntime.controlPlane, ownership: replacement,
-        projectInboxBatch() {}, hasProjectedMessage() { return true; }, now: scenario.clock.now,
+      const source = scenario.transcripts.appendAgentSend(owner, {
+        targetAgentId: child.agentId, message: "New work after ending.", activationIntent: "Restart ended work", responseRequired: true,
       });
-      try {
-        await replacementRouter.start();
-        await ownerMessages.start();
-        const source = scenario.transcripts.appendAgentSend(owner, {
-          targetAgentId: child.agentId, message: "New work after ending.", responseRequired: true,
-        });
-        await ownerMessages.sendMessage({
-          target: { agentId: child.agentId }, message: "New work after ending.", sourceEntryId: source, responseRequired: true,
-        });
-        const activation = runtime.inspectActivation(runtime.agent(child.agentId));
-        assert.equal(activation?.state.kind, "active");
-        assert.equal(activation?.sequence, 2);
-        assert.equal(activation?.runId, replacement.runId);
-      } finally {
-        await replacementRouter.close();
-      }
+      await ownerMessages.sendMessage({
+        target: { agentId: child.agentId }, message: "New work after ending.", sourceEntryId: source, responseRequired: true, activationIntent: "Restart ended work",
+        async prepareEndedRecipient(request) {
+          const store = new DirectSignalStore(runtime.workflow.databasePath);
+          try {
+            return store.acceptEndedRecipientRequest({
+              request,
+              recipient: runtime.agent(child.agentId),
+              endpoint: "prepared://ended-worker",
+              runId: scenario.identities.next(),
+              checkpoint: JSON.stringify({ surface: "ended-worker" }),
+              acceptedAtMs: scenario.clock.now(),
+            });
+          } finally {
+            store.close();
+          }
+        },
+      });
+      const activation = runtime.inspectActivation(runtime.agent(child.agentId));
+      assert.equal(activation?.state.kind, "active");
+      assert.equal(activation?.sequence, 2);
+      assert.notEqual(activation?.runId, firstOwnership.runId);
     } finally {
       await ownerMessages.close();
     }

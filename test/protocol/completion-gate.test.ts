@@ -18,7 +18,7 @@ function fixture() {
   const workerPath = join(owner.workflow.sessionsDirectory, "worker.jsonl");
   initializeSubagentSessionFile({ mode: "standalone", childSessionFile: workerPath, childCwd: root, childSessionId: "00000000-0000-4000-8000-000000000002" });
   const sessionBinding = bindNewWorkflowSession({ workflowOwnerId: owner.workflow.ownerAgentId, agentId: "00000000-0000-4000-8000-000000000002", sessionPath: workerPath });
-  const worker = owner.addAgent({ agentId: "00000000-0000-4000-8000-000000000002", sessionPath: workerPath, sessionBinding, spawner: owner.currentAgent, name: "worker", capabilities: { spawning: false } });
+  const worker = owner.addAgent({ agentId: "00000000-0000-4000-8000-000000000002", sessionPath: workerPath, sessionBinding, spawner: owner.currentAgent, name: "worker", delegationPolicy: "disabled" });
   const ownership = owner.acquireAgentRun(owner.agent(worker.agentId), "00000000-0000-4000-8000-000000000003");
   owner.startActivation(ownership);
   const signals = new DirectSignalStore(owner.workflow.databasePath);

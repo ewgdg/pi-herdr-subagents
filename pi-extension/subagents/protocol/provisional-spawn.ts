@@ -30,6 +30,7 @@ export interface ProvisionalSpawnProjection {
   senderAgentId: string;
   recipientAgentId: string;
   payloadDigest: string;
+  activationIntent: string;
   agentDefinition: string;
   agentName: string;
 }
@@ -226,6 +227,6 @@ async function boundedChildPhase<T>(phase: string, timeout: number, pending: Pro
 }
 
 function isReady(value: unknown): value is ProvisionalSpawnReady { return !!value && typeof value === "object" && typeof (value as { routerEndpoint?: unknown }).routerEndpoint === "string"; }
-function isProjection(value: unknown): value is ProvisionalSpawnProjection { if (!value || typeof value !== "object") return false; const candidate = value as Record<string, unknown>; return ["senderSessionPath", "messageId", "sourceEntryId", "senderAgentId", "recipientAgentId", "payloadDigest", "agentDefinition", "agentName"].every((field) => typeof candidate[field] === "string" && candidate[field]); }
+function isProjection(value: unknown): value is ProvisionalSpawnProjection { if (!value || typeof value !== "object") return false; const candidate = value as Record<string, unknown>; return ["senderSessionPath", "messageId", "sourceEntryId", "senderAgentId", "recipientAgentId", "payloadDigest", "activationIntent", "agentDefinition", "agentName"].every((field) => typeof candidate[field] === "string" && candidate[field]); }
 function isCommit(value: unknown): value is ProvisionalSpawnCommit { return !!value && typeof value === "object" && typeof (value as { runId?: unknown }).runId === "string" && typeof (value as { fencingEpoch?: unknown }).fencingEpoch === "number"; }
-function sameProjection(left: ProvisionalSpawnProjection, right: ProvisionalSpawnProjection): boolean { return left.senderSessionPath === right.senderSessionPath && left.messageId === right.messageId && left.sourceEntryId === right.sourceEntryId && left.senderAgentId === right.senderAgentId && left.recipientAgentId === right.recipientAgentId && left.payloadDigest === right.payloadDigest && left.agentDefinition === right.agentDefinition && left.agentName === right.agentName; }
+function sameProjection(left: ProvisionalSpawnProjection, right: ProvisionalSpawnProjection): boolean { return left.senderSessionPath === right.senderSessionPath && left.messageId === right.messageId && left.sourceEntryId === right.sourceEntryId && left.senderAgentId === right.senderAgentId && left.recipientAgentId === right.recipientAgentId && left.payloadDigest === right.payloadDigest && left.activationIntent === right.activationIntent && left.agentDefinition === right.agentDefinition && left.agentName === right.agentName; }

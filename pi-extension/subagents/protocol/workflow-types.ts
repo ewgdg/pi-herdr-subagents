@@ -1,5 +1,17 @@
-export interface AgentCapabilityConfiguration {
-  spawning: boolean;
+export const DELEGATION_POLICIES = ["disabled", "approval-required", "autonomous"] as const;
+export type DelegationPolicy = typeof DELEGATION_POLICIES[number];
+export const DEFAULT_DELEGATION_POLICY: DelegationPolicy = "approval-required";
+
+export function isDelegationPolicy(value: string | undefined): value is DelegationPolicy {
+  return value !== undefined && (DELEGATION_POLICIES as readonly string[]).includes(value);
+}
+
+export function persistedDelegationPolicyFor(
+  agentDefinition: string | undefined,
+  requestedPolicy: DelegationPolicy | undefined,
+): DelegationPolicy | undefined {
+  if (agentDefinition === "moderator") return undefined;
+  return requestedPolicy ?? DEFAULT_DELEGATION_POLICY;
 }
 
 /** Immutable least-privilege policy captured when a Pi-backed Agent is created. */
@@ -28,7 +40,7 @@ export interface AgentRecord extends AgentReference {
   name: string;
   agentDefinition?: string;
   spawnerAgentId?: string;
-  capabilities: AgentCapabilityConfiguration;
+  delegationPolicy?: DelegationPolicy;
   launchPolicy?: AgentLaunchPolicy;
   createdAtMs: number;
 }
@@ -44,7 +56,8 @@ export type WorkflowProtocolErrorCode =
   | "WorkflowMismatch"
   | "UnknownAgent"
   | "AgentAlreadyExists"
-  | "SpawnerCapabilityRequired"
+  | "SpawnerDelegationDisabled"
+  | "DelegatedActivationApprovalRequired"
   | "InvalidSpawner"
   | "TranscriptOutsideWorkflow"
   | "AgentRunAlreadyOwned"
@@ -59,6 +72,8 @@ export type WorkflowProtocolErrorCode =
   | "HumanInterruptAlreadyBound"
   | "HumanInterruptTerminal"
   | "HumanInterruptResponseMissing"
+  | "ActivationIntentRequired"
+  | "ActivationIntentForbidden"
   | "RecipientUnreachable"
   | "RecipientEnded"
   | "RecipientReactivationUnauthorized"

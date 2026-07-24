@@ -175,6 +175,24 @@ describe("direct Signal Pi transcript projection", () => {
     assert.equal(llmVisibleContent(projected), projected.content);
   });
 
+  it("projects Activation Intent alongside the detailed Request message", () => {
+    const projected = projectInboxBatch({
+      messages: [{
+        kind: "request",
+        messageId: "request-activation-1",
+        senderAgentId: "sender",
+        recipientAgentId: "recipient",
+        activationIntent: "Resume audit",
+        message: "Continue the audit from the saved checkpoint.",
+        responseRequired: true,
+      }],
+    });
+
+    assert.match(projected.content, /Activation Intent: Resume audit/);
+    assert.equal(projected.details.messages[0].activationIntent, "Resume audit");
+    assert.equal(llmVisibleContent(projected), projected.content);
+  });
+
   it("makes an Answer's identity and Request correlation visible to the model", () => {
     const projected = projectInboxBatch({
       messages: [{
@@ -236,11 +254,13 @@ describe("direct Signal Pi transcript projection", () => {
       { target: { agent: "agent" }, message: "signal", onAccepted: "continue" },
       { target: { agent: "agent" }, message: "signal", timing: "deferred", responseRequired: false, onAccepted: "complete" },
       { target: { agent: "agent" }, message: "request", timing: "steer", responseRequired: true, onAccepted: "continue" },
+      { target: { agent: "agent" }, message: "activation", timing: "deferred", responseRequired: true, activation: { intent: "Resume for the next step" }, onAccepted: "continue" },
       { target: { request: "request" }, message: "answer", onAccepted: "complete" },
       { target: { request: "request" }, message: "answer", responseRequired: false, onAccepted: "continue" },
       { target: { request: "request" }, message: "answer and request", responseRequired: true, onAccepted: "continue" },
-      { target: { spawn: { agent: "worker" } }, message: "initial request", responseRequired: true, onAccepted: "continue" },
-      { target: { spawn: { agent: "worker", name: "Research helper" } }, message: "initial request", responseRequired: true, onAccepted: "continue" },
+      { target: { spawn: { agent: "worker" } }, message: "initial request", responseRequired: true, activation: { intent: "Investigate the failure" }, onAccepted: "continue" },
+      { target: { spawn: { agent: "worker", name: "Research helper" } }, message: "initial request", responseRequired: true, activation: { intent: "Investigate the failure" }, onAccepted: "continue" },
+      { target: { spawn: { agent: "worker", delegationPolicy: "disabled" } }, message: "initial request", responseRequired: true, activation: { intent: "Investigate the failure" }, onAccepted: "continue" },
     ]) assert.equal(Value.Check(AgentSendParams, params), true, JSON.stringify(params));
 
     assert.equal(Value.Check(AgentSendParams, {
@@ -250,14 +270,36 @@ describe("direct Signal Pi transcript projection", () => {
       target: { spawn: { agent: "worker" } }, message: "empty child", responseRequired: false,
     }), false, "Spawn must always create its initial Request");
     assert.equal(Value.Check(AgentSendParams, {
+      target: { spawn: { agent: "worker" } }, message: "missing activation", responseRequired: true, onAccepted: "continue",
+    }), false, "Spawn must carry an Activation Intent");
+    assert.equal(Value.Check(AgentSendParams, {
       target: { spawn: { agent: "worker" } }, message: "illegal spawn timing", timing: "steer", responseRequired: true,
     }), false, "Spawn-target timing must be rejected by the registered schema");
+    assert.equal(Value.Check(AgentSendParams, {
+      target: { spawn: { agent: "worker", delegationPolicy: "forbidden" } }, message: "illegal policy", responseRequired: true, onAccepted: "continue",
+    }), false, "Spawn-target delegationPolicy must be one of the supported literals");
     assert.equal(Value.Check(AgentSendParams, {
       target: { agent: "agent" }, message: "ignored settlement", onAccepted: "settle",
     }), false, "Settle must not be silently accepted");
     assert.equal(Value.Check(AgentSendParams, {
       target: { agent: "agent" }, message: "request", responseRequired: true, onAccepted: "complete",
     }), false, "A terminal message cannot create a Response Requirement");
+    assert.equal(Value.Check(AgentSendParams, {
+      target: { spawn: { agent: "worker" } }, message: "request", responseRequired: true,
+      activation: { intent: "   " }, onAccepted: "continue",
+    }), false, "Activation Intent must contain non-whitespace text");
+    assert.equal(Value.Check(AgentSendParams, {
+      target: { agent: "agent" }, message: "signal", activation: { intent: "Forbidden" }, onAccepted: "continue",
+    }), false, "Signals must reject Activation Intent");
+    assert.equal(Value.Check(AgentSendParams, {
+      target: { request: "request" }, message: "answer", activation: { intent: "Forbidden" }, onAccepted: "continue",
+    }), false, "Answers must reject Activation Intent");
+    assert.equal(Value.Check(AgentSendParams, {
+      target: { request: "request" }, message: "answer and request", responseRequired: true, activation: { intent: "Forbidden" }, onAccepted: "continue",
+    }), false, "Answer-plus-Request must reject Activation Intent");
+    assert.equal(Value.Check(AgentSendParams, {
+      target: { agent: "agent" }, message: "blank activation", responseRequired: true, activation: { intent: "" }, onAccepted: "continue",
+    }), false, "Activation Intent must be non-empty");
   });
 
   it("routes a legal spawn form through the prepared Spawned Initial Request launcher", async () => {
@@ -272,9 +314,10 @@ describe("direct Signal Pi transcript projection", () => {
     });
 
     const spawnParams = {
-      target: { spawn: { agent: "worker", name: "Worker" } },
+      target: { spawn: { agent: "worker", name: "Worker", delegationPolicy: "autonomous" } },
       message: "Initial work.",
       responseRequired: true,
+      activation: { intent: "Investigate initial work" },
       onAccepted: "continue" as const,
     };
     const result = await registered.execute("tool-1", spawnParams, undefined, undefined, {
@@ -288,6 +331,8 @@ describe("direct Signal Pi transcript projection", () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0].agent, "worker");
     assert.equal(calls[0].name, "Worker");
+    assert.equal(calls[0].delegationPolicy, "autonomous");
+    assert.equal(calls[0].activationIntent, "Investigate initial work");
     assert.equal(calls[0].message, "Initial work.");
     assert.match(calls[0].messageId as string, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     assert.notEqual(calls[0].messageId, calls[0].sourceEntryId);
@@ -312,9 +357,10 @@ describe("direct Signal Pi transcript projection", () => {
     });
 
     const spawnParams = {
-      target: { spawn: { agent: "worker", name: "Worker" } },
+      target: { spawn: { agent: "worker", name: "Worker", delegationPolicy: "disabled" } },
       message: "Initial work.",
       responseRequired: true,
+      activation: { intent: "Resume recovered work" },
       onAccepted: "continue" as const,
     };
     const result = await registered.execute("tool-1", spawnParams, undefined, undefined, {
@@ -327,7 +373,7 @@ describe("direct Signal Pi transcript projection", () => {
 
     assert.equal(launchAttempts, 0);
     assert.deepEqual(reconciliationInputs.map(({ context: _context, ...input }) => input), [{
-      agent: "worker", name: "Worker", message: "Initial work.", sourceEntryId: "tool-1",
+      agent: "worker", name: "Worker", delegationPolicy: "disabled", activationIntent: "Resume recovered work", message: "Initial work.", sourceEntryId: "tool-1",
     }]);
     assert.equal(result.details.messageId, "original-request");
   });

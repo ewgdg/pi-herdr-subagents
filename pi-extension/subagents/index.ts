@@ -97,7 +97,13 @@ import {
   WORKFLOW_OWNER_SESSION_PATH_ENV,
   humanInterruptActorRoleFromMembership,
 } from "./protocol/workflow-bootstrap.ts";
-import type { AgentRecord } from "./protocol/workflow-types.ts";
+import {
+  DEFAULT_DELEGATION_POLICY,
+  DELEGATION_POLICIES,
+  isDelegationPolicy,
+  type AgentRecord,
+  type DelegationPolicy,
+} from "./protocol/workflow-types.ts";
 import {
   ProvisionalSpawnGate,
   PROVISIONAL_SPAWN_ENDPOINT_ENV,
@@ -187,6 +193,19 @@ const SubagentParams = Type.Object({
         "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
     }),
   ),
+  delegationPolicy: Type.Optional(
+    Type.Union(
+      DELEGATION_POLICIES.map((policy) => Type.Literal(policy)) as [
+        ReturnType<typeof Type.Literal>,
+        ReturnType<typeof Type.Literal>,
+        ReturnType<typeof Type.Literal>,
+      ],
+      {
+        description:
+          "Delegation policy for the spawned child Agent's own future child activations. Omit to resolve from the Agent Definition default, then to approval-required.",
+      },
+    ),
+  ),
   fork: Type.Optional(
     Type.Boolean({
       description:
@@ -231,7 +250,7 @@ interface AgentDefaults {
   skills?: string;
   thinking?: string;
   denyTools?: string;
-  spawning?: boolean;
+  delegationPolicy?: DelegationPolicy;
   autoExit?: boolean;
   interactive?: boolean;
   systemPromptMode?: "append" | "replace";
@@ -254,27 +273,13 @@ interface ListedAgentDefinition extends AgentDefinition {
   source: AgentSource;
 }
 
-/** Tools that are gated by `spawning: false` */
-const SPAWNING_TOOLS = new Set([
-  "subagent",
-  "subagent_interrupt",
-  "subagents_list",
-  "subagent_resume",
-]);
-
 /**
  * Resolve the effective set of denied tool names from agent defaults.
- * `spawning: false` expands to all SPAWNING_TOOLS.
  * `deny-tools` adds individual tool names on top.
  */
 function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
   const denied = new Set<string>();
   if (!agentDefs) return denied;
-
-  // spawning: false → deny all spawning tools
-  if (agentDefs.spawning === false) {
-    for (const t of SPAWNING_TOOLS) denied.add(t);
-  }
 
   // deny-tools: explicit list
   if (agentDefs.denyTools) {
@@ -307,6 +312,12 @@ function parseOptionalBoolean(value: string | undefined): boolean | undefined {
   return value != null ? value === "true" : undefined;
 }
 
+function parseDelegationPolicy(value: string | undefined): DelegationPolicy | undefined {
+  if (value == null) return undefined;
+  if (isDelegationPolicy(value)) return value;
+  throw new Error(`Invalid delegation-policy frontmatter: ${value}`);
+}
+
 function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
   if (value === "standalone" || value === "lineage-only" || value === "fork") {
     return value;
@@ -336,7 +347,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
     thinking: getFrontmatterValue(frontmatter, "thinking"),
     denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
-    spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
+    delegationPolicy: parseDelegationPolicy(getFrontmatterValue(frontmatter, "delegation-policy")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
@@ -387,6 +398,13 @@ function resolveSubagentPaths(
   const effectiveAgentDir =
     localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
   return { effectiveCwd, localAgentDir, effectiveAgentDir };
+}
+
+function resolveDelegationPolicy(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): DelegationPolicy {
+  return params.delegationPolicy ?? agentDefs?.delegationPolicy ?? DEFAULT_DELEGATION_POLICY;
 }
 
 function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
@@ -1265,6 +1283,7 @@ export const __test__ = {
   buildAutomaticRecoveryReactivationCommand,
   buildPiPromptArgs,
   observeRunningSubagent,
+  resolveDelegationPolicy,
   resolveDenyTools,
   resolveInterruptTarget,
   requestSubagentInterrupt,
@@ -1297,7 +1316,7 @@ async function launchSubagent(
   parentThinking: ThinkingLevel,
   options?: {
     surface?: string;
-    spawnedInitialRequest?: { messageId: string; sourceEntryId: string; message: string };
+    spawnedInitialRequest?: { messageId: string; sourceEntryId: string; message: string; activationIntent: string };
   },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -1306,6 +1325,7 @@ async function launchSubagent(
   await runtime.workflowBootstrap.waitUntilReady(ctx);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const activationLabel = spawnedInitialRequest?.activationIntent ?? params.name;
   if (!ctx.model) throw new Error("Subagent launch requires a resolved parent model");
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },
@@ -1394,7 +1414,7 @@ async function launchSubagent(
   const surfacePreCreated = !!options?.surface;
   let surface: string;
   try {
-    surface = options?.surface ?? createSubagentPane(params.name);
+    surface = options?.surface ?? createSubagentPane(activationLabel);
     if (!surfacePreCreated) {
       await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
     }
@@ -1423,7 +1443,7 @@ async function launchSubagent(
         runId: id,
         name: params.name,
         agentDefinition: params.agent,
-        capabilities: { spawning: agentDefs?.spawning !== false },
+        delegationPolicy: resolveDelegationPolicy(params, agentDefs),
         launchPolicy,
         sessionBinding: workflowSessionBinding!,
         surface,
@@ -1700,6 +1720,7 @@ async function launchSubagent(
         senderAgentId: runtime.workflowBootstrap.currentAgentId!,
         recipientAgentId: agentSessionId,
         payloadDigest: digestPayload(spawnedInitialRequest.message),
+        activationIntent: spawnedInitialRequest.activationIntent,
         agentDefinition: params.agent!,
         agentName: params.name,
       });
@@ -1710,9 +1731,10 @@ async function launchSubagent(
         messageId: spawnedInitialRequest.messageId,
         sourceEntryId: spawnedInitialRequest.sourceEntryId,
         message: spawnedInitialRequest.message,
+        activationIntent: spawnedInitialRequest.activationIntent,
         name: params.name,
         agentDefinition: params.agent!,
-        capabilities: { spawning: agentDefs?.spawning !== false },
+        delegationPolicy: resolveDelegationPolicy(params, agentDefs),
         launchPolicy,
         sessionBinding: workflowSessionBinding,
         routerEndpoint: ready.routerEndpoint,
@@ -1767,7 +1789,7 @@ async function launchSubagent(
   const running: RunningSubagent = {
     id,
     name: params.name,
-    task: params.task,
+    task: spawnedInitialRequest?.activationIntent ?? params.task,
     agent: params.agent,
     surface,
     startTime,
@@ -2013,6 +2035,7 @@ async function reactivateEndedRecipientForRequest(
   request: import("./protocol/direct-signal-types.ts").SignalAcceptRequest,
   context: ExtensionContext,
 ): Promise<import("./protocol/direct-signal-types.ts").DurableAcceptanceReceipt> {
+  runtime.workflowBootstrap.assertCurrentAgentMayReactivateEndedChild(request.recipientAgentId);
   const key = `${request.senderAgentId}:${request.sourceEntryId}`;
   const existing = runtime.pendingRequestReactivations.get(key);
   if (existing) return existing;
@@ -2025,7 +2048,7 @@ async function reactivateEndedRecipientForRequest(
     if (!member.launchPolicy) {
       throw new Error(`Ended Agent ${member.agentId} has no durable launch policy; refusing to resume with expanded privileges`);
     }
-    const surface = createSubagentPane(member.name);
+    const surface = createSubagentPane(request.activationIntent!);
     const gate = await ProvisionalSpawnGate.create();
     const artifactDir = getArtifactDir(context.sessionManager.getSessionDir(), context.sessionManager.getSessionId());
     const activityFile = getSubagentActivityFile(artifactDir, id);
@@ -2081,7 +2104,7 @@ async function reactivateEndedRecipientForRequest(
       }
       ownership = accepted.ownership;
       const running: RunningSubagent = {
-        id, name: member.name, task: "Request-driven reactivation", agent: member.agentDefinition,
+        id, name: member.name, task: request.activationIntent!, agent: member.agentDefinition,
         surface, startTime: Date.now(), sessionFile: member.sessionPath, activityFile,
         interactive: false, runtimePlan: undefined, launchKind: "resume", workflowOwnership: ownership,
         lifecycle: createLifecycle(Date.now()),
@@ -2625,10 +2648,12 @@ function subagentsExtensionWithOptions(
         agentDefinition: input.agent,
         name: input.name ?? input.agent,
         message: input.message,
-        capabilities: { spawning: agentDefinition?.spawning !== false },
+        activationIntent: input.activationIntent,
+        delegationPolicy: input.delegationPolicy ?? agentDefinition?.delegationPolicy ?? DEFAULT_DELEGATION_POLICY,
       });
     },
     async spawnInitialRequest(input) {
+      runtime.workflowBootstrap.assertCurrentAgentMaySpawnChild();
       if (!isTerminalAvailable()) throw new Error(terminalSetupHint());
       const parentThinking = pi.getThinkingLevel();
       if (!THINKING_LEVELS.includes(parentThinking as ThinkingLevel)) {
@@ -2639,6 +2664,7 @@ function subagentsExtensionWithOptions(
           name: input.name ?? input.agent,
           task: input.message,
           agent: input.agent,
+          ...(input.delegationPolicy ? { delegationPolicy: input.delegationPolicy } : {}),
         },
         context: input.context,
         parentThinking: parentThinking as ThinkingLevel,
@@ -2646,6 +2672,7 @@ function subagentsExtensionWithOptions(
           messageId: input.messageId,
           sourceEntryId: input.sourceEntryId,
           message: input.message,
+          activationIntent: input.activationIntent,
         },
       });
       void superviseLegacyAgentRun(running, legacyAgentRunAdapters);

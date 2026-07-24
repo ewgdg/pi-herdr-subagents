@@ -29,11 +29,12 @@ import {
   type WorkflowSessionBinding,
 } from "./workflow-session-binding.ts";
 import {
+  persistedDelegationPolicyFor,
   WorkflowProtocolError,
-  type AgentCapabilityConfiguration,
   type AgentRecord,
   type AgentReference,
   type AgentRunOwnership,
+  type DelegationPolicy,
   type WorkflowRecord,
 } from "./workflow-types.ts";
 import { ActivationCancellationStore } from "./activation-cancellation.ts";
@@ -58,10 +59,10 @@ import {
 } from "./operational-incidents.ts";
 
 export type {
-  AgentCapabilityConfiguration,
   AgentRecord,
   AgentReference,
   AgentRunOwnership,
+  DelegationPolicy,
   WorkflowRecord,
 } from "./workflow-types.ts";
 export { WorkflowProtocolError } from "./workflow-types.ts";
@@ -82,13 +83,10 @@ export type {
   UndeclaredSettlementEpisode,
 } from "./activation-lifecycle.ts";
 
-const DEFAULT_CAPABILITIES: AgentCapabilityConfiguration = { spawning: true };
-
 export interface StartWorkflowOwnerOptions {
   ownerSessionId: string;
   ownerSessionPath: string;
   ownerName?: string;
-  ownerCapabilities?: AgentCapabilityConfiguration;
   operationReviewPolicy?: OperationReviewPolicy;
   now?: () => number;
 }
@@ -113,7 +111,7 @@ export interface AddWorkflowAgentInput {
   spawner: AgentReference;
   name: string;
   agentDefinition?: string;
-  capabilities?: AgentCapabilityConfiguration;
+  delegationPolicy?: DelegationPolicy;
   launchPolicy?: import("./workflow-types.ts").AgentLaunchPolicy;
   sessionBinding: WorkflowSessionBinding;
 }
@@ -125,9 +123,10 @@ export interface SpawnedInitialRequestInput {
   messageId: string;
   sourceEntryId: string;
   message: string;
+  activationIntent: string;
   name: string;
   agentDefinition: string;
-  capabilities?: AgentCapabilityConfiguration;
+  delegationPolicy?: DelegationPolicy;
   launchPolicy?: import("./workflow-types.ts").AgentLaunchPolicy;
   sessionBinding: WorkflowSessionBinding;
   /** Presence proves the external child Router completed its prepare phase. */
@@ -196,7 +195,6 @@ export class WorkflowControlPlane {
       workflow = store.openOwner({
         workflow: proposedWorkflow,
         ownerName: options.ownerName ?? "Workflow Owner",
-        capabilities: options.ownerCapabilities ?? DEFAULT_CAPABILITIES,
       });
     } catch (error) {
       store.close();
@@ -367,7 +365,7 @@ export class WorkflowControlPlane {
       name: input.name,
       agentDefinition: input.agentDefinition,
       spawnerAgentId: input.spawner.agentId,
-      capabilities: input.capabilities ?? DEFAULT_CAPABILITIES,
+      delegationPolicy: persistedDelegationPolicyFor(input.agentDefinition, input.delegationPolicy),
       launchPolicy: input.launchPolicy,
       createdAtMs: this.#now(),
     });
@@ -375,6 +373,7 @@ export class WorkflowControlPlane {
 
   spawnInitialRequest(input: SpawnedInitialRequestInput): SpawnedInitialRequestReceipt {
     this.#assertOpen();
+    if (!input.activationIntent.trim()) throw new TypeError("Activation Intent must not be empty");
     assertSessionUuid(input.agentId);
     const sessionPath = assertDescendantTranscriptPath(this.workflow, input.sessionPath);
     assertWorkflowSessionBinding(input.sessionBinding, {
@@ -393,6 +392,8 @@ export class WorkflowControlPlane {
       agentDefinition: input.agentDefinition,
       name: input.name,
       message: input.message,
+      activationIntent: input.activationIntent,
+      delegationPolicy: input.delegationPolicy,
     });
     const messages = new DirectSignalStore(this.workflow.databasePath);
     try {
@@ -403,13 +404,14 @@ export class WorkflowControlPlane {
           sessionPath,
           name: input.name,
           agentDefinition: input.agentDefinition,
-          capabilities: input.capabilities ?? DEFAULT_CAPABILITIES,
+          delegationPolicy: persistedDelegationPolicyFor(input.agentDefinition, input.delegationPolicy),
           launchPolicy: input.launchPolicy,
         },
         runId: input.runId,
         messageId: input.messageId,
         sourceEntryId: input.sourceEntryId,
         payloadDigest: digestPayload(input.message),
+        activationIntent: input.activationIntent,
         routerEndpoint: input.routerEndpoint,
         checkpoint: input.checkpoint,
         createdAtMs: this.#now(),
@@ -424,7 +426,8 @@ export class WorkflowControlPlane {
     agentDefinition: string;
     name: string;
     message: string;
-    capabilities?: AgentCapabilityConfiguration;
+    activationIntent: string;
+    delegationPolicy?: DelegationPolicy;
   }) {
     const messages = new DirectSignalStore(this.workflow.databasePath);
     try {
@@ -434,7 +437,8 @@ export class WorkflowControlPlane {
         payloadDigest: digestPayload(input.message),
         agentDefinition: input.agentDefinition,
         name: input.name,
-        capabilities: input.capabilities ?? DEFAULT_CAPABILITIES,
+        activationIntent: input.activationIntent,
+        delegationPolicy: persistedDelegationPolicyFor(input.agentDefinition, input.delegationPolicy),
       });
     } finally {
       messages.close();

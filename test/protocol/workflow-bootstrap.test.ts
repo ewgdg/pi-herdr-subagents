@@ -1356,6 +1356,7 @@ describe("production Workflow bootstrap", () => {
     initializeSubagentSessionFile({ mode: "standalone", childSessionFile: parentPath, childCwd: root, childSessionId: parentId });
     const parentRun = owner.prepareSpawn({
       agentId: parentId, sessionPath: parentPath, runId: "parent-run", surface: "parent-surface", name: "Parent",
+      delegationPolicy: "autonomous",
       launchPolicy: { denyTools: [] },
       sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: parentId, sessionPath: parentPath }),
     });
@@ -1445,6 +1446,7 @@ describe("production Workflow bootstrap", () => {
     initializeSubagentSessionFile({ mode: "standalone", childSessionFile: parentPath, childCwd: root, childSessionId: parentId });
     const parentRun = owner.prepareSpawn({
       agentId: parentId, sessionPath: parentPath, runId: "closed-parent-run", surface: "closed-parent-surface", name: "Parent",
+      delegationPolicy: "autonomous",
       launchPolicy: { denyTools: [] },
       sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: parentId, sessionPath: parentPath }),
     });
@@ -1695,10 +1697,10 @@ describe("production Workflow bootstrap", () => {
       });
       const routerStarted = child.startDirectSignalRouter({ projectInboxBatch() {} });
       const ready = await gate.waitUntilReady();
-      appendFileSync(ownerPath, `${JSON.stringify({ message: { content: [{ type: "toolCall", id: "tool-call", name: "agent_send", arguments: { target: { spawn: { agent: "worker", name: "Child" } }, message: "Recover after disconnect.", responseRequired: true } }] } })}\n`);
+      appendFileSync(ownerPath, `${JSON.stringify({ message: { content: [{ type: "toolCall", id: "tool-call", name: "agent_send", arguments: { target: { spawn: { agent: "worker", name: "Child" } }, message: "Recover after disconnect.", activation: { intent: "Recover disconnected child" }, responseRequired: true } }] } })}\n`);
       const receipt = owner.spawnInitialRequest({
         agentId: childId, sessionPath: childPath, runId: "committed-run", messageId: "committed-message",
-        sourceEntryId: "tool-call", message: "Recover after disconnect.", name: "Child", agentDefinition: "worker",
+        sourceEntryId: "tool-call", message: "Recover after disconnect.", activationIntent: "Recover disconnected child", name: "Child", agentDefinition: "worker",
         sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: childId, sessionPath: childPath }),
         routerEndpoint: ready.routerEndpoint,
       });
@@ -1736,18 +1738,20 @@ describe("production Workflow bootstrap", () => {
       const routerStarted = child.startDirectSignalRouter({ projectInboxBatch() {}, async projectInitialInboxBatch(batch) { projected.push(batch); } });
       const ready = await gate.waitUntilReady();
       const message = "Canonical spawn work.";
-      appendFileSync(ownerPath, `${JSON.stringify({ message: { content: [{ type: "toolCall", id: "spawn-source", name: "agent_send", arguments: { target: { spawn: { agent: "worker", name: "Child" } }, message, responseRequired: true } }] } })}\n`);
+      const activationIntent = "Handle canonical spawn work";
+      appendFileSync(ownerPath, `${JSON.stringify({ message: { content: [{ type: "toolCall", id: "spawn-source", name: "agent_send", arguments: { target: { spawn: { agent: "worker", name: "Child" } }, message, activation: { intent: activationIntent }, responseRequired: true } }] } })}\n`);
       const messageId = "spawn-message";
       const { digestPayload } = await import("../../pi-extension/subagents/protocol/direct-signal-transcript.ts");
-      await gate.project({ senderSessionPath: ownerPath, messageId, sourceEntryId: "spawn-source", senderAgentId: ownerId, recipientAgentId: childId, payloadDigest: digestPayload(message), agentDefinition: "worker", agentName: "Child" });
+      await gate.project({ senderSessionPath: ownerPath, messageId, sourceEntryId: "spawn-source", senderAgentId: ownerId, recipientAgentId: childId, payloadDigest: digestPayload(message), activationIntent, agentDefinition: "worker", agentName: "Child" });
       const receipt = owner.spawnInitialRequest({
-        agentId: childId, sessionPath: childPath, runId: "spawn-run", messageId, sourceEntryId: "spawn-source", message,
+        agentId: childId, sessionPath: childPath, runId: "spawn-run", messageId, sourceEntryId: "spawn-source", message, activationIntent,
         name: "Child", agentDefinition: "worker", sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: childId, sessionPath: childPath }), routerEndpoint: ready.routerEndpoint,
       });
       await gate.release({ runId: receipt.runId, fencingEpoch: receipt.fencingEpoch });
       await routerStarted;
       assert.equal(receipt.status, "delivered");
       assert.equal((projected[0] as { messages: Array<{ message: string }> }).messages[0]?.message, message);
+      assert.equal((projected[0] as { messages: Array<{ activationIntent?: string }> }).messages[0]?.activationIntent, activationIntent);
     } finally {
       child.close();
       owner.close();
@@ -1876,7 +1880,7 @@ describe("production Workflow bootstrap", () => {
       sessionPath: parentPath,
       runId: "parent-run",
       name: "Parent",
-      capabilities: { spawning: false },
+      delegationPolicy: "disabled",
       surface: "parent-surface",
       sessionBinding: bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: parentId, sessionPath: parentPath }),
     });
@@ -1889,7 +1893,7 @@ describe("production Workflow bootstrap", () => {
     const binding = bindNewWorkflowSession({ workflowOwnerId: ownerId, agentId: childId, sessionPath: childPath });
     assert.throws(
       () => parent.prepareSpawn({ agentId: childId, sessionPath: childPath, name: "Rejected", runId: "rejected-run", surface: "rejected-surface", sessionBinding: binding }),
-      (error: unknown) => (error as { code?: string }).code === "SpawnerCapabilityRequired",
+      (error: unknown) => (error as { code?: string }).code === "SpawnerDelegationDisabled",
     );
     assert.equal(existsSync(childPath), false);
     assert.equal(existsSync(`${childPath}.workflow.json`), false);
@@ -1930,7 +1934,7 @@ describe("production Workflow bootstrap", () => {
       runId: "run-one",
       name: "Child",
       agentDefinition: "worker",
-      capabilities: { spawning: false },
+      delegationPolicy: "disabled",
       surface: "child-surface",
       sessionBinding: bindNewWorkflowSession({
         workflowOwnerId: ownerId,
@@ -1940,7 +1944,7 @@ describe("production Workflow bootstrap", () => {
     });
 
     assert.equal(bootstrap.inspect(childId).spawnerAgentId, ownerId);
-    assert.deepEqual(bootstrap.inspect(childId).capabilities, { spawning: false });
+    assert.equal(bootstrap.inspect(childId).delegationPolicy, "disabled");
     assert.equal(prepared.environment.PI_WORKFLOW_OWNER_SESSION_ID, ownerId);
     assert.equal(prepared.environment.PI_WORKFLOW_OWNER_SESSION_PATH, ownerPath);
     assert.equal(prepared.environment.PI_WORKFLOW_RUN_ID, "run-one");
@@ -2087,7 +2091,7 @@ describe("production Workflow bootstrap", () => {
       sessionPath: parentPath,
       runId: "parent-run",
       name: "Parent",
-      capabilities: { spawning: true },
+      delegationPolicy: "autonomous",
       surface: "parent-surface",
       sessionBinding: bindNewWorkflowSession({
         workflowOwnerId: ownerId,

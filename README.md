@@ -262,9 +262,17 @@ agent_send({ target: { agent: agentId }, message: "Status update", onAccepted: "
 // A Request: creates one durable Answer obligation using this message ID.
 agent_send({ target: { agent: agentId }, message: "Review this", responseRequired: true, onAccepted: "continue" });
 
+// An explicit ended-child activation: only Agent-targeted Requests may carry activation intent.
+agent_send({ target: { agent: agentId }, activation: { intent: "Resume review" }, message: "Continue from the previous findings.", responseRequired: true, onAccepted: "continue" });
+
+// A Spawned Initial Request: creates the child and delivers its first Request atomically.
+agent_send({ target: { spawn: { agent: "worker", name: "Worker" } }, activation: { intent: "Investigate failure" }, message: "Trace the failing test and report root cause.", responseRequired: true, onAccepted: "continue" });
+
 // An Answer: destination and delivery timing come from the Request.
 agent_send({ target: { request: requestId }, message: "Review complete", onAccepted: "continue" });
 ```
+
+`activation.intent` is required for Spawned Initial Requests and for Agent-targeted Requests that create a new activation for an ended direct child. Signals, Request-targeted Answers, and Answer-plus-Request forms cannot carry it. If the target is still open or interrupted, the Request must omit activation intent.
 
 Subagents may finish through the shared mechanical Completion Gate either with
 `agent_complete()` after prior messages are accepted, or by adding
@@ -414,7 +422,7 @@ model: anthropic/claude-sonnet-4-6
 thinking: minimal
 tools: read, bash, edit, write
 session-mode: lineage-only
-spawning: false
+delegation-policy: disabled
 ---
 
 # My Agent
@@ -433,7 +441,7 @@ You are a specialized agent that does X...
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
-| `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
+| `delegation-policy` | string | Default Delegation Policy for child-Agent-created descendants: `disabled`, `approval-required`, or `autonomous`. Omit to use the protocol default `approval-required`. |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
@@ -515,16 +523,18 @@ subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 
 ## Tool Access Control
 
-By default, every sub-agent can spawn further sub-agents. Control this with frontmatter:
+By default, every ordinary child Agent uses the protocol default `approval-required` Delegation Policy. Set an Agent Definition default when a role should never delegate or should delegate autonomously:
 
-### `spawning: false`
+The Workflow Owner bypasses Delegation Policy checks. Ordinary child activation attempts obey the requester's effective policy mechanically: `autonomous` executes, `disabled` rejects immediately, and `approval-required` identifies the attempt for the approval path without creating target effects.
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+### `delegation-policy: disabled`
+
+Disables future child activations requested by that Agent:
 
 ```yaml
 ---
 name: worker
-spawning: false
+delegation-policy: disabled
 ---
 ```
 
@@ -541,13 +551,13 @@ deny-tools: subagent
 
 ### Recommended Configuration
 
-| Agent      | `spawning`  | Rationale                                    |
-| ---------- | ----------- | -------------------------------------------- |
-| planner    | _(default)_ | Legitimately spawns scouts for investigation |
-| worker     | `false`     | Should implement tasks, not delegate         |
-| researcher | `false`     | Should research, not spawn                   |
-| reviewer   | `false`     | Should review, not spawn                     |
-| scout      | `false`     | Should gather context, not spawn             |
+| Agent      | `delegation-policy` | Rationale                                    |
+| ---------- | ------------------- | -------------------------------------------- |
+| planner    | _(default)_         | Uses the protocol default `approval-required` |
+| worker     | `disabled`          | Should implement tasks, not delegate         |
+| researcher | `disabled`          | Should research, not spawn                   |
+| reviewer   | `disabled`          | Should review, not spawn                     |
+| scout      | `disabled`          | Should gather context, not spawn             |
 
 ---
 
@@ -578,7 +588,7 @@ Set a default `cwd` in agent frontmatter:
 ---
 name: game-designer
 cwd: ./agents/game-designer
-spawning: false
+delegation-policy: disabled
 ---
 ```
 

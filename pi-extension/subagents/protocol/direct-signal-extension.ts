@@ -5,6 +5,7 @@ import type {
 import { Type } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
 import type { DurableAcceptanceReceipt, InboxBatch } from "./direct-signal.ts";
+import { DELEGATION_POLICIES, type DelegationPolicy } from "./workflow-types.ts";
 import {
   WorkflowBootstrap,
   type AutomaticRecoveryRunReconciliation,
@@ -22,11 +23,26 @@ const AgentTarget = Type.Object({
 const RequestTarget = Type.Object({
   request: Type.String({ description: "Request ID to Answer; routing is derived from that Request" }),
 }, { additionalProperties: false });
+const DelegationPolicySchema = Type.Union(
+  DELEGATION_POLICIES.map((policy) => Type.Literal(policy)) as [
+    ReturnType<typeof Type.Literal>,
+    ReturnType<typeof Type.Literal>,
+    ReturnType<typeof Type.Literal>,
+  ],
+);
 const SpawnSpec = Type.Object({
   agent: Type.String({ minLength: 1, description: "Agent Definition name for the direct child" }),
   name: Type.Optional(Type.String({ minLength: 1, description: "Optional display name for the direct child" })),
+  delegationPolicy: Type.Optional(DelegationPolicySchema),
 }, { additionalProperties: false });
 const SpawnTarget = Type.Object({ spawn: SpawnSpec }, { additionalProperties: false });
+const Activation = Type.Object({
+  intent: Type.String({
+    minLength: 1,
+    pattern: "\\S",
+    description: "Concise human-readable purpose of the activation",
+  }),
+}, { additionalProperties: false });
 const Message = Type.String({ minLength: 1, description: "Plain actionable message content" });
 const Timing = Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("deferred")]));
 const Continue = Type.Literal("continue");
@@ -36,9 +52,10 @@ const TerminalDisposition = Type.Union([Continue, Type.Literal("complete")]);
 export const AgentSendParams = Type.Union([
   Type.Object({ target: AgentTarget, message: Message, timing: Timing, responseRequired: Type.Optional(Type.Literal(false)), onAccepted: TerminalDisposition }, { additionalProperties: false }),
   Type.Object({ target: AgentTarget, message: Message, timing: Timing, responseRequired: Type.Literal(true), onAccepted: Continue }, { additionalProperties: false }),
+  Type.Object({ target: AgentTarget, message: Message, timing: Timing, responseRequired: Type.Literal(true), activation: Activation, onAccepted: Continue }, { additionalProperties: false }),
   Type.Object({ target: RequestTarget, message: Message, responseRequired: Type.Optional(Type.Literal(false)), onAccepted: TerminalDisposition }, { additionalProperties: false }),
   Type.Object({ target: RequestTarget, message: Message, responseRequired: Type.Literal(true), onAccepted: Continue }, { additionalProperties: false }),
-  Type.Object({ target: SpawnTarget, message: Message, responseRequired: Type.Literal(true), onAccepted: Continue }, { additionalProperties: false }),
+  Type.Object({ target: SpawnTarget, message: Message, responseRequired: Type.Literal(true), activation: Activation, onAccepted: Continue }, { additionalProperties: false }),
 ]);
 
 export async function startDirectSignalRouter(
@@ -121,6 +138,8 @@ export function registerAgentSendTool(
     spawnInitialRequest?(input: {
       agent: string;
       name?: string;
+      delegationPolicy?: DelegationPolicy;
+      activationIntent: string;
       message: string;
       messageId: string;
       sourceEntryId: string;
@@ -129,12 +148,15 @@ export function registerAgentSendTool(
     reconcileSpawnedInitialRequest?(input: {
       agent: string;
       name?: string;
+      delegationPolicy?: DelegationPolicy;
+      activationIntent: string;
       message: string;
       sourceEntryId: string;
       context: ExtensionContext;
     }): Promise<DurableAcceptanceReceipt | undefined>;
     prepareEndedRecipient?(input: {
       request: import("./direct-signal-types.ts").SignalAcceptRequest;
+      activationIntent: string;
       context: ExtensionContext;
     }): Promise<DurableAcceptanceReceipt>;
   } = {},
@@ -163,6 +185,7 @@ export function registerAgentSendTool(
           toolCallId,
           params.target,
           params.message,
+          params.activation.intent,
           undefined,
           true,
           params.onAccepted,
@@ -173,6 +196,8 @@ export function registerAgentSendTool(
         const reconciled = await options.reconcileSpawnedInitialRequest?.({
           agent: params.target.spawn.agent,
           name: params.target.spawn.name,
+          delegationPolicy: params.target.spawn.delegationPolicy,
+          activationIntent: params.activation.intent,
           message: params.message,
           sourceEntryId: toolCallId,
           context,
@@ -189,6 +214,8 @@ export function registerAgentSendTool(
         const receipt = await options.spawnInitialRequest({
           agent: params.target.spawn.agent,
           name: params.target.spawn.name,
+          delegationPolicy: params.target.spawn.delegationPolicy,
+          activationIntent: params.activation.intent,
           message: params.message,
           messageId: randomUUID(),
           sourceEntryId: toolCallId,
@@ -208,6 +235,7 @@ export function registerAgentSendTool(
         toolCallId,
         params.target,
         params.message,
+        params.responseRequired === true && "activation" in params ? params.activation.intent : undefined,
         "agent" in params.target ? params.timing : undefined,
         params.responseRequired === true,
         params.onAccepted,
@@ -223,9 +251,16 @@ export function registerAgentSendTool(
           sourceEntryId: toolCallId,
           deliveryTiming: "agent" in params.target ? params.timing : undefined,
           responseRequired: params.responseRequired,
+          activationIntent: params.responseRequired === true && "activation" in params ? params.activation.intent : undefined,
           onAccepted: params.onAccepted,
           ...(options.prepareEndedRecipient && "agent" in params.target
-            ? { prepareEndedRecipient: (request) => options.prepareEndedRecipient!({ request, context }) }
+            ? {
+                prepareEndedRecipient: (request) => options.prepareEndedRecipient!({
+                  request,
+                  activationIntent: params.responseRequired === true && "activation" in params ? params.activation.intent : undefined,
+                  context,
+                }),
+              }
             : {}),
         });
       } catch (error) {
@@ -265,6 +300,7 @@ export function projectInboxBatch(batch: InboxBatch): {
       senderAgentId: string;
       recipientAgentId: string;
       deliveryTiming: "steer" | "deferred";
+      activationIntent?: string;
       responseRequired?: true;
       inReplyToRequestId?: string;
     } | {
@@ -292,6 +328,7 @@ export function projectInboxBatch(batch: InboxBatch): {
           ? { noticeKind: signal.noticeKind, requestId: signal.requestId }
           : {
               senderAgentId: signal.senderAgentId,
+              ...(signal.activationIntent ? { activationIntent: signal.activationIntent } : {}),
               ...(signal.responseRequired ? { responseRequired: true as const } : {}),
               ...(signal.inReplyToRequestId ? { inReplyToRequestId: signal.inReplyToRequestId } : {}),
             }),
@@ -326,6 +363,7 @@ function projectInboxMessage(message: InboxBatch["messages"][number]): string {
     : undefined;
   return [
     `${label} from Agent ${message.senderAgentId} [${identity}]`,
+    ...(message.activationIntent ? [`Activation Intent: ${message.activationIntent}`] : []),
     ...(message.inReplyToRequestId ? [`inReplyToRequestId: ${message.inReplyToRequestId}`] : []),
     ...(requirement ? [requirement] : []),
     "",
@@ -361,8 +399,9 @@ function inboxMessageIds(entries: unknown[]): string[] {
 function assertCanonicalAgentSendSource(
   entries: unknown[],
   toolCallId: string,
-  target: { agent?: string; request?: string; spawn?: { agent: string; name?: string } },
+  target: { agent?: string; request?: string; spawn?: { agent: string; name?: string; delegationPolicy?: DelegationPolicy } },
   message: string,
+  activationIntent: string | undefined,
   deliveryTiming: "steer" | "deferred" | undefined,
   responseRequired: boolean,
   onAccepted: "continue" | "complete",
@@ -372,6 +411,8 @@ function assertCanonicalAgentSendSource(
     && toolCall.arguments.target?.request === target.request
     && toolCall.arguments.target?.spawn?.agent === target.spawn?.agent
     && toolCall.arguments.target?.spawn?.name === target.spawn?.name
+    && toolCall.arguments.target?.spawn?.delegationPolicy === target.spawn?.delegationPolicy
+    && toolCall.arguments.activation?.intent === activationIntent
     && toolCall.arguments.message === message
     && toolCall.arguments.timing === deliveryTiming
     && (toolCall.arguments.responseRequired === true) === responseRequired

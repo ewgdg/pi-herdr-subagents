@@ -1,9 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
 import {
   WorkflowProtocolError,
-  type AgentCapabilityConfiguration,
   type AgentReference,
   type AgentRunOwnership,
+  type DelegationPolicy,
 } from "./workflow-types.ts";
 import type {
   AcceptedSignal,
@@ -29,6 +29,7 @@ interface MessageRow {
   message_id: string; sender_agent_id: string; recipient_agent_id: string; source_entry_id: string;
   payload_digest: string; delivery_timing: SignalDeliveryTiming; response_required: number;
   on_accepted: "continue" | "complete";
+  activation_intent: string | null;
   reactivates_recipient: number;
   in_reply_to_request_id: string | null; acceptance_sequence: number | null;
   delivery_status: "bound" | "accepted" | "delivered" | "suppressed"; created_at_ms: number;
@@ -71,13 +72,14 @@ export interface SpawnedInitialRequestInput {
     sessionPath: string;
     name: string;
     agentDefinition: string;
-    capabilities: AgentCapabilityConfiguration;
+    delegationPolicy?: DelegationPolicy;
     launchPolicy?: import("./workflow-types.ts").AgentLaunchPolicy;
   };
   runId: string;
   messageId: string;
   sourceEntryId: string;
   payloadDigest: string;
+  activationIntent: string;
   routerEndpoint?: string;
   checkpoint?: string;
   createdAtMs: number;
@@ -96,7 +98,8 @@ export interface SpawnedInitialRequestReconciliation {
   payloadDigest: string;
   agentDefinition: string;
   name: string;
-  capabilities: AgentCapabilityConfiguration;
+  activationIntent: string;
+  delegationPolicy?: DelegationPolicy;
 }
 
 export interface EndedRecipientRequestInput {
@@ -219,7 +222,7 @@ export class DirectSignalStore {
 
   findMessageBySource(input: {
     sender: AgentReference; recipient: AgentReference; sourceEntryId: string; payloadDigest: string;
-    deliveryTiming: SignalDeliveryTiming; responseRequired: boolean; inReplyToRequestId?: string;
+    deliveryTiming: SignalDeliveryTiming; responseRequired: boolean; activationIntent?: string; inReplyToRequestId?: string;
     onAccepted?: "continue" | "complete";
   }): DirectSignalRecord | undefined {
     this.#assertWorkflow(input.sender.workflowOwnerId);
@@ -231,7 +234,7 @@ export class DirectSignalStore {
 
   bindMessage(input: {
     messageId: string; sender: AgentReference; recipient: AgentReference; sourceEntryId: string; payloadDigest: string;
-    deliveryTiming: SignalDeliveryTiming; responseRequired: boolean; inReplyToRequestId?: string; createdAtMs: number;
+    deliveryTiming: SignalDeliveryTiming; responseRequired: boolean; activationIntent?: string; inReplyToRequestId?: string; createdAtMs: number;
     onAccepted?: "continue" | "complete";
     ownership?: AgentRunOwnership;
   }): DirectSignalRecord {
@@ -248,11 +251,11 @@ export class DirectSignalStore {
       this.#database.prepare(`
         INSERT INTO direct_signal_messages (
           message_id, sender_agent_id, recipient_agent_id, source_entry_id, payload_digest, delivery_timing,
-          response_required, in_reply_to_request_id, acceptance_sequence, delivery_status, created_at_ms, accepted_at_ms, delivered_at_ms
+          response_required, activation_intent, in_reply_to_request_id, acceptance_sequence, delivery_status, created_at_ms, accepted_at_ms, delivered_at_ms
           , on_accepted
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'bound', ?, NULL, NULL, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'bound', ?, NULL, NULL, ?)
       `).run(input.messageId, input.sender.agentId, input.recipient.agentId, input.sourceEntryId, input.payloadDigest,
-        input.deliveryTiming, input.responseRequired ? 1 : 0, input.inReplyToRequestId ?? null, input.createdAtMs, input.onAccepted ?? "continue");
+        input.deliveryTiming, input.responseRequired ? 1 : 0, input.activationIntent ?? null, input.inReplyToRequestId ?? null, input.createdAtMs, input.onAccepted ?? "continue");
       if (input.ownership) {
         this.#database.prepare(`INSERT INTO activation_dependencies
           (activation_id, dependency_kind, dependency_id, dependency_agent_id, created_at_ms)
@@ -332,6 +335,7 @@ export class DirectSignalStore {
           payloadDigest: input.payloadDigest,
           deliveryTiming: "steer",
           responseRequired: true,
+          activationIntent: input.activationIntent,
         });
         this.#assertSpawnBinding(existing, input);
         const receipt = receiptFor(existing);
@@ -339,15 +343,14 @@ export class DirectSignalStore {
       }
       const spawner = this.#readAgent(input.spawner.agentId);
       if (!spawner) throw new WorkflowProtocolError("UnknownAgent", `Unknown Workflow Agent: ${input.spawner.agentId}`);
-      const capabilities = JSON.parse(spawner.capabilities_json) as AgentCapabilityConfiguration;
-      if (!capabilities.spawning) throw new WorkflowProtocolError("SpawnerCapabilityRequired", `Agent ${input.spawner.agentId} does not have spawning capability`);
+      this.#assertActivationPolicy({ requesterAgentId: input.spawner.agentId, targetAgentId: input.child.agentId, member: spawner });
       if (this.#readAgent(input.child.agentId)) throw new WorkflowProtocolError("AgentAlreadyExists", `Agent is already a member of Workflow ${input.spawner.workflowOwnerId}: ${input.child.agentId}`);
       if (this.#readMessage(input.messageId)) throw new WorkflowProtocolError("MessageIdentityConflict", `Message Identity ${input.messageId} is already bound to different routing or source metadata`);
 
       this.#database.prepare(`
-        INSERT INTO workflow_agents (agent_id, session_path, name, agent_definition, spawner_agent_id, capabilities_json, launch_policy_json, created_at_ms)
+        INSERT INTO workflow_agents (agent_id, session_path, name, agent_definition, spawner_agent_id, delegation_policy, launch_policy_json, created_at_ms)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(input.child.agentId, input.child.sessionPath, input.child.name, input.child.agentDefinition, input.spawner.agentId, JSON.stringify({ spawning: input.child.capabilities.spawning }), input.child.launchPolicy ? JSON.stringify(input.child.launchPolicy) : null, input.createdAtMs);
+      `).run(input.child.agentId, input.child.sessionPath, input.child.name, input.child.agentDefinition, input.spawner.agentId, input.child.delegationPolicy ?? null, input.child.launchPolicy ? JSON.stringify(input.child.launchPolicy) : null, input.createdAtMs);
       const resourceId = `agent-run:${input.spawner.workflowOwnerId}:${input.child.agentId}`;
       const fencingEpoch = 1;
       this.#database.prepare("INSERT INTO ownership_epochs (resource_id, last_epoch) VALUES (?, ?)").run(resourceId, fencingEpoch);
@@ -366,11 +369,11 @@ export class DirectSignalStore {
         VALUES (?, ?, ?, ?, ?)
       `).run(input.child.agentId, input.routerEndpoint, input.runId, fencingEpoch, input.createdAtMs);
       this.#database.prepare(`
-        INSERT INTO direct_signal_messages (message_id, sender_agent_id, recipient_agent_id, source_entry_id, payload_digest, delivery_timing, response_required, in_reply_to_request_id, acceptance_sequence, delivery_status, created_at_ms, accepted_at_ms, delivered_at_ms)
-        VALUES (?, ?, ?, ?, ?, 'steer', 1, NULL, 1, 'delivered', ?, ?, ?)
-      `).run(input.messageId, input.spawner.agentId, input.child.agentId, input.sourceEntryId, input.payloadDigest, input.createdAtMs, input.createdAtMs, input.createdAtMs);
+        INSERT INTO direct_signal_messages (message_id, sender_agent_id, recipient_agent_id, source_entry_id, payload_digest, delivery_timing, response_required, activation_intent, in_reply_to_request_id, acceptance_sequence, delivery_status, created_at_ms, accepted_at_ms, delivered_at_ms)
+        VALUES (?, ?, ?, ?, ?, 'steer', 1, ?, NULL, 1, 'delivered', ?, ?, ?)
+      `).run(input.messageId, input.spawner.agentId, input.child.agentId, input.sourceEntryId, input.payloadDigest, input.activationIntent, input.createdAtMs, input.createdAtMs, input.createdAtMs);
       this.#database.prepare("INSERT INTO recipient_acceptance_counters (agent_id, last_sequence) VALUES (?, 1)").run(input.child.agentId);
-      this.#createRequest({ workflowOwnerId: input.spawner.workflowOwnerId, messageId: input.messageId, senderAgentId: input.spawner.agentId, recipientAgentId: input.child.agentId, sourceEntryId: input.sourceEntryId, payloadDigest: input.payloadDigest, deliveryTiming: "steer", responseRequired: true, message: "" });
+      this.#createRequest({ workflowOwnerId: input.spawner.workflowOwnerId, messageId: input.messageId, senderAgentId: input.spawner.agentId, recipientAgentId: input.child.agentId, sourceEntryId: input.sourceEntryId, payloadDigest: input.payloadDigest, deliveryTiming: "steer", responseRequired: true, activationIntent: input.activationIntent, message: "" });
       return { status: "delivered", messageId: input.messageId, recipientAgentId: input.child.agentId, acceptanceSequence: 1, childAgentId: input.child.agentId, runId: input.runId, fencingEpoch };
     });
   }
@@ -413,6 +416,9 @@ export class DirectSignalStore {
           throw new WorkflowProtocolError("MessageIdentityConflict", `Prepared reactivation Message ${input.request.messageId} does not match bound Message ${existing.message_id}`);
         }
       }
+      const sender = this.#readAgent(input.request.senderAgentId);
+      if (!sender) throw new WorkflowProtocolError("UnknownAgent", `Unknown Workflow Agent: ${input.request.senderAgentId}`);
+      this.#assertActivationPolicy({ requesterAgentId: input.request.senderAgentId, targetAgentId: input.recipient.agentId, member: sender });
       if (this.#recipientLifecycle(input.recipient) !== "ended") {
         throw new WorkflowProtocolError("InvalidLifecycleTransition", `Agent ${input.recipient.agentId} is no longer ended`);
       }
@@ -444,8 +450,8 @@ export class DirectSignalStore {
           SET acceptance_sequence = ?, delivery_status = 'accepted', accepted_at_ms = ?, reactivates_recipient = 1
           WHERE message_id = ? AND delivery_status = 'bound'`).run(sequence, input.acceptedAtMs, existing.message_id);
       } else {
-        this.#database.prepare(`INSERT INTO direct_signal_messages (message_id, sender_agent_id, recipient_agent_id, source_entry_id, payload_digest, delivery_timing, response_required, reactivates_recipient, in_reply_to_request_id, acceptance_sequence, delivery_status, created_at_ms, accepted_at_ms, delivered_at_ms)
-          VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, 'accepted', ?, ?, NULL)`).run(input.request.messageId, input.request.senderAgentId, input.request.recipientAgentId, input.request.sourceEntryId, input.request.payloadDigest, input.request.deliveryTiming, input.request.inReplyToRequestId ?? null, sequence, input.acceptedAtMs, input.acceptedAtMs);
+        this.#database.prepare(`INSERT INTO direct_signal_messages (message_id, sender_agent_id, recipient_agent_id, source_entry_id, payload_digest, delivery_timing, response_required, activation_intent, reactivates_recipient, in_reply_to_request_id, acceptance_sequence, delivery_status, created_at_ms, accepted_at_ms, delivered_at_ms)
+          VALUES (?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?, 'accepted', ?, ?, NULL)`).run(input.request.messageId, input.request.senderAgentId, input.request.recipientAgentId, input.request.sourceEntryId, input.request.payloadDigest, input.request.deliveryTiming, input.request.activationIntent ?? null, input.request.inReplyToRequestId ?? null, sequence, input.acceptedAtMs, input.acceptedAtMs);
       }
       if (input.request.inReplyToRequestId) this.#claimAnswerSlot(input.request);
       this.#createRequest(input.request);
@@ -459,9 +465,20 @@ export class DirectSignalStore {
     });
   }
 
-  assertEndedRecipientRequestAuthorized(sender: AgentReference, recipient: AgentReference): void {
+  assertSpawnActivationPreflight(requester: AgentReference): void {
+    this.#assertWorkflow(requester.workflowOwnerId);
+    const member = this.#readAgent(requester.agentId);
+    if (!member) throw new WorkflowProtocolError("UnknownAgent", `Unknown Workflow Agent: ${requester.agentId}`);
+    this.#assertActivationPolicy({ requesterAgentId: requester.agentId, targetAgentId: "new child Agent", member });
+  }
+
+  assertEndedRecipientActivationPreflight(sender: AgentReference, recipient: AgentReference): void {
     this.#assertWorkflow(sender.workflowOwnerId);
+    this.#requireAgent(recipient.agentId);
     this.#assertReactivationAuthorized(sender.agentId, recipient);
+    const member = this.#readAgent(sender.agentId);
+    if (!member) throw new WorkflowProtocolError("UnknownAgent", `Unknown Workflow Agent: ${sender.agentId}`);
+    this.#assertActivationPolicy({ requesterAgentId: sender.agentId, targetAgentId: recipient.agentId, member });
   }
 
   /** Reconcile only an exact Router/ownership/activation footprint after IPC loss. */
@@ -827,6 +844,7 @@ export class DirectSignalStore {
         payload_digest TEXT NOT NULL, delivery_timing TEXT NOT NULL CHECK (delivery_timing IN ('steer', 'deferred')),
         response_required INTEGER NOT NULL CHECK (response_required IN (0, 1)),
         on_accepted TEXT NOT NULL DEFAULT 'continue' CHECK (on_accepted IN ('continue', 'complete')),
+        activation_intent TEXT,
         reactivates_recipient INTEGER NOT NULL DEFAULT 0 CHECK (reactivates_recipient IN (0, 1)), in_reply_to_request_id TEXT,
         acceptance_sequence INTEGER, delivery_status TEXT NOT NULL CHECK (delivery_status IN ('bound', 'accepted', 'delivered', 'suppressed')),
         created_at_ms INTEGER NOT NULL, accepted_at_ms INTEGER, delivered_at_ms INTEGER,
@@ -868,6 +886,7 @@ export class DirectSignalStore {
     `);
     this.#ensureColumn("direct_signal_messages", "reactivates_recipient", "INTEGER NOT NULL DEFAULT 0 CHECK (reactivates_recipient IN (0, 1))");
     this.#ensureColumn("direct_signal_messages", "on_accepted", "TEXT NOT NULL DEFAULT 'continue' CHECK (on_accepted IN ('continue', 'complete'))");
+    this.#ensureColumn("direct_signal_messages", "activation_intent", "TEXT");
     this.#ensureColumn("pending_message_pointers", "reactivates_recipient", "INTEGER NOT NULL DEFAULT 0 CHECK (reactivates_recipient IN (0, 1))");
     this.#ensureColumn("direct_signal_messages", "activation_notice_kind", "TEXT CHECK (activation_notice_kind IN ('request-orphaned'))");
     this.#ensureColumn("direct_signal_messages", "activation_notice_request_id", "TEXT REFERENCES workflow_requests(request_id)");
@@ -968,7 +987,29 @@ export class DirectSignalStore {
   #readMessage(id: string): MessageRow | undefined { return this.#database.prepare("SELECT * FROM direct_signal_messages WHERE message_id = ?").get(id) as MessageRow | undefined; }
   #readMessageBySource(sender: string, source: string): MessageRow | undefined { return this.#database.prepare("SELECT * FROM direct_signal_messages WHERE sender_agent_id = ? AND source_entry_id = ?").get(sender, source) as MessageRow | undefined; }
   #readRequest(id: string): RequestRow | undefined { return this.#database.prepare("SELECT * FROM workflow_requests WHERE request_id = ?").get(id) as RequestRow | undefined; }
-  #readAgent(agentId: string): { capabilities_json: string } | undefined { return this.#database.prepare("SELECT capabilities_json FROM workflow_agents WHERE agent_id = ?").get(agentId) as { capabilities_json: string } | undefined; }
+  #readAgent(agentId: string): { delegation_policy: DelegationPolicy | null; agent_definition: string | null } | undefined {
+    return this.#database.prepare("SELECT delegation_policy, agent_definition FROM workflow_agents WHERE agent_id = ?").get(agentId) as {
+      delegation_policy: DelegationPolicy | null;
+      agent_definition: string | null;
+    } | undefined;
+  }
+  #assertActivationPolicy(input: {
+    requesterAgentId: string;
+    targetAgentId: string;
+    member: { delegation_policy: DelegationPolicy | null; agent_definition: string | null };
+  }): void {
+    const owner = this.#workflowOwnerId();
+    if (input.requesterAgentId === owner) return;
+    if (input.member.agent_definition === "moderator") {
+      throw new WorkflowProtocolError("InvalidSpawner", `Moderator ${input.requesterAgentId} cannot create child Agents`);
+    }
+    if (input.member.delegation_policy === "disabled") {
+      throw new WorkflowProtocolError("SpawnerDelegationDisabled", `Agent ${input.requesterAgentId} cannot activate child Agent ${input.targetAgentId} because its delegation policy is disabled`);
+    }
+    if (input.member.delegation_policy === "approval-required" || input.member.delegation_policy == null) {
+      throw new WorkflowProtocolError("DelegatedActivationApprovalRequired", `Agent ${input.requesterAgentId} needs delegated activation approval before activating child Agent ${input.targetAgentId}`);
+    }
+  }
   #spawnOwnershipEpoch(workflowOwnerId: string, agentId: string, runId: string): number {
     const resourceId = `agent-run:${workflowOwnerId}:${agentId}`;
     const row = this.#database.prepare("SELECT fencing_epoch FROM ownership WHERE resource_id = ? AND owner_id = ?").get(resourceId, runId) as { fencing_epoch: number } | undefined;
@@ -977,18 +1018,18 @@ export class DirectSignalStore {
   }
   #assertSpawnBinding(existing: MessageRow, input: SpawnedInitialRequestInput): void {
     const child = this.#database.prepare(`
-      SELECT session_path, name, agent_definition, capabilities_json, spawner_agent_id
+      SELECT session_path, name, agent_definition, delegation_policy, spawner_agent_id
       FROM workflow_agents WHERE agent_id = ?
     `).get(input.child.agentId) as {
       session_path: string; name: string; agent_definition: string | null;
-      capabilities_json: string; spawner_agent_id: string | null;
+      delegation_policy: DelegationPolicy | null; spawner_agent_id: string | null;
     } | undefined;
     const matches = child
       && child.session_path === input.child.sessionPath
       && child.name === input.child.name
       && child.agent_definition === input.child.agentDefinition
       && child.spawner_agent_id === input.spawner.agentId
-      && child.capabilities_json === JSON.stringify({ spawning: input.child.capabilities.spawning });
+      && child.delegation_policy === input.child.delegationPolicy;
     if (!matches) {
       throw new WorkflowProtocolError("MessageIdentityConflict", `Spawn source ${input.sourceEntryId} is already bound to different child metadata`);
     }
@@ -998,10 +1039,10 @@ export class DirectSignalStore {
     input: SpawnedInitialRequestReconciliation,
   ): void {
     const child = this.#database.prepare(`
-      SELECT name, agent_definition, spawner_agent_id, capabilities_json
+      SELECT name, agent_definition, spawner_agent_id, delegation_policy
       FROM workflow_agents WHERE agent_id = ?
     `).get(existing.recipient_agent_id) as {
-      name: string; agent_definition: string | null; spawner_agent_id: string | null; capabilities_json: string;
+      name: string; agent_definition: string | null; spawner_agent_id: string | null; delegation_policy: DelegationPolicy | null;
     } | undefined;
     const activation = this.#database.prepare("SELECT run_id, fencing_epoch FROM agent_activations WHERE agent_id = ? AND activation_sequence = 1").get(existing.recipient_agent_id) as { run_id: string; fencing_epoch: number } | undefined;
     const request = this.#database.prepare("SELECT requester_agent_id, responder_agent_id FROM workflow_requests WHERE request_id = ?").get(existing.message_id) as { requester_agent_id: string; responder_agent_id: string } | undefined;
@@ -1010,13 +1051,14 @@ export class DirectSignalStore {
       && existing.payload_digest === input.payloadDigest
       && existing.delivery_timing === "steer"
       && Number(existing.response_required) === 1
+      && existing.activation_intent === input.activationIntent
       && existing.in_reply_to_request_id === null
       && existing.delivery_status === "delivered"
       && Number(existing.acceptance_sequence) === 1
       && child?.name === input.name
       && child.agent_definition === input.agentDefinition
       && child.spawner_agent_id === input.spawner.agentId
-      && child.capabilities_json === JSON.stringify({ spawning: input.capabilities.spawning })
+      && child.delegation_policy === input.delegationPolicy
       && request?.requester_agent_id === input.spawner.agentId
       && request.responder_agent_id === existing.recipient_agent_id
       && Boolean(activation?.run_id)
@@ -1041,7 +1083,7 @@ function mapMessage(row: MessageRow): DirectSignalRecord {
     ? { kind: "protocol-notice" as const, protocolNoticeKind, canonicalRequestId: canonicalRequestId! }
     : row.in_reply_to_request_id ? { kind: "answer" as const, inReplyToRequestId: row.in_reply_to_request_id }
       : row.response_required ? { kind: "request" as const } : { kind: "signal" as const };
-  return { messageId: row.message_id, ...answer, senderAgentId: row.sender_agent_id, recipientAgentId: row.recipient_agent_id, sourceEntryId: row.source_entry_id, payloadDigest: row.payload_digest, deliveryTiming: row.delivery_timing, responseRequired: Number(row.response_required) === 1, onAccepted: row.on_accepted, ...(row.acceptance_sequence == null ? {} : { acceptanceSequence: Number(row.acceptance_sequence) }), deliveryStatus: row.delivery_status, createdAtMs: Number(row.created_at_ms), ...(row.accepted_at_ms == null ? {} : { acceptedAtMs: Number(row.accepted_at_ms) }), ...(row.delivered_at_ms == null ? {} : { deliveredAtMs: Number(row.delivered_at_ms) }) };
+  return { messageId: row.message_id, ...answer, senderAgentId: row.sender_agent_id, recipientAgentId: row.recipient_agent_id, sourceEntryId: row.source_entry_id, payloadDigest: row.payload_digest, deliveryTiming: row.delivery_timing, responseRequired: Number(row.response_required) === 1, onAccepted: row.on_accepted, ...(row.activation_intent ? { activationIntent: row.activation_intent } : {}), ...(row.acceptance_sequence == null ? {} : { acceptanceSequence: Number(row.acceptance_sequence) }), deliveryStatus: row.delivery_status, createdAtMs: Number(row.created_at_ms), ...(row.accepted_at_ms == null ? {} : { acceptedAtMs: Number(row.accepted_at_ms) }), ...(row.delivered_at_ms == null ? {} : { deliveredAtMs: Number(row.delivered_at_ms) }) };
 }
 function mapPointer(row: PointerRow): PendingMessagePointer { const protocolNoticeKind = row.protocol_notice_kind ?? row.activation_notice_kind; const canonicalRequestId = row.canonical_request_id ?? row.activation_notice_request_id; return { messageId: row.message_id, senderAgentId: row.sender_agent_id, recipientAgentId: row.recipient_agent_id, sourceEntryId: row.source_entry_id, payloadDigest: row.payload_digest, deliveryTiming: row.delivery_timing, responseRequired: Number(row.response_required) === 1, reactivatesRecipient: Number(row.reactivates_recipient) === 1, ...(row.in_reply_to_request_id ? { inReplyToRequestId: row.in_reply_to_request_id } : {}), ...(protocolNoticeKind ? { protocolNoticeKind, canonicalRequestId: canonicalRequestId! } : {}), acceptanceSequence: Number(row.acceptance_sequence), acceptedAtMs: Number(row.accepted_at_ms), projectionClaimed: Number(row.projection_claimed) === 1, projectionCommitted: Number(row.projection_committed) === 1 }; }
 function mapRequest(row: RequestRow): RequestRecord {
@@ -1085,9 +1127,9 @@ function cancellationReceipt(row: RequestRow): RequestCancellationReceipt {
 }
 
 function receiptFor(row: MessageRow) { if (row.acceptance_sequence == null) throw new Error(`Unaccepted Message ${row.message_id} has no receipt`); return { status: row.delivery_status === "delivered" ? "delivered" as const : "accepted" as const, messageId: row.message_id, recipientAgentId: row.recipient_agent_id, acceptanceSequence: Number(row.acceptance_sequence) }; }
-function assertSameBinding(row: MessageRow, request: { sender: AgentReference; recipient: AgentReference; sourceEntryId: string; payloadDigest: string; deliveryTiming: SignalDeliveryTiming; responseRequired: boolean; inReplyToRequestId?: string; onAccepted?: "continue" | "complete" } | SignalAcceptRequest): void {
+function assertSameBinding(row: MessageRow, request: { sender: AgentReference; recipient: AgentReference; sourceEntryId: string; payloadDigest: string; deliveryTiming: SignalDeliveryTiming; responseRequired: boolean; activationIntent?: string; inReplyToRequestId?: string; onAccepted?: "continue" | "complete" } | SignalAcceptRequest): void {
   const sender = "sender" in request ? request.sender.agentId : request.senderAgentId; const recipient = "recipient" in request ? request.recipient.agentId : request.recipientAgentId;
-  const matches = row.sender_agent_id === sender && row.recipient_agent_id === recipient && row.source_entry_id === request.sourceEntryId && row.payload_digest === request.payloadDigest && row.delivery_timing === request.deliveryTiming && Number(row.response_required) === (request.responseRequired ? 1 : 0) && row.in_reply_to_request_id === (request.inReplyToRequestId ?? null) && row.on_accepted === (request.onAccepted ?? "continue");
+  const matches = row.sender_agent_id === sender && row.recipient_agent_id === recipient && row.source_entry_id === request.sourceEntryId && row.payload_digest === request.payloadDigest && row.delivery_timing === request.deliveryTiming && Number(row.response_required) === (request.responseRequired ? 1 : 0) && row.activation_intent === (request.activationIntent ?? null) && row.in_reply_to_request_id === (request.inReplyToRequestId ?? null) && row.on_accepted === (request.onAccepted ?? "continue");
   if (!matches) throw new WorkflowProtocolError("MessageIdentityConflict", `Message Identity ${"messageId" in request ? request.messageId : row.message_id} is already bound to different routing or source metadata`);
 }
 

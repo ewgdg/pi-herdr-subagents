@@ -147,7 +147,7 @@ export interface LegacySpawnRequest<SpawnParams> {
   params: SpawnParams;
   context: LegacyLaunchContext;
   parentThinking: ThinkingLevel;
-  spawnedInitialRequest?: { sourceEntryId: string; message: string };
+  spawnedInitialRequest?: { sourceEntryId: string; message: string; activationIntent: string };
 }
 
 export interface LegacyResumeRequest {

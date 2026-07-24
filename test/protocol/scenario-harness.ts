@@ -7,12 +7,12 @@ import {
 } from "../../pi-extension/subagents/protocol/workflow-session-binding.ts";
 import {
   WorkflowControlPlane,
-  type AgentCapabilityConfiguration,
   type AgentRecord,
   type AgentReference,
   type AgentRunOwnership,
   type ActivationRecord,
   type DeclaredActivationDependency,
+  type DelegationPolicy,
   type FailedExit,
   type InterruptionRequest,
   type WorkflowRecord,
@@ -114,8 +114,9 @@ export class ControllableTranscriptAdapter {
       sourceEntryId?: string;
       targetAgentId?: string;
       targetRequestId?: string;
-      targetSpawn?: { agent: string; name?: string };
+      targetSpawn?: { agent: string; name?: string; delegationPolicy?: DelegationPolicy };
       message: string;
+      activationIntent?: string;
       timing?: "steer" | "deferred";
       responseRequired?: boolean;
       onAccepted?: "continue" | "complete";
@@ -139,6 +140,7 @@ export class ControllableTranscriptAdapter {
                 ? { request: input.targetRequestId }
                 : { agent: input.targetAgentId },
             message: input.message,
+            ...(input.activationIntent ? { activation: { intent: input.activationIntent } } : {}),
             ...(input.timing === undefined ? {} : { timing: input.timing }),
             ...(input.responseRequired === undefined
               ? input.targetSpawn ? { responseRequired: true } : {}
@@ -297,8 +299,10 @@ export class ControllableRuntimeAdapter {
     messageId: string;
     sourceEntryId: string;
     message: string;
+    activationIntent: string;
     name: string;
     agentDefinition: string;
+    delegationPolicy?: DelegationPolicy;
     launchPolicy?: import("../../pi-extension/subagents/protocol/workflow-types.ts").AgentLaunchPolicy;
     routerEndpoint?: string;
     checkpoint?: string;
@@ -311,8 +315,10 @@ export class ControllableRuntimeAdapter {
       messageId: input.messageId,
       sourceEntryId: input.sourceEntryId,
       message: input.message,
+      activationIntent: input.activationIntent,
       name: input.name,
       agentDefinition: input.agentDefinition,
+      delegationPolicy: input.delegationPolicy,
       launchPolicy: input.launchPolicy,
       sessionBinding: input.child.workflowBinding,
       routerEndpoint: input.routerEndpoint,
@@ -335,7 +341,7 @@ export class ControllableRuntimeAdapter {
     spawner: AgentReference;
     name: string;
     agentDefinition?: string;
-    capabilities?: AgentCapabilityConfiguration;
+    delegationPolicy?: DelegationPolicy;
     launchPolicy?: import("../../pi-extension/subagents/protocol/workflow-types.ts").AgentLaunchPolicy;
   }): AgentRecord {
     if (!input.session.workflowBinding) {
@@ -347,7 +353,7 @@ export class ControllableRuntimeAdapter {
       spawner: input.spawner,
       name: input.name,
       agentDefinition: input.agentDefinition,
-      capabilities: input.capabilities,
+      delegationPolicy: input.delegationPolicy,
       launchPolicy: input.launchPolicy,
       sessionBinding: input.session.workflowBinding,
     });

@@ -108,7 +108,12 @@ describe("Workflow inspection", () => {
     const scenario = new WorkflowScenario({ rootDirectory: await mkdtemp(join(tmpdir(), "inspection-enum-")) });
     const { runtime: owner } = scenario.createOwner(); test.after(() => owner.close());
     const parentSession = scenario.childSession(owner, "parent");
-    const parent = owner.addAgent({ session: parentSession, spawner: owner.owner(), name: "Parent" });
+    const parent = owner.addAgent({
+      session: parentSession,
+      spawner: owner.owner(),
+      name: "Parent",
+      delegationPolicy: "autonomous",
+    });
     const siblingSession = scenario.childSession(owner, "sibling");
     owner.addAgent({ session: siblingSession, spawner: owner.owner(), name: "Sibling" });
     const parentRuntime = scenario.startAgent(owner.workflow, parentSession); test.after(() => parentRuntime.close());

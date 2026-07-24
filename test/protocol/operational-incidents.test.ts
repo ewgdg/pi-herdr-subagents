@@ -242,9 +242,19 @@ describe("Operational Incidents", () => {
     const secondSession = workflow.childSession(runtime, "scope-second");
     const neighborSession = workflow.childSession(runtime, "scope-neighbor");
     const unrelatedSession = workflow.childSession(runtime, "scope-unrelated");
-    const first = runtime.addAgent({ session: firstSession, spawner: runtime.owner(), name: "Scope First" });
+    const first = runtime.addAgent({
+      session: firstSession,
+      spawner: runtime.owner(),
+      name: "Scope First",
+      delegationPolicy: "autonomous",
+    });
     const second = runtime.addAgent({ session: secondSession, spawner: runtime.owner(), name: "Scope Second" });
-    const neighbor = runtime.addAgent({ session: neighborSession, spawner: runtime.owner(), name: "Scope Neighbor" });
+    const neighbor = runtime.addAgent({
+      session: neighborSession,
+      spawner: runtime.owner(),
+      name: "Scope Neighbor",
+      delegationPolicy: "autonomous",
+    });
     const unrelated = runtime.addAgent({ session: unrelatedSession, spawner: runtime.owner(), name: "Scope Unrelated" });
     const firstRun = runtime.startAgentRun(runtime.agent(first.agentId));
     const secondRun = runtime.startAgentRun(runtime.agent(second.agentId));

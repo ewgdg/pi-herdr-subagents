@@ -75,7 +75,7 @@ describe("durable Workflow identity scenarios", () => {
     runtime.close();
   });
 
-  it("persists membership, direct Spawners, capability configuration, and one Owner across nesting", async () => {
+  it("persists membership, direct Spawners, delegation policy, and one Owner across nesting", async () => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime } = scenario.createOwner();
     const owner = runtime.agent(runtime.workflow.ownerAgentId);
@@ -85,7 +85,7 @@ describe("durable Workflow identity scenarios", () => {
       spawner: owner,
       name: "Parent",
       agentDefinition: "worker",
-      capabilities: { spawning: true },
+      delegationPolicy: "autonomous",
     });
     scenario.clock.advance();
     const parentRuntime = scenario.startAgent(runtime.workflow, parentSession);
@@ -95,21 +95,23 @@ describe("durable Workflow identity scenarios", () => {
       spawner: parentRuntime.agent(parent.agentId),
       name: "Nested Child",
       agentDefinition: "scout",
-      capabilities: { spawning: false },
+      delegationPolicy: "disabled",
     });
 
     runtime.restart();
+    const reopenedOwner = runtime.inspect(runtime.owner());
     const reopenedParent = runtime.inspect(runtime.agent(parent.agentId));
     const reopenedChild = runtime.inspect(runtime.agent(child.agentId));
 
+    assert.equal(reopenedOwner.delegationPolicy, undefined);
     assert.equal(reopenedParent.workflowOwnerId, owner.agentId);
     assert.equal(reopenedParent.spawnerAgentId, owner.agentId);
     assert.equal(reopenedParent.agentDefinition, "worker");
-    assert.deepEqual(reopenedParent.capabilities, { spawning: true });
+    assert.equal(reopenedParent.delegationPolicy, "autonomous");
     assert.equal(reopenedChild.workflowOwnerId, owner.agentId);
     assert.equal(reopenedChild.spawnerAgentId, parent.agentId);
     assert.equal(reopenedChild.agentDefinition, "scout");
-    assert.deepEqual(reopenedChild.capabilities, { spawning: false });
+    assert.equal(reopenedChild.delegationPolicy, "disabled");
     assert.deepEqual(runtime.directChildren(owner).map((agent) => agent.agentId), [parent.agentId]);
     assert.deepEqual(runtime.directChildren(runtime.agent(parent.agentId)).map((agent) => agent.agentId), [child.agentId]);
     assert.deepEqual(new Set(runtime.descendants().map((agent) => agent.workflowOwnerId)), new Set([owner.agentId]));
@@ -117,7 +119,7 @@ describe("durable Workflow identity scenarios", () => {
     runtime.close();
   });
 
-  it("rejects spawning when the durable Spawner capability is disabled", async () => {
+  it("rejects nesting when the direct Spawner delegation policy is disabled", async () => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { runtime } = scenario.createOwner();
     const parentSession = scenario.childSession(runtime, "non-spawner");
@@ -125,7 +127,7 @@ describe("durable Workflow identity scenarios", () => {
       session: parentSession,
       spawner: runtime.agent(runtime.workflow.ownerAgentId),
       name: "Non-spawner",
-      capabilities: { spawning: false },
+      delegationPolicy: "disabled",
     });
     const rejectedChild = scenario.childSession(runtime, "rejected-child");
     const parentRuntime = scenario.startAgent(runtime.workflow, parentSession);
@@ -136,10 +138,66 @@ describe("durable Workflow identity scenarios", () => {
         spawner: parentRuntime.agent(parent.agentId),
         name: "Rejected Child",
       }),
-      (error: unknown) => (error as { code?: string }).code === "SpawnerCapabilityRequired",
+      (error: unknown) => (error as { code?: string }).code === "SpawnerDelegationDisabled",
     );
     assert.equal(runtime.descendants().some((agent) => agent.agentId === rejectedChild.agentId), false);
     parentRuntime.close();
+    runtime.close();
+  });
+
+  it("rejects nesting when the direct Spawner delegation policy requires approval", async () => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime } = scenario.createOwner();
+    const parentSession = scenario.childSession(runtime, "approval-parent");
+    const parent = runtime.addAgent({
+      session: parentSession,
+      spawner: runtime.agent(runtime.workflow.ownerAgentId),
+      name: "Approval Parent",
+    });
+    const rejectedChild = scenario.childSession(runtime, "approval-rejected-child");
+    const parentRuntime = scenario.startAgent(runtime.workflow, parentSession);
+
+    assert.throws(
+      () => parentRuntime.addAgent({
+        session: rejectedChild,
+        spawner: parentRuntime.agent(parent.agentId),
+        name: "Held Child",
+      }),
+      (error: unknown) => (error as { code?: string }).code === "DelegatedActivationApprovalRequired",
+    );
+    assert.equal(runtime.descendants().some((agent) => agent.agentId === rejectedChild.agentId), false);
+    parentRuntime.close();
+    runtime.close();
+  });
+
+  it("persists moderators without a delegation policy and still blocks child creation", async () => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime } = scenario.createOwner();
+    const moderatorSession = scenario.childSession(runtime, "moderator");
+    const moderator = runtime.addAgent({
+      session: moderatorSession,
+      spawner: runtime.agent(runtime.workflow.ownerAgentId),
+      name: "Moderator",
+      agentDefinition: "moderator",
+      delegationPolicy: "autonomous",
+    });
+    assert.equal(runtime.inspect(runtime.agent(moderator.agentId)).delegationPolicy, undefined);
+    runtime.restart();
+    assert.equal(runtime.inspect(runtime.agent(moderator.agentId)).delegationPolicy, undefined);
+
+    const childSession = scenario.childSession(runtime, "moderator-child");
+    const moderatorRuntime = scenario.startAgent(runtime.workflow, moderatorSession);
+
+    assert.throws(
+      () => moderatorRuntime.addAgent({
+        session: childSession,
+        spawner: moderatorRuntime.agent(moderator.agentId),
+        name: "Forbidden Child",
+      }),
+      (error: unknown) => (error as { code?: string }).code === "InvalidSpawner",
+    );
+    assert.equal(runtime.descendants().some((agent) => agent.agentId === childSession.agentId), false);
+    moderatorRuntime.close();
     runtime.close();
   });
 

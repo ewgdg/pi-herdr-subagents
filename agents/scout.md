@@ -4,7 +4,7 @@ description: Fast codebase reconnaissance - maps existing code, conventions, and
 tools: read, bash
 deny-tools: claude
 output: context.md
-spawning: false
+delegation-policy: disabled
 auto-exit: true
 system-prompt: append
 ---

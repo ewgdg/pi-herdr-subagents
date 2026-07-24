@@ -43,7 +43,7 @@ describe("provisional Spawned Initial Request startup fence", () => {
       await gate.waitUntilReady();
       const plan = {
         senderSessionPath: "/sender.jsonl", messageId: "message-1", sourceEntryId: "message-1",
-        senderAgentId: "sender", recipientAgentId: "recipient", payloadDigest: "digest", agentDefinition: "worker", agentName: "Worker",
+        senderAgentId: "sender", recipientAgentId: "recipient", payloadDigest: "digest", activationIntent: "Handle first task", agentDefinition: "worker", agentName: "Worker",
       };
       await gate.project(plan);
       await gate.project(plan);
@@ -52,6 +52,24 @@ describe("provisional Spawned Initial Request startup fence", () => {
       await gate.release({ runId: "run-1", fencingEpoch: 1 });
       assert.equal(adopted, true);
       assert.deepEqual(await childCommit, { runId: "run-1", fencingEpoch: 1 });
+    } finally {
+      await gate.close();
+    }
+  });
+
+  it("treats activation intent as part of provisional projection identity", async () => {
+    const gate = await ProvisionalSpawnGate.create();
+    try {
+      const childCommit = awaitProvisionalSpawnCommit(gate.endpoint, { routerEndpoint: "child-router" });
+      await gate.waitUntilReady();
+      const plan = {
+        senderSessionPath: "/sender.jsonl", messageId: "message-1", sourceEntryId: "message-1",
+        senderAgentId: "sender", recipientAgentId: "recipient", payloadDigest: "digest", activationIntent: "Handle first task", agentDefinition: "worker", agentName: "Worker",
+      };
+      await gate.project(plan);
+      await assert.rejects(() => gate.project({ ...plan, activationIntent: "Handle different task" }), /Conflicting/);
+      await gate.release({ runId: "run-1", fencingEpoch: 1 });
+      await childCommit;
     } finally {
       await gate.close();
     }
@@ -67,7 +85,7 @@ describe("provisional Spawned Initial Request startup fence", () => {
       await gate.waitUntilReady();
       await assert.rejects(gate.project({
         senderSessionPath: "/sender.jsonl", messageId: "message-1", sourceEntryId: "message-1",
-        senderAgentId: "sender", recipientAgentId: "recipient", payloadDigest: "digest", agentDefinition: "worker", agentName: "Worker",
+        senderAgentId: "sender", recipientAgentId: "recipient", payloadDigest: "digest", activationIntent: "Handle projection failure", agentDefinition: "worker", agentName: "Worker",
       }), /child project failure|disconnected/);
       await assert.rejects(child, /child project failure/);
     } finally {
@@ -116,7 +134,7 @@ describe("provisional Spawned Initial Request startup fence", () => {
       await gate.waitUntilReady();
       await gate.project({
         senderSessionPath: "/sender.jsonl", messageId: "message-1", sourceEntryId: "message-1",
-        senderAgentId: "sender", recipientAgentId: "recipient", payloadDigest: "digest", agentDefinition: "worker", agentName: "Worker",
+        senderAgentId: "sender", recipientAgentId: "recipient", payloadDigest: "digest", activationIntent: "Handle release failure", agentDefinition: "worker", agentName: "Worker",
       });
 
       const commit = { runId: "run-1", fencingEpoch: 1 };
@@ -156,7 +174,7 @@ describe("provisional Spawned Initial Request startup fence", () => {
       await gate.waitUntilReady();
       const project = gate.project({
         senderSessionPath: "/sender.jsonl", messageId: "message-1", sourceEntryId: "source-1",
-        senderAgentId: "sender", recipientAgentId: "recipient", payloadDigest: "digest", agentDefinition: "worker", agentName: "Worker",
+        senderAgentId: "sender", recipientAgentId: "recipient", payloadDigest: "digest", activationIntent: "Handle disconnect", agentDefinition: "worker", agentName: "Worker",
       });
       void project.catch(() => undefined);
       await projectStartedPromise;

@@ -9,6 +9,7 @@ export interface AgentDirectSignalMessage {
   recipientAgentId: string;
   deliveryTiming: SignalDeliveryTiming;
   message: string;
+  activationIntent?: string;
   responseRequired?: true;
   inReplyToRequestId?: string;
 }
@@ -48,6 +49,7 @@ export interface DirectSignalRecord {
   deliveryTiming: SignalDeliveryTiming;
   responseRequired: boolean;
   onAccepted: "continue" | "complete";
+  activationIntent?: string;
   inReplyToRequestId?: string;
   acceptanceSequence?: number;
   deliveryStatus: "bound" | "accepted" | "delivered" | "suppressed";
@@ -120,6 +122,7 @@ export interface SignalAcceptRequest {
   deliveryTiming: SignalDeliveryTiming;
   responseRequired: boolean;
   onAccepted?: "continue" | "complete";
+  activationIntent?: string;
   inReplyToRequestId?: string;
   message: string;
   completion?: {

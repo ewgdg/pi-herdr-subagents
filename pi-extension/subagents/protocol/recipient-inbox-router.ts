@@ -345,13 +345,19 @@ export class RecipientInboxRouter {
     );
     const record = this.#store.inspectMessage(this.#options.workflowOwnerId, pointer.messageId);
     if (!record) throw new Error(`Accepted Message ${pointer.messageId} is missing`);
+    const canonical = resolveCanonicalSignal(sessionPath, {
+      ...pointer,
+      activationIntent: record.activationIntent,
+      onAccepted: record.onAccepted,
+    });
     return {
       kind: record.kind,
       messageId: pointer.messageId,
       senderAgentId: pointer.senderAgentId,
       recipientAgentId: pointer.recipientAgentId,
       deliveryTiming: pointer.deliveryTiming,
-      message: resolveCanonicalSignal(sessionPath, pointer),
+      message: canonical.message,
+      ...(canonical.activationIntent ? { activationIntent: canonical.activationIntent } : {}),
       ...(pointer.responseRequired ? { responseRequired: true as const } : {}),
       ...(pointer.inReplyToRequestId ? { inReplyToRequestId: pointer.inReplyToRequestId } : {}),
     };

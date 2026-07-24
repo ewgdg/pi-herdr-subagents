@@ -1195,7 +1195,7 @@ describe("direct Signal protocol scenarios", () => {
     runtime.controlPlane.addActivationDependency(endedRun, { kind: "operation", dependencyId: "acceptance:pre-reactivation" });
     runtime.controlPlane.failAgentRun(endedRun, { error: "ended before Request" });
     const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
-      targetAgentId: recipient.agentId, message: "Resume with this Request.", responseRequired: true,
+      targetAgentId: recipient.agentId, message: "Resume with this Request.", activationIntent: "Resume ended recipient", responseRequired: true,
     });
     let preparations = 0;
     const senderSignals = directSignalRuntime(test, {
@@ -1203,7 +1203,7 @@ describe("direct Signal protocol scenarios", () => {
       allocateMessageId: () => scenario.identities.next(),
     });
     const receipt = await senderSignals.sendMessage({
-      target: { agentId: recipient.agentId }, message: "Resume with this Request.", sourceEntryId, responseRequired: true,
+      target: { agentId: recipient.agentId }, message: "Resume with this Request.", sourceEntryId, responseRequired: true, activationIntent: "Resume ended recipient",
       async prepareEndedRecipient(request) {
         preparations += 1;
         const store = new DirectSignalStore(runtime.workflow.databasePath);
@@ -1231,7 +1231,7 @@ describe("direct Signal protocol scenarios", () => {
     assert.equal(senderSignals.listPending(runtime.agent(recipient.agentId)).length, 1);
 
     const retry = await senderSignals.sendMessage({
-      target: { agentId: recipient.agentId }, message: "Resume with this Request.", sourceEntryId, responseRequired: true,
+      target: { agentId: recipient.agentId }, message: "Resume with this Request.", sourceEntryId, responseRequired: true, activationIntent: "Resume ended recipient",
       async prepareEndedRecipient() { throw new Error("same-source retry must not prepare again"); },
     });
     assert.deepEqual(retry, {
@@ -1245,6 +1245,147 @@ describe("direct Signal protocol scenarios", () => {
     runtime.close();
   });
 
+  it("projects activation intent when an ended child is reactivated through its prepared Recipient Inbox Router", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { session: owner, runtime } = scenario.createOwner();
+    const recipientSession = scenario.childSession(runtime, "ended-delivery");
+    const recipient = runtime.addAgent({
+      session: recipientSession,
+      spawner: runtime.agent(runtime.workflow.ownerAgentId),
+      name: "Ended Recipient",
+    });
+    const endedRun = runtime.controlPlane.acquireAgentRun(runtime.agent(recipient.agentId), scenario.identities.next());
+    runtime.controlPlane.startActivation(endedRun);
+    runtime.controlPlane.failAgentRun(endedRun, { error: "ended before Request delivery" });
+    const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
+      targetAgentId: recipient.agentId,
+      message: "Resume with this Request.",
+      activationIntent: "Resume ended recipient",
+      responseRequired: true,
+    });
+    const projected: InboxBatch[] = [];
+    const router = closeAfter(test, new RecipientInboxRouter({
+      workflowOwnerId: runtime.workflow.ownerAgentId,
+      recipient: runtime.agent(recipient.agentId),
+      databasePath: runtime.workflow.databasePath,
+      projectInboxBatch(batch) { projected.push(batch); },
+      now: scenario.clock.now,
+    }));
+    await router.prepare();
+    let resumedOwnership!: { workflowOwnerId: string; agentId: string; runId: string; epoch: number; resourceId: string };
+    const senderSignals = directSignalRuntime(test, {
+      controlPlane: runtime.controlPlane,
+      allocateMessageId: () => scenario.identities.next(),
+    });
+
+    const receipt = await senderSignals.sendMessage({
+      target: { agentId: recipient.agentId },
+      message: "Resume with this Request.",
+      sourceEntryId,
+      responseRequired: true,
+      activationIntent: "Resume ended recipient",
+      async prepareEndedRecipient(request) {
+        const store = new DirectSignalStore(runtime.workflow.databasePath);
+        try {
+          const prepared = store.acceptEndedRecipientRequest({
+            request,
+            recipient: runtime.agent(recipient.agentId),
+            endpoint: router.endpoint,
+            runId: scenario.identities.next(),
+            checkpoint: JSON.stringify({ surface: "ended-delivery" }),
+            acceptedAtMs: scenario.clock.now(),
+          });
+          resumedOwnership = prepared.ownership;
+          return prepared;
+        } finally {
+          store.close();
+        }
+      },
+    });
+
+    router.activatePrepared(resumedOwnership);
+    await waitFor(() => projected.length === 1);
+    assert.equal(projected[0].messages[0]?.messageId, receipt.messageId);
+    assert.equal(projected[0].messages[0]?.message, "Resume with this Request.");
+    assert.equal(projected[0].messages[0]?.activationIntent, "Resume ended recipient");
+    assert.equal(router.confirmDelivery(receipt.messageId), true);
+    assert.deepEqual(senderSignals.listPending(runtime.agent(recipient.agentId)), []);
+    runtime.close();
+  });
+
+  it("rejects an ended-recipient Request that omits Activation Intent before any effects", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { session: owner, runtime } = scenario.createOwner();
+    const recipientSession = scenario.childSession(runtime, "ended-without-intent");
+    const recipient = runtime.addAgent({
+      session: recipientSession,
+      spawner: runtime.agent(runtime.workflow.ownerAgentId),
+      name: "Ended Recipient",
+    });
+    const endedRun = runtime.controlPlane.acquireAgentRun(runtime.agent(recipient.agentId), scenario.identities.next());
+    runtime.controlPlane.startActivation(endedRun);
+    runtime.controlPlane.failAgentRun(endedRun, { error: "ended before Request" });
+    const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
+      targetAgentId: recipient.agentId,
+      message: "Resume without explicit intent.",
+      responseRequired: true,
+    });
+    const senderSignals = directSignalRuntime(test, {
+      controlPlane: runtime.controlPlane,
+      allocateMessageId: () => scenario.identities.next(),
+    });
+
+    await assert.rejects(() => senderSignals.sendMessage({
+      target: { agentId: recipient.agentId },
+      message: "Resume without explicit intent.",
+      sourceEntryId,
+      responseRequired: true,
+      async prepareEndedRecipient() {
+        assert.fail("activation omission must fail before preparation");
+      },
+    }), (error: unknown) => (error as { code?: string }).code === "ActivationIntentRequired");
+    assert.deepEqual(senderSignals.listMessages(), []);
+    assert.deepEqual(senderSignals.listPending(runtime.agent(recipient.agentId)), []);
+    assert.equal(runtime.inspectActivation(runtime.agent(recipient.agentId))?.state.kind, "ended");
+    runtime.close();
+  });
+
+  it("rejects Activation Intent for interrupted direct-child Requests before any effects", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { session: owner, runtime } = scenario.createOwner();
+    const recipientSession = scenario.childSession(runtime, "interrupted-with-intent");
+    const recipient = runtime.addAgent({
+      session: recipientSession,
+      spawner: runtime.agent(runtime.workflow.ownerAgentId),
+      name: "Interrupted Recipient",
+    });
+    const run = runtime.startAgentRun(runtime.agent(recipient.agentId));
+    const interruption = runtime.requestInterruption(run);
+    runtime.confirmInterruption(run, interruption);
+    const sourceEntryId = scenario.transcripts.appendAgentSend(owner, {
+      targetAgentId: recipient.agentId,
+      message: "Resume interrupted child.",
+      activationIntent: "Forbidden while interrupted",
+      responseRequired: true,
+    });
+    const senderSignals = directSignalRuntime(test, {
+      controlPlane: runtime.controlPlane,
+      allocateMessageId: () => scenario.identities.next(),
+    });
+
+    await assert.rejects(() => senderSignals.sendMessage({
+      target: { agentId: recipient.agentId },
+      message: "Resume interrupted child.",
+      sourceEntryId,
+      responseRequired: true,
+      activationIntent: "Forbidden while interrupted",
+    }), (error: unknown) => (error as { code?: string }).code === "ActivationIntentForbidden");
+    assert.deepEqual(senderSignals.listMessages(), []);
+    assert.deepEqual(senderSignals.listPending(runtime.agent(recipient.agentId)), []);
+    assert.equal(runtime.inspectActivation(runtime.agent(recipient.agentId))?.state.kind, "interrupted");
+    runtime.close();
+  });
+
   it("reconciles a concurrent ended-Request preparation without letting the loser own the resumed run", async () => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { session: ownerSession, runtime } = scenario.createOwner();
@@ -1255,12 +1396,12 @@ describe("direct Signal protocol scenarios", () => {
     runtime.controlPlane.startActivation(oldRun);
     runtime.controlPlane.failAgentRun(oldRun, { error: "ended before concurrent Request" });
     const sourceEntryId = scenario.transcripts.appendAgentSend(ownerSession, {
-      targetAgentId: child.agentId, message: "Resume once.", responseRequired: true,
+      targetAgentId: child.agentId, message: "Resume once.", activationIntent: "Resume ended child once", responseRequired: true,
     });
     const request = {
       workflowOwnerId: runtime.workflow.ownerAgentId, messageId: scenario.identities.next(), senderAgentId: owner.agentId,
       recipientAgentId: child.agentId, sourceEntryId, payloadDigest: digestPayload("Resume once."),
-      deliveryTiming: "steer" as const, responseRequired: true, message: "Resume once.",
+      deliveryTiming: "steer" as const, responseRequired: true, activationIntent: "Resume ended child once", message: "Resume once.",
     };
     const store = new DirectSignalStore(runtime.workflow.databasePath);
     try {
@@ -1286,7 +1427,7 @@ describe("direct Signal protocol scenarios", () => {
     runtime.close();
   });
 
-  it("atomically reactivates an ended recipient for an Answer-plus-Request and preserves its reply slot", async (test) => {
+  it("rejects implicit ended activation from an Answer-plus-Request before any effects", async (test) => {
     const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
     const { session: ownerSession, runtime: ownerRuntime } = scenario.createOwner();
     const owner = ownerRuntime.agent(ownerRuntime.workflow.ownerAgentId);
@@ -1313,59 +1454,24 @@ describe("direct Signal protocol scenarios", () => {
     const answerSource = scenario.transcripts.appendAgentSend(ownerSession, {
       targetRequestId: original.messageId, message: "Decision and follow-up.", responseRequired: true,
     });
-    const boundMessageId = scenario.identities.next();
-    const boundStore = new DirectSignalStore(ownerRuntime.workflow.databasePath);
-    try {
-      boundStore.bindMessage({
-        messageId: boundMessageId, sender: owner, recipient: ownerRuntime.agent(recipient.agentId),
-        sourceEntryId: answerSource, payloadDigest: digestPayload("Decision and follow-up."),
-        deliveryTiming: "steer", responseRequired: true, inReplyToRequestId: original.messageId, createdAtMs: scenario.clock.now(),
-      });
-    } finally { boundStore.close(); }
     let preparations = 0;
-    let resumedActivationId = "";
-    const answer = await ownerMessages.sendMessage({
+    await assert.rejects(ownerMessages.sendMessage({
       target: { requestId: original.messageId }, message: "Decision and follow-up.", sourceEntryId: answerSource, responseRequired: true,
       async prepareEndedRecipient(request) {
         preparations += 1;
         const store = new DirectSignalStore(ownerRuntime.workflow.databasePath);
         try {
-          const accepted = store.acceptEndedRecipientRequest({
+          return store.acceptEndedRecipientRequest({
             request, recipient: ownerRuntime.agent(recipient.agentId), endpoint: "prepared://ended-answer",
             runId: scenario.identities.next(), checkpoint: JSON.stringify({ surface: "ended-answer" }), acceptedAtMs: scenario.clock.now(),
           });
-          resumedActivationId = accepted.ownership.runId;
-          return accepted;
         } finally { store.close(); }
       },
-    });
-    const retry = await ownerMessages.sendMessage({
-      target: { requestId: original.messageId }, message: "Decision and follow-up.", sourceEntryId: answerSource, responseRequired: true,
-      async prepareEndedRecipient() { throw new Error("retry must reconcile durable acceptance"); },
-    });
-
-    assert.deepEqual(retry, {
-      status: answer.status, messageId: answer.messageId, recipientAgentId: answer.recipientAgentId,
-      acceptanceSequence: answer.acceptanceSequence,
-    });
-    assert.equal(preparations, 1);
-    assert.equal(answer.messageId, boundMessageId);
-    assert.equal(ownerMessages.inspectRequest(original.messageId)?.answerMessageId, answer.messageId);
-    assert.equal(ownerMessages.inspectRequest(original.messageId)?.status, "answered");
-    assert.deepEqual(ownerMessages.inspectRequest(answer.messageId), {
-      requestId: answer.messageId, requesterAgentId: owner.agentId, responderAgentId: recipient.agentId,
-      responderActivationId: resumedActivationId,
-      answerDeliveryTiming: "steer", status: "open",
-    });
-    assert.equal(ownerMessages.listPending(ownerRuntime.agent(recipient.agentId))[0]?.inReplyToRequestId, original.messageId);
-
-    const staleSource = scenario.transcripts.appendAgentSend(ownerSession, {
-      targetRequestId: original.messageId, message: "Late collision.", responseRequired: true,
-    });
-    await assert.rejects(ownerMessages.sendMessage({
-      target: { requestId: original.messageId }, message: "Late collision.", sourceEntryId: staleSource, responseRequired: true,
-    }), (error: unknown) => (error as { code?: string }).code === "AnswerAlreadyClosed");
-    assert.equal(ownerMessages.listMessages().length, 2);
+    }), (error: unknown) => (error as { code?: string }).code === "ActivationIntentRequired");
+    assert.equal(preparations, 0);
+    assert.equal(ownerMessages.inspectRequest(original.messageId)?.status, "open");
+    assert.equal(ownerMessages.listMessages().length, 1);
+    assert.equal(ownerMessages.listPending(ownerRuntime.agent(recipient.agentId)).length, 0);
     await recipientMessages.close();
     await ownerMessages.close();
     recipientRuntime.close();

@@ -82,6 +82,7 @@ import {
   superviseLegacyAgentRun,
   type LegacyAgentRunAdapters,
 } from "../pi-extension/subagents/legacy-agent-run.ts";
+import { WorkflowScenario } from "./protocol/scenario-harness.ts";
 
 // Tool-registration behavior is environment-sensitive for child subagents.
 // Isolate the unit suite from inherited parent/child capability variables.
@@ -132,6 +133,13 @@ function withTempDir(run: (dir: string) => void) {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+function readJsonlEntries(path: string): unknown[] {
+  return readFileSync(path, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 }
 
 function createMockExtensionApi() {
@@ -2425,6 +2433,7 @@ describe("tool registration", () => {
     assert.deepEqual(Object.keys(spawn.parameters.properties).sort(), [
       "agent",
       "cwd",
+      "delegationPolicy",
       "fork",
       "interactive",
       "model",
@@ -2520,6 +2529,102 @@ describe("tool registration", () => {
       assert.equal(result.details.id, "adapter-run");
       assert.equal(result.details.status, "started");
       assert.deepEqual(events, ["launched", "presented", "watched", "relayed"]);
+    });
+  });
+
+  it("rejects ordinary Spawned Initial Requests before invoking injected launch adapters when policy blocks activation", async () => {
+    await withFakeHerdr(async () => {
+      const rootDirectories: string[] = [];
+      try {
+        for (const [label, expectedCode] of [["disabled", "SpawnerDelegationDisabled"], ["approval", "DelegatedActivationApprovalRequired"]] as const) {
+          const rootDirectory = createTestDir();
+          rootDirectories.push(rootDirectory);
+          const scenario = new WorkflowScenario({ rootDirectory });
+          const { runtime } = scenario.createOwner();
+          const parentSession = scenario.childSession(runtime, `parent-${label}`);
+          runtime.addAgent({
+            session: parentSession,
+            spawner: runtime.agent(runtime.workflow.ownerAgentId),
+            name: `Parent ${label}`,
+            ...(label === "disabled" ? { delegationPolicy: "disabled" as const } : {}),
+          });
+
+          const { api, registeredTools, eventHandlers } = createMockExtensionApi();
+          const launches: unknown[] = [];
+          const extension = subagentsModule.createSubagentsExtension({
+            legacyAgentRunAdapters: () => ({
+              launcher: {
+                async launch(request: unknown) {
+                  launches.push(request);
+                  throw new Error("blocked activation must not reach launch adapters");
+                },
+                async resume() {
+                  assert.fail("resume must not be called");
+                },
+              },
+              supervisor: {
+                async watch() { return { summary: "done" }; },
+              },
+              resultRelay: {
+                completed() {},
+                failed() {},
+              },
+              ui: {
+                sessionStarted() {},
+                sessionShutdown() {},
+                runStarted() {},
+              },
+            } as any),
+          });
+          extension(api);
+
+          const context = {
+            sessionManager: {
+              getSessionFile: () => parentSession.sessionPath,
+              getSessionId: () => parentSession.agentId,
+              getSessionDir: () => rootDirectory,
+              getEntries: () => readJsonlEntries(parentSession.sessionPath),
+            },
+            ui: {
+              notify() {},
+            },
+            shutdown() {},
+          } as any;
+
+          const sessionStart = eventHandlers.get("session_start")?.[0];
+          assert.ok(sessionStart);
+          await sessionStart({}, context);
+
+          const agentSend = registeredTools.find((tool) => tool.name === "agent_send");
+          assert.ok(agentSend);
+          const sourceEntryId = scenario.transcripts.appendAgentSend(parentSession, {
+            sourceEntryId: `tool-${label}`,
+            targetSpawn: { agent: "worker", name: "Child" },
+            activationIntent: "Handle initial work",
+            message: "Initial work.",
+            onAccepted: "continue",
+          });
+          const params = {
+            target: { spawn: { agent: "worker", name: "Child" } },
+            message: "Initial work.",
+            responseRequired: true,
+            activation: { intent: "Handle initial work" },
+            onAccepted: "continue" as const,
+          };
+
+          await assert.rejects(
+            () => agentSend.execute(sourceEntryId, params, new AbortController().signal, () => {}, context),
+            (error: unknown) => (error as { code?: string }).code === expectedCode,
+          );
+          assert.equal(launches.length, 0);
+
+          const sessionShutdown = eventHandlers.get("session_shutdown")?.[0];
+          if (sessionShutdown) await sessionShutdown({ reason: "test" }, context);
+          runtime.close();
+        }
+      } finally {
+        for (const rootDirectory of rootDirectories) rmSync(rootDirectory, { recursive: true, force: true });
+      }
     });
   });
 
@@ -2622,13 +2727,67 @@ describe("tool registration", () => {
     });
   });
 
-  it("expands spawning false to deny subagent interruption", () => {
+  it("parses delegation-policy frontmatter and resolves explicit override precedence", async () => {
     const testApi = (subagentsModule as any).__test__;
-    const denied = testApi.resolveDenyTools({ spawning: false });
 
-    assert.equal(denied.has("subagent"), true);
-    assert.equal(denied.has("subagent_interrupt"), true);
-    assert.equal(denied.has("subagent_resume"), true);
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "delegation-policy-test-agent",
+        [
+          "name: delegation-policy-test-agent",
+          "delegation-policy: autonomous",
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("delegation-policy-test-agent");
+      assert.ok(loaded, "expected agent to load");
+      assert.equal(loaded.delegationPolicy, "autonomous");
+      assert.equal(
+        testApi.resolveDelegationPolicy(
+          { name: "Child", task: "Work", delegationPolicy: "disabled" },
+          loaded,
+        ),
+        "disabled",
+      );
+      assert.equal(
+        testApi.resolveDelegationPolicy({ name: "Child", task: "Work" }, loaded),
+        "autonomous",
+      );
+      assert.equal(
+        testApi.resolveDelegationPolicy({ name: "Child", task: "Work" }, null),
+        "approval-required",
+      );
+    });
+  });
+
+  it("rejects invalid delegation-policy frontmatter instead of silently defaulting", async () => {
+    const testApi = (subagentsModule as any).__test__;
+
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "invalid-delegation-policy-agent",
+        [
+          "name: invalid-delegation-policy-agent",
+          "delegation-policy: maybe-later",
+        ].join("\n"),
+      );
+
+      assert.throws(
+        () => testApi.loadAgentDefaults("invalid-delegation-policy-agent"),
+        /delegation-policy/i,
+      );
+    });
+  });
+
+  it("does not expand delegation policy into denied tools", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const denied = testApi.resolveDenyTools({ delegationPolicy: "disabled" });
+
+    assert.equal(denied.has("subagent"), false);
+    assert.equal(denied.has("subagent_interrupt"), false);
+    assert.equal(denied.has("subagent_resume"), false);
   });
 
   it("retains the durable restricted policy in no-prompt Request reactivation", () => {

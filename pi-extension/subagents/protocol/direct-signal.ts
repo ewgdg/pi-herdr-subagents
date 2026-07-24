@@ -168,12 +168,14 @@ export class DirectSignalRuntime {
     sourceEntryId: string;
     deliveryTiming?: SignalDeliveryTiming;
     responseRequired?: boolean;
+    activationIntent?: string;
     onAccepted: "continue" | "complete";
     prepareEndedRecipient?: (request: SignalAcceptRequest) => Promise<DurableAcceptanceReceipt>;
   }): Promise<DurableAcceptanceReceipt> {
     this.#assertOpen();
     assertNonEmpty(input.message, "Message");
     assertNonEmpty(input.sourceEntryId, "Message source entry ID");
+    if (input.activationIntent !== undefined) assertNonEmpty(input.activationIntent, "Activation Intent");
     const sender = this.#controlPlane.currentAgent;
     const responseRequired = input.responseRequired === true;
     const onAccepted = input.onAccepted ?? "continue";
@@ -182,6 +184,12 @@ export class DirectSignalRuntime {
     }
     if (onAccepted === "complete" && !this.#ownership) {
       throw new WorkflowProtocolError("OwnerActivationForbidden", "Workflow Owner cannot complete");
+    }
+    if ("requestId" in input.target && input.activationIntent !== undefined) {
+      throw new WorkflowProtocolError(
+        "ActivationIntentForbidden",
+        "Only Agent-targeted Requests may carry an Activation Intent",
+      );
     }
     const target = this.#resolveTarget(sender, input.target, input.deliveryTiming);
     const payloadDigest = digestPayload(input.message);
@@ -192,11 +200,26 @@ export class DirectSignalRuntime {
       payloadDigest,
       deliveryTiming: target.deliveryTiming,
       responseRequired,
+      activationIntent: input.activationIntent,
       inReplyToRequestId: target.inReplyToRequestId,
       onAccepted,
     });
     if (existing && existing.deliveryStatus !== "bound") {
       return this.#store.reconcileAcceptedMessage(sender, existing.messageId, this.#ownership) ?? receiptFor(existing);
+    }
+    const recipientLifecycle = this.#store.recipientLifecycle(target.recipient);
+    const createsActivation = responseRequired && recipientLifecycle === "ended";
+    if (input.activationIntent !== undefined && !createsActivation) {
+      throw new WorkflowProtocolError(
+        "ActivationIntentForbidden",
+        `Agent ${target.recipient.agentId} is not ended; this Request must omit activation intent`,
+      );
+    }
+    if (createsActivation && input.activationIntent === undefined) {
+      throw new WorkflowProtocolError(
+        "ActivationIntentRequired",
+        `Ended Agent ${target.recipient.agentId} requires explicit activation intent`,
+      );
     }
     if (target.inReplyToRequestId && this.#store.inspectRequest(sender.workflowOwnerId, target.inReplyToRequestId)?.status !== "open") {
       throw new WorkflowProtocolError("AnswerAlreadyClosed", `Request ${target.inReplyToRequestId} already has a terminal outcome`);
@@ -207,7 +230,7 @@ export class DirectSignalRuntime {
       if (!responseRequired) {
         throw recipientUnreachable(target.recipient.agentId);
       }
-      this.#store.assertEndedRecipientRequestAuthorized(sender, target.recipient);
+      this.#store.assertEndedRecipientActivationPreflight(sender, target.recipient);
       if (!input.prepareEndedRecipient) throw recipientUnreachable(target.recipient.agentId);
       const request: SignalAcceptRequest = {
         workflowOwnerId: sender.workflowOwnerId,
@@ -219,6 +242,7 @@ export class DirectSignalRuntime {
         deliveryTiming: target.deliveryTiming,
         responseRequired: true,
         onAccepted,
+        activationIntent: input.activationIntent,
         ...(target.inReplyToRequestId ? { inReplyToRequestId: target.inReplyToRequestId } : {}),
         message: input.message,
       };
@@ -234,6 +258,7 @@ export class DirectSignalRuntime {
       payloadDigest,
       deliveryTiming: target.deliveryTiming,
       responseRequired,
+      activationIntent: input.activationIntent,
       inReplyToRequestId: target.inReplyToRequestId,
       onAccepted,
       ...(this.#ownership ? { ownership: this.#ownership } : {}),
@@ -252,6 +277,7 @@ export class DirectSignalRuntime {
       deliveryTiming: target.deliveryTiming,
       responseRequired,
       onAccepted,
+      ...(input.activationIntent ? { activationIntent: input.activationIntent } : {}),
       ...(target.inReplyToRequestId ? { inReplyToRequestId: target.inReplyToRequestId } : {}),
       message: input.message,
       ...(onAccepted === "complete" ? { completion: { ownership: this.#ownership! } } : {}),
@@ -329,15 +355,18 @@ export class DirectSignalRuntime {
     const canonical = {
       messageId: bound.messageId, sourceEntryId: bound.sourceEntryId, recipientAgentId: bound.recipientAgentId,
       payloadDigest: bound.payloadDigest, deliveryTiming: bound.deliveryTiming, responseRequired: bound.responseRequired,
+      activationIntent: bound.activationIntent,
       onAccepted: bound.onAccepted, ...(bound.inReplyToRequestId ? { inReplyToRequestId: bound.inReplyToRequestId } : {}),
       ...(completion ? { completion } : {}),
     };
-    const message = resolveCanonicalSignal(this.#store.senderSessionPath(sender.workflowOwnerId, sender.agentId), canonical);
+    const canonicalContent = resolveCanonicalSignal(this.#store.senderSessionPath(sender.workflowOwnerId, sender.agentId), canonical);
     const request: SignalAcceptRequest = {
       workflowOwnerId: sender.workflowOwnerId, messageId: bound.messageId, senderAgentId: sender.agentId,
       recipientAgentId: bound.recipientAgentId, sourceEntryId: bound.sourceEntryId, payloadDigest: bound.payloadDigest,
       deliveryTiming: bound.deliveryTiming, responseRequired: bound.responseRequired, onAccepted: bound.onAccepted,
-      ...(bound.inReplyToRequestId ? { inReplyToRequestId: bound.inReplyToRequestId } : {}), message,
+      ...(bound.activationIntent ? { activationIntent: bound.activationIntent } : {}),
+      ...(bound.inReplyToRequestId ? { inReplyToRequestId: bound.inReplyToRequestId } : {}),
+      message: canonicalContent.message,
       ...(completion ? { completion } : {}),
     };
     try { await this.#requestReceipt(route.endpoint, request); } catch { /* Probe durable acceptance below. */ }
@@ -606,11 +635,12 @@ function replyError(error: SignalReceiptReply["error"]): Error {
 
 function isWorkflowProtocolErrorCode(code: string | undefined): code is ConstructorParameters<typeof WorkflowProtocolError>[0] {
   return code === "WorkflowMismatch" || code === "UnknownAgent" || code === "OwnershipLost"
+    || code === "ActivationIntentRequired" || code === "ActivationIntentForbidden"
     || code === "RecipientUnreachable" || code === "RecipientEnded" || code === "MessageIdentityConflict"
-    || code === "RecipientReactivationUnauthorized"
+    || code === "RecipientReactivationUnauthorized" || code === "DelegatedActivationApprovalRequired"
     || code === "InvalidCompletionMessage" || code === "CompletionBlocked" || code === "AcceptanceInDoubt"
     || code === "InvalidMessageSource" || code === "AnswerUnauthorized" || code === "AnswerAlreadyClosed" || code === "UnknownRequest"
-    || code === "RequestCancellationUnauthorized" || code === "RequestAlreadyClosed";
+    || code === "RequestCancellationUnauthorized" || code === "RequestAlreadyClosed" || code === "SpawnerDelegationDisabled";
 }
 
 function recipientUnreachable(agentId: string, cause?: unknown): WorkflowProtocolError {

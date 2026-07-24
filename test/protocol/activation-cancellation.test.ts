@@ -22,7 +22,12 @@ async function setupCancellation(test: { after(fn: () => void): void }) {
   const scenario = new WorkflowScenario({ rootDirectory: await mkdtemp(join(tmpdir(), "activation-cancellation-")) });
   const { runtime } = scenario.createOwner();
   const childSession = scenario.childSession(runtime, "child");
-  const child = runtime.addAgent({ session: childSession, spawner: runtime.owner(), name: "Child" });
+  const child = runtime.addAgent({
+    session: childSession,
+    spawner: runtime.owner(),
+    name: "Child",
+    delegationPolicy: "autonomous",
+  });
   const run = runtime.startAgentRun(runtime.agent(child.agentId));
   runtime.checkpoint(run, JSON.stringify({ surface: `pane:${child.agentId}` }));
   const routerStore = new DirectSignalStore(runtime.workflow.databasePath);
@@ -167,6 +172,7 @@ describe("Activation Cancellation", () => {
       session: rootSession,
       spawner: spawnerRuntime.agent(setup.child.agentId),
       name: "Spawner-cancelled Root",
+      delegationPolicy: "autonomous",
     });
     const rootRun = spawnerRuntime.startAgentRun(spawnerRuntime.agent(root.agentId));
     spawnerRuntime.checkpoint(rootRun, JSON.stringify({ surface: "spawner-cancelled-root" }));
@@ -436,7 +442,12 @@ describe("Activation Cancellation", () => {
     );
 
     const parentSession = setup.scenario.childSession(setup.runtime, "parent");
-    const parent = setup.runtime.addAgent({ session: parentSession, spawner: setup.runtime.owner(), name: "Parent" });
+    const parent = setup.runtime.addAgent({
+      session: parentSession,
+      spawner: setup.runtime.owner(),
+      name: "Parent",
+      delegationPolicy: "autonomous",
+    });
     const parentRun = setup.runtime.startAgentRun(setup.runtime.agent(parent.agentId));
     const parentRuntime = setup.scenario.startAgent(setup.runtime.workflow, parentSession);
     const grandchildSession = setup.scenario.childSession(parentRuntime, "grandchild");
@@ -512,7 +523,12 @@ describe("Activation Cancellation", () => {
     rootRuntime.checkpoint(seedRun, JSON.stringify({ surface: "survivor-seed" }));
 
     const retainedSession = setup.scenario.childSession(rootRuntime, "retained-dependency");
-    const retained = rootRuntime.addAgent({ session: retainedSession, spawner: rootRuntime.agent(setup.child.agentId), name: "Retained Dependency" });
+    const retained = rootRuntime.addAgent({
+      session: retainedSession,
+      spawner: rootRuntime.agent(setup.child.agentId),
+      name: "Retained Dependency",
+      delegationPolicy: "autonomous",
+    });
     const retainedRun = rootRuntime.startAgentRun(rootRuntime.agent(retained.agentId));
     rootRuntime.checkpoint(retainedRun, JSON.stringify({ surface: "retained-dependency" }));
     const retainedRuntime = setup.scenario.startAgent(setup.runtime.workflow, retainedSession);
@@ -541,6 +557,7 @@ describe("Activation Cancellation", () => {
       session: prunableSession,
       spawner: rootRuntime.agent(setup.child.agentId),
       name: "Prunable Descendant",
+      delegationPolicy: "autonomous",
     });
     const prunableRun = rootRuntime.startAgentRun(rootRuntime.agent(prunable.agentId));
     rootRuntime.checkpoint(prunableRun, JSON.stringify({ surface: "prunable-descendant" }));

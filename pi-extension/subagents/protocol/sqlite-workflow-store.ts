@@ -1,8 +1,8 @@
 import { DatabaseSync } from "node:sqlite";
 import {
   WorkflowProtocolError,
-  type AgentCapabilityConfiguration,
   type AgentRecord,
+  type DelegationPolicy,
   type WorkflowRecord,
 } from "./workflow-types.ts";
 
@@ -28,7 +28,7 @@ interface AgentRow {
   name: string;
   agent_definition: string | null;
   spawner_agent_id: string | null;
-  capabilities_json: string;
+  delegation_policy: DelegationPolicy | null;
   launch_policy_json: string | null;
   created_at_ms: number;
 }
@@ -36,7 +36,6 @@ interface AgentRow {
 export interface OpenOwnerInput {
   workflow: WorkflowRecord;
   ownerName: string;
-  capabilities: AgentCapabilityConfiguration;
 }
 
 export interface AddAgentInput {
@@ -46,7 +45,7 @@ export interface AddAgentInput {
   name: string;
   agentDefinition?: string;
   spawnerAgentId: string;
-  capabilities: AgentCapabilityConfiguration;
+  delegationPolicy?: DelegationPolicy;
   launchPolicy?: import("./workflow-types.ts").AgentLaunchPolicy;
   createdAtMs: number;
 }
@@ -81,7 +80,7 @@ export class SQLiteWorkflowStore {
         name TEXT NOT NULL,
         agent_definition TEXT,
         spawner_agent_id TEXT REFERENCES workflow_agents(agent_id),
-        capabilities_json TEXT NOT NULL,
+        delegation_policy TEXT CHECK (delegation_policy IN ('disabled', 'approval-required', 'autonomous')),
         launch_policy_json TEXT,
         created_at_ms INTEGER NOT NULL
       ) STRICT;
@@ -344,13 +343,12 @@ export class SQLiteWorkflowStore {
       this.#database.prepare(`
         INSERT INTO workflow_agents (
           agent_id, session_path, name, agent_definition,
-          spawner_agent_id, capabilities_json, created_at_ms
-        ) VALUES (?, ?, ?, NULL, NULL, ?, ?)
+          spawner_agent_id, delegation_policy, created_at_ms
+        ) VALUES (?, ?, ?, NULL, NULL, NULL, ?)
       `).run(
         input.workflow.ownerAgentId,
         input.workflow.ownerSessionPath,
         input.ownerName,
-        serializeCapabilities(input.capabilities),
         input.workflow.createdAtMs,
       );
       return input.workflow.createdAtMs;
@@ -387,11 +385,25 @@ export class SQLiteWorkflowStore {
           `Spawner is not a member of Workflow ${workflow.owner_agent_id}: ${input.spawnerAgentId}`,
         );
       }
-      if (!spawner.capabilities.spawning) {
-        throw new WorkflowProtocolError(
-          "SpawnerCapabilityRequired",
-          `Agent ${input.spawnerAgentId} does not have spawning capability`,
-        );
+      if (spawner.agentId !== workflow.owner_agent_id) {
+        if (spawner.agentDefinition === "moderator") {
+          throw new WorkflowProtocolError(
+            "InvalidSpawner",
+            `Moderator ${input.spawnerAgentId} cannot create child Agents`,
+          );
+        }
+        if (spawner.delegationPolicy === "disabled") {
+          throw new WorkflowProtocolError(
+            "SpawnerDelegationDisabled",
+            `Agent ${input.spawnerAgentId} cannot create child Agents because its delegation policy is disabled`,
+          );
+        }
+        if (spawner.delegationPolicy !== "autonomous") {
+          throw new WorkflowProtocolError(
+            "DelegatedActivationApprovalRequired",
+            `Agent ${input.spawnerAgentId} needs delegated activation approval before creating child Agents`,
+          );
+        }
       }
       const existing = this.#readAgent(input.agentId);
       if (existing) {
@@ -404,7 +416,7 @@ export class SQLiteWorkflowStore {
       this.#database.prepare(`
         INSERT INTO workflow_agents (
           agent_id, session_path, name, agent_definition,
-          spawner_agent_id, capabilities_json, launch_policy_json, created_at_ms
+          spawner_agent_id, delegation_policy, launch_policy_json, created_at_ms
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         input.agentId,
@@ -412,7 +424,7 @@ export class SQLiteWorkflowStore {
         input.name,
         input.agentDefinition ?? null,
         input.spawnerAgentId,
-        serializeCapabilities(input.capabilities),
+        input.delegationPolicy ?? null,
         input.launchPolicy ? JSON.stringify(input.launchPolicy) : null,
         input.createdAtMs,
       );
@@ -441,7 +453,7 @@ export class SQLiteWorkflowStore {
     this.inspectAgent(workflowOwnerId, spawnerAgentId);
     return (this.#database.prepare(`
       SELECT agent_id, session_path, name, agent_definition,
-             spawner_agent_id, capabilities_json, launch_policy_json, created_at_ms
+             spawner_agent_id, delegation_policy, launch_policy_json, created_at_ms
       FROM workflow_agents
       WHERE spawner_agent_id = ?
       ORDER BY created_at_ms, agent_id
@@ -452,7 +464,7 @@ export class SQLiteWorkflowStore {
     this.#requireWorkflow(workflowOwnerId);
     return (this.#database.prepare(`
       SELECT agent_id, session_path, name, agent_definition,
-             spawner_agent_id, capabilities_json, launch_policy_json, created_at_ms
+             spawner_agent_id, delegation_policy, launch_policy_json, created_at_ms
       FROM workflow_agents
       ORDER BY created_at_ms, agent_id
     `).all() as unknown as AgentRow[]).map((row) => mapAgentRow(row, workflowOwnerId));
@@ -489,7 +501,7 @@ export class SQLiteWorkflowStore {
     if (!workflowOwnerId) return undefined;
     const row = this.#database.prepare(`
       SELECT agent_id, session_path, name, agent_definition,
-             spawner_agent_id, capabilities_json, launch_policy_json, created_at_ms
+             spawner_agent_id, delegation_policy, launch_policy_json, created_at_ms
       FROM workflow_agents
       WHERE agent_id = ?
     `).get(agentId) as AgentRow | undefined;
@@ -515,12 +527,7 @@ function isTransientSqliteLock(error: unknown): boolean {
     || (typeof candidate.message === "string" && /database is (busy|locked)/i.test(candidate.message));
 }
 
-function serializeCapabilities(capabilities: AgentCapabilityConfiguration): string {
-  return JSON.stringify({ spawning: capabilities.spawning });
-}
-
 function mapAgentRow(row: AgentRow, workflowOwnerId: string): AgentRecord {
-  const capabilities = JSON.parse(row.capabilities_json) as AgentCapabilityConfiguration;
   return {
     workflowOwnerId,
     agentId: row.agent_id,
@@ -528,7 +535,7 @@ function mapAgentRow(row: AgentRow, workflowOwnerId: string): AgentRecord {
     name: row.name,
     ...(row.agent_definition ? { agentDefinition: row.agent_definition } : {}),
     ...(row.spawner_agent_id ? { spawnerAgentId: row.spawner_agent_id } : {}),
-    capabilities: { spawning: capabilities.spawning === true },
+    ...(row.delegation_policy ? { delegationPolicy: row.delegation_policy } : {}),
     ...(row.launch_policy_json ? { launchPolicy: JSON.parse(row.launch_policy_json) } : {}),
     createdAtMs: Number(row.created_at_ms),
   };

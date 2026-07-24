@@ -18,9 +18,9 @@ import { notifyWorkflowOwnerOfAutomaticRecovery } from "./activation-recovery-no
 import {
   WorkflowControlPlane,
   WorkflowProtocolError,
-  type AgentCapabilityConfiguration,
   type AgentRecord,
   type AgentRunOwnership,
+  type DelegationPolicy,
   type WorkflowRecord,
 } from "./workflow-control-plane.ts";
 import {
@@ -99,7 +99,7 @@ export interface PrepareSpawnInput {
   runId: string;
   name: string;
   agentDefinition?: string;
-  capabilities?: AgentCapabilityConfiguration;
+  delegationPolicy?: DelegationPolicy;
   launchPolicy?: import("./workflow-types.ts").AgentLaunchPolicy;
   sessionBinding: WorkflowSessionBinding;
   surface: string;
@@ -471,6 +471,26 @@ export class WorkflowBootstrap {
     });
   }
 
+  assertCurrentAgentMaySpawnChild(): void {
+    const controlPlane = this.#requireControlPlane();
+    const store = new DirectSignalStore(controlPlane.workflow.databasePath);
+    try {
+      store.assertSpawnActivationPreflight(controlPlane.currentAgent);
+    } finally {
+      store.close();
+    }
+  }
+
+  assertCurrentAgentMayReactivateEndedChild(agentId: string): void {
+    const controlPlane = this.#requireControlPlane();
+    const store = new DirectSignalStore(controlPlane.workflow.databasePath);
+    try {
+      store.assertEndedRecipientActivationPreflight(controlPlane.currentAgent, controlPlane.agent(agentId));
+    } finally {
+      store.close();
+    }
+  }
+
   sendDirectMessage(input: {
     target: { agentId: string } | { requestId: string };
     message: string;
@@ -503,8 +523,8 @@ export class WorkflowBootstrap {
     }
   }
 
-  spawnInitialRequest(input: Omit<import("./workflow-control-plane.ts").SpawnedInitialRequestInput, "capabilities"> & {
-    capabilities?: AgentCapabilityConfiguration;
+  spawnInitialRequest(input: Omit<import("./workflow-control-plane.ts").SpawnedInitialRequestInput, "delegationPolicy"> & {
+    delegationPolicy?: DelegationPolicy;
   }) {
     return this.#requireControlPlane().spawnInitialRequest(input);
   }
@@ -514,7 +534,8 @@ export class WorkflowBootstrap {
     agentDefinition: string;
     name: string;
     message: string;
-    capabilities?: AgentCapabilityConfiguration;
+    activationIntent: string;
+    delegationPolicy?: DelegationPolicy;
   }) {
     return this.#requireControlPlane().reconcileSpawnedInitialRequest(input);
   }
@@ -688,7 +709,7 @@ export class WorkflowBootstrap {
         spawner: controlPlane.currentAgent,
         name: input.name,
         agentDefinition: input.agentDefinition,
-        capabilities: input.capabilities,
+        delegationPolicy: input.delegationPolicy,
         launchPolicy: input.launchPolicy,
         sessionBinding: input.sessionBinding,
       });
@@ -1863,6 +1884,7 @@ export class WorkflowBootstrap {
       agentDefinition: plan.agentDefinition,
       name: plan.agentName,
       payloadDigest: plan.payloadDigest,
+      activationIntent: plan.activationIntent,
     });
     await this.#provisionalInboxProjector({
       deliveryTiming: "steer",
@@ -1872,7 +1894,8 @@ export class WorkflowBootstrap {
         senderAgentId: plan.senderAgentId,
         recipientAgentId: plan.recipientAgentId,
         deliveryTiming: "steer",
-        message,
+        message: message.message,
+        activationIntent: message.activationIntent,
         responseRequired: true,
       }],
     });

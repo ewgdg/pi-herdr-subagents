@@ -412,7 +412,8 @@ describe("SQLite cross-process coordination", () => {
       CREATE TABLE workflow_agents (
         agent_id TEXT PRIMARY KEY, session_path TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
         agent_definition TEXT, spawner_agent_id TEXT REFERENCES workflow_agents(agent_id),
-        capabilities_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL
+        delegation_policy TEXT CHECK (delegation_policy IN ('disabled', 'approval-required', 'autonomous')),
+        created_at_ms INTEGER NOT NULL
       ) STRICT;
     `);
     legacy.close();
