@@ -21,6 +21,12 @@ import type { InboxBatch } from "../../pi-extension/subagents/protocol/direct-si
 import { projectInboxBatch } from "../../pi-extension/subagents/protocol/direct-signal-extension.ts";
 import { DirectSignalStore } from "../../pi-extension/subagents/protocol/sqlite-message-store.ts";
 import { ActivationCancellationStore } from "../../pi-extension/subagents/protocol/activation-cancellation.ts";
+import type {
+  OperationEvidence,
+  OperationReviewPolicy,
+  OperationReconciliationOutcome,
+  OperationReviewRecord,
+} from "../../pi-extension/subagents/protocol/operation-review.ts";
 
 export class ManualClock {
   #now: number;
@@ -372,6 +378,41 @@ export class ControllableRuntimeAdapter {
     return this.#controlPlane.inspectActivation(agent);
   }
 
+  inspectOperationReview(operationReviewId: number) {
+    return this.#controlPlane.inspectOperationReview(operationReviewId);
+  }
+
+  listOperationReviews(agent: AgentReference) {
+    return this.#controlPlane.listOperationReviews(agent);
+  }
+
+  listOperationReviewEvidence(operationReviewId: number) {
+    return this.#controlPlane.listOperationReviewEvidence(operationReviewId);
+  }
+
+  recordOperationEvidence(
+    operationReviewId: number,
+    evidence: Omit<OperationEvidence, "observedAtMs">,
+  ) {
+    return this.#controlPlane.recordOperationEvidence(operationReviewId, evidence);
+  }
+
+  listWorkflowAttention() {
+    return this.#controlPlane.listWorkflowAttention();
+  }
+
+  reconcileOperationReviews(
+    reconcile: (
+      review: OperationReviewRecord,
+    ) => OperationReconciliationOutcome | Promise<OperationReconciliationOutcome>,
+  ) {
+    return this.#controlPlane.reconcileOperationReviews(reconcile);
+  }
+
+  listOperationIncidentTriggers() {
+    return this.#controlPlane.listOperationIncidentTriggers();
+  }
+
   addActivationDependency(
     run: ScenarioAgentRun,
     dependency: DeclaredActivationDependency,
@@ -530,6 +571,7 @@ export interface WorkflowScenarioOptions {
   clock?: ManualClock;
   identityFactory?: DeterministicIdentityFactory;
   processAdapter?: ControllableProcessAdapter;
+  operationReviewPolicy?: OperationReviewPolicy;
 }
 
 export class WorkflowScenario {
@@ -538,6 +580,7 @@ export class WorkflowScenario {
   readonly identities: DeterministicIdentityFactory;
   readonly transcripts: ControllableTranscriptAdapter;
   readonly processes: ControllableProcessAdapter;
+  readonly operationReviewPolicy: OperationReviewPolicy | undefined;
 
   constructor(options: WorkflowScenarioOptions) {
     this.rootDirectory = options.rootDirectory;
@@ -545,6 +588,7 @@ export class WorkflowScenario {
     this.identities = options.identityFactory ?? new DeterministicIdentityFactory();
     this.transcripts = new ControllableTranscriptAdapter(this.identities, this.clock);
     this.processes = options.processAdapter ?? new ControllableProcessAdapter();
+    this.operationReviewPolicy = options.operationReviewPolicy;
   }
 
   createOwner(name = "Owner"): { session: ScenarioSession; runtime: ControllableRuntimeAdapter } {
@@ -557,6 +601,7 @@ export class WorkflowScenario {
       ownerSessionId: owner.agentId,
       ownerSessionPath: owner.sessionPath,
       ownerName: name,
+      operationReviewPolicy: this.operationReviewPolicy,
       now: this.clock.now,
     });
     return new ControllableRuntimeAdapter(open(), this.processes, open, this.clock.now);

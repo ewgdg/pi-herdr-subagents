@@ -3,12 +3,18 @@ import { DatabaseSync } from "node:sqlite";
 import { DirectSignalStore } from "./sqlite-message-store.ts";
 import { cancelOpenRequestInTransaction } from "./request-cancellation-transition.ts";
 import {
+  recordActiveOperationReviewEvidenceInTransaction,
+  recordOperationReviewEvidenceInTransaction,
+} from "./operation-review.ts";
+import {
   WorkflowProtocolError,
   type AgentReference,
 } from "./workflow-types.ts";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 const CANCELLATION_DEPENDENCY_PREFIX = "cancellation:";
+const CANCELLATION_REVALIDATION_FAILURE =
+  "Exact activation/run/epoch/revision/checkpoint revalidation failed";
 
 export type CancellationOperationState =
   | "terminating"
@@ -685,12 +691,25 @@ export class ActivationCancellationStore {
             last_error = ?, updated_at_ms = ?
         WHERE operation_id = ? AND state != 'committed'`
       ).run(error, now, operationId);
+      recordActiveOperationReviewEvidenceInTransaction(this.#database, {
+        activationId: operation.activation_id,
+        dependencyId: `${CANCELLATION_DEPENDENCY_PREFIX}${operationId}`,
+        evidence: {
+          kind: "cancellation-uncertainty",
+          detail: error,
+        },
+        observedAtMs: now,
+      });
       return mapCancellation(this.#readRequired(operationId));
     });
   }
 
   /** One write transaction owns all cancellation effects and completion arbitration. */
-  finalize(operationId: string, now: number): ActivationCancellationRecord {
+  finalize(
+    operationId: string,
+    now: number,
+    operationReviewId?: number,
+  ): ActivationCancellationRecord {
     return this.#withImmediateTransaction(() => {
       const operation = this.#readRequired(operationId);
       if (operation.state === "committed") return mapCancellation(operation);
@@ -721,7 +740,26 @@ export class ActivationCancellationStore {
         this.#database.prepare(`UPDATE activation_cancellations
           SET state = 'in-doubt', last_error = ?, updated_at_ms = ?
           WHERE operation_id = ? AND state != 'committed'`
-        ).run("Exact activation/run/epoch/revision/checkpoint revalidation failed", now, operationId);
+        ).run(CANCELLATION_REVALIDATION_FAILURE, now, operationId);
+        const evidence = {
+          dependencyId: `${CANCELLATION_DEPENDENCY_PREFIX}${operationId}`,
+          evidence: {
+            kind: "cancellation-uncertainty",
+            detail: CANCELLATION_REVALIDATION_FAILURE,
+          },
+          observedAtMs: now,
+        };
+        if (operationReviewId === undefined) {
+          recordActiveOperationReviewEvidenceInTransaction(this.#database, {
+            activationId: operation.activation_id,
+            ...evidence,
+          });
+        } else {
+          recordOperationReviewEvidenceInTransaction(this.#database, {
+            operationReviewId,
+            ...evidence,
+          });
+        }
         return mapCancellation(this.#readRequired(operationId));
       }
 

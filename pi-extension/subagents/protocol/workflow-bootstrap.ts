@@ -43,6 +43,14 @@ import {
   ActivationCancellationInspectionStore,
   type AgentRunTerminator,
 } from "./activation-cancellation.ts";
+import type {
+  OperationReviewPolicy,
+} from "./operation-review.ts";
+import {
+  assertOperationReconciliationConfigured,
+  reconcileKnownOperation,
+  type ExtensionOperationReconciler,
+} from "./operation-reconciliation.ts";
 
 export const WORKFLOW_OWNER_SESSION_ID_ENV = "PI_WORKFLOW_OWNER_SESSION_ID";
 export const WORKFLOW_OWNER_SESSION_PATH_ENV = "PI_WORKFLOW_OWNER_SESSION_PATH";
@@ -54,6 +62,7 @@ export const WORKFLOW_AGENT_ROLE_ENV = "PI_WORKFLOW_AGENT_ROLE";
 const SESSION_BOOTSTRAP_RETRY_MS = 25;
 const AUTOMATIC_RECOVERY_RECONCILIATION_RETRY_MS = 25;
 const AUTOMATIC_RECOVERY_RECONCILIATION_MAX_ATTEMPTS = 8;
+const OPERATION_REVIEW_DISCOVERY_INTERVAL_MS = 1_000;
 
 export interface WorkflowBootstrapContext {
   sessionManager?: {
@@ -149,6 +158,8 @@ export class WorkflowBootstrap {
   readonly #confirmRunTerminated: ((locator: AgentRunLocator) => Promise<boolean>) | undefined;
   readonly #agentRunTerminator: AgentRunTerminator;
   readonly #recoveryPaneLocator: RecoveryPaneLocator | undefined;
+  readonly #extensionOperationReconciler: ExtensionOperationReconciler | undefined;
+  readonly #operationReviewPolicy: OperationReviewPolicy | undefined;
   #controlPlane: WorkflowControlPlane | undefined;
   #sessionId: string | undefined;
   #sessionPath: string | undefined;
@@ -160,6 +171,9 @@ export class WorkflowBootstrap {
   #automaticRecoveryReconciliationPromise: Promise<void> | undefined;
   #automaticRecoveryReconciliationGeneration = 0;
   #automaticRecoveryReconciliationAttempts = 0;
+  #operationReviewTimer: ReturnType<typeof setTimeout> | undefined;
+  #operationReviewPromise: Promise<void> | undefined;
+  #operationReviewGeneration = 0;
   #automaticRecoveryRequested: (() => void | Promise<void>) | undefined;
   #automaticRecoveryReconciled: ((results: AutomaticRecoveryRunReconciliation[]) => void | Promise<void>) | undefined;
   #directSignals: DirectSignalRuntime | undefined;
@@ -181,6 +195,8 @@ export class WorkflowBootstrap {
     confirmRunTerminated?: (locator: AgentRunLocator) => Promise<boolean>;
     agentRunTerminator?: AgentRunTerminator;
     recoveryPaneLocator?: RecoveryPaneLocator;
+    extensionOperationReconciler?: ExtensionOperationReconciler;
+    operationReviewPolicy?: OperationReviewPolicy;
   } = {}) {
     this.#now = options.now ?? Date.now;
     this.#confirmRunTerminated = options.confirmRunTerminated;
@@ -189,6 +205,8 @@ export class WorkflowBootstrap {
       async close() { throw new Error("Agent Run terminator is unavailable"); },
     };
     this.#recoveryPaneLocator = options.recoveryPaneLocator;
+    this.#extensionOperationReconciler = options.extensionOperationReconciler;
+    this.#operationReviewPolicy = options.operationReviewPolicy;
   }
 
   get workflow(): WorkflowRecord | undefined {
@@ -297,6 +315,7 @@ export class WorkflowBootstrap {
         this.#controlPlane = WorkflowControlPlane.startOwner({
           ownerSessionId: sessionId,
           ownerSessionPath: sessionPath,
+          operationReviewPolicy: this.#operationReviewPolicy,
           now: this.#now,
         });
       }
@@ -341,6 +360,7 @@ export class WorkflowBootstrap {
 
   close(): void {
     this.#stopAutomaticRecoveryReconciliation();
+    this.#stopOperationReviewReconciliation();
     if (this.#directSignals) {
       const preserveRouterRegistration = Boolean(
         this.#selfOwnership && this.isCancellationOwnedRun(this.#selfOwnership),
@@ -415,6 +435,7 @@ export class WorkflowBootstrap {
       await this.#provisionalBootstrap;
       return this.startDirectSignalRouter(input);
     }
+    this.#assertOperationReviewConfiguration();
     const runtime = this.#directSignalRuntime();
     runtime.configureInboxDelivery(input);
     await runtime.start();
@@ -427,6 +448,7 @@ export class WorkflowBootstrap {
       input.onAutomaticRecoveryRequested,
       input.onAutomaticRecoveryReconciled,
     );
+    await this.#restartOperationReviewReconciliation();
   }
 
   sendDirectSignal(input: {
@@ -502,6 +524,7 @@ export class WorkflowBootstrap {
 
   async closeDirectSignalRouter(): Promise<void> {
     this.#stopAutomaticRecoveryReconciliation();
+    this.#stopOperationReviewReconciliation();
     const runtime = this.#directSignals;
     this.#directSignals = undefined;
     const preserveRouterRegistration = Boolean(
@@ -512,6 +535,14 @@ export class WorkflowBootstrap {
 
   reconcilePendingDirectSignals(options: { waitForResolution?: boolean } = {}) {
     return this.#directSignalRuntime().reconcilePendingAcceptances(options);
+  }
+
+  listOperationIncidentTriggers() {
+    return this.#requireControlPlane().listOperationIncidentTriggers();
+  }
+
+  listWorkflowAttention() {
+    return this.#requireControlPlane().listWorkflowAttention();
   }
 
   completeCurrentActivation(source: CompletionSource) {
@@ -1099,7 +1130,13 @@ export class WorkflowBootstrap {
     this.#automaticRecoveryReconciliationAttempts = 0;
     const generation = ++this.#automaticRecoveryReconciliationGeneration;
     this.#automaticRecoveryReconciliationPromise = this.#runAutomaticRecoveryReconciliation(generation)
-      .catch(() => undefined)
+      .catch((error) => {
+        process.emitWarning(
+          `Initial automatic recovery reconciliation failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      })
       .finally(() => {
         if (this.#automaticRecoveryReconciliationGeneration === generation) {
           this.#automaticRecoveryReconciliationPromise = undefined;
@@ -1136,7 +1173,13 @@ export class WorkflowBootstrap {
       this.#automaticRecoveryReconciliationTimer = undefined;
       if (generation !== this.#automaticRecoveryReconciliationGeneration) return;
       this.#automaticRecoveryReconciliationPromise = this.#runAutomaticRecoveryReconciliation(generation)
-        .catch(() => undefined)
+        .catch((error) => {
+          process.emitWarning(
+            `Scheduled automatic recovery reconciliation failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        })
         .finally(() => {
           if (this.#automaticRecoveryReconciliationGeneration === generation) {
             this.#automaticRecoveryReconciliationPromise = undefined;
@@ -1156,6 +1199,102 @@ export class WorkflowBootstrap {
     this.#automaticRecoveryReconciliationAttempts = 0;
     this.#automaticRecoveryRequested = undefined;
     this.#automaticRecoveryReconciled = undefined;
+  }
+
+  async #restartOperationReviewReconciliation(): Promise<void> {
+    this.#stopOperationReviewReconciliation();
+    const controlPlane = this.#controlPlane;
+    if (!controlPlane || controlPlane.currentAgent.agentId !== controlPlane.workflow.ownerAgentId) return;
+    const generation = ++this.#operationReviewGeneration;
+    const reconciliation = this.#runOperationReviewReconciliation(generation);
+    this.#operationReviewPromise = reconciliation;
+    try {
+      await reconciliation;
+    } finally {
+      if (this.#operationReviewGeneration === generation) {
+        this.#operationReviewPromise = undefined;
+      }
+    }
+  }
+
+  async #runOperationReviewReconciliation(generation: number): Promise<void> {
+    if (generation !== this.#operationReviewGeneration) return;
+    const controlPlane = this.#controlPlane;
+    if (!controlPlane || controlPlane.currentAgent.agentId !== controlPlane.workflow.ownerAgentId) return;
+    await controlPlane.reconcileOperationReviews(
+      (review) => reconcileKnownOperation({
+        databasePath: controlPlane.workflow.databasePath,
+        workflowOwnerId: controlPlane.workflow.ownerAgentId,
+        agentRunTerminator: this.#agentRunTerminator,
+        now: this.#now,
+      }, review, this.#extensionOperationReconciler),
+      { dueOnly: true },
+    );
+    if (generation !== this.#operationReviewGeneration) return;
+    const deadlines = controlPlane.listWorkflowAttention()
+      .map((attention) => attention.reviewDeadlineAtMs);
+    const untilNextDeadline = deadlines.length > 0
+      ? Math.max(0, Math.min(...deadlines) - this.#now())
+      : OPERATION_REVIEW_DISCOVERY_INTERVAL_MS;
+    const delay = Math.min(
+      OPERATION_REVIEW_DISCOVERY_INTERVAL_MS,
+      untilNextDeadline,
+    );
+    this.#scheduleOperationReviewReconciliation(generation, delay);
+  }
+
+  #scheduleOperationReviewReconciliation(generation: number, delay: number): void {
+    if (generation !== this.#operationReviewGeneration || this.#operationReviewTimer) return;
+    const controlPlane = this.#controlPlane;
+    if (!controlPlane || controlPlane.currentAgent.agentId !== controlPlane.workflow.ownerAgentId) return;
+    this.#operationReviewTimer = setTimeout(() => {
+      this.#operationReviewTimer = undefined;
+      if (generation !== this.#operationReviewGeneration) return;
+      const reconciliation = this.#runOperationReviewReconciliation(generation)
+        .catch((error) => {
+          process.emitWarning(
+            `Scheduled Operation Review reconciliation failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          this.#scheduleOperationReviewReconciliation(
+            generation,
+            OPERATION_REVIEW_DISCOVERY_INTERVAL_MS,
+          );
+        })
+        .finally(() => {
+          if (
+            this.#operationReviewGeneration === generation
+            && this.#operationReviewPromise === reconciliation
+          ) {
+            this.#operationReviewPromise = undefined;
+          }
+        });
+      this.#operationReviewPromise = reconciliation;
+    }, delay);
+    this.#operationReviewTimer.unref?.();
+  }
+
+  #stopOperationReviewReconciliation(): void {
+    this.#operationReviewGeneration += 1;
+    if (this.#operationReviewTimer) {
+      clearTimeout(this.#operationReviewTimer);
+      this.#operationReviewTimer = undefined;
+    }
+    this.#operationReviewPromise = undefined;
+  }
+
+  #assertOperationReviewConfiguration(): void {
+    const controlPlane = this.#requireControlPlane();
+    if (controlPlane.currentAgent.agentId !== controlPlane.workflow.ownerAgentId) return;
+    const unresolvedReviews = controlPlane
+      .listWorkflow(controlPlane.owner)
+      .flatMap((agent) => controlPlane.listOperationReviews(controlPlane.agent(agent.agentId)))
+      .filter((review) => review.status !== "resolved");
+    assertOperationReconciliationConfigured(
+      unresolvedReviews,
+      this.#extensionOperationReconciler,
+    );
   }
 
   /** Notify the live Owner to reconcile its durable recovery queue. */

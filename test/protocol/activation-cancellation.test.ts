@@ -366,6 +366,22 @@ describe("Activation Cancellation", () => {
     assert.equal(projected.callerAuthority.cancelActivation, true);
     assert.equal(projected.cancellation.operationId, operationId);
     assert.equal(projected.cancellation.state, "in-doubt");
+    const operationReviewId = projected.operationReviews.find(
+      (review: { dependencyId: string }) => review.dependencyId === `cancellation:${operationId}`,
+    ).operationReviewId as number;
+    const review = setup.runtime.inspectOperationReview(operationReviewId);
+    assert.equal(review?.status, "reconciling");
+    assert.equal(review?.evidenceCount, 1);
+    assert.deepEqual(review?.latestEvidence, {
+      kind: "cancellation-uncertainty",
+      detail: "Post-close Agent Run inspection is unavailable",
+      observedAtMs: setup.scenario.clock.now(),
+    });
+    assert.equal(
+      review?.reviewDeadlineAtMs,
+      (review?.reviewStartedAtMs ?? 0) + 5 * 60_000,
+      "process activity and repeated termination attempts do not renew review policy",
+    );
     const database = new DatabaseSync(setup.runtime.workflow.databasePath, { readOnly: true });
     assert.ok(database.prepare("SELECT 1 FROM recipient_inbox_routers WHERE agent_id = ?").get(setup.child.agentId));
     database.close();
@@ -689,12 +705,24 @@ describe("Activation Cancellation", () => {
       now: 10,
     });
     setup.runtime.addActivationDependency(setup.run, { kind: "operation", dependencyId: "side-effect:concurrent" });
+    const cancellationReviewId = (
+      setup.runtime.inspectTarget({ agent: setup.child.agentId }) as any
+    ).operationReviews.find(
+      (review: { dependencyId: string }) => review.dependencyId === `cancellation:${claim.operationId}`,
+    ).operationReviewId as number;
     store.markReady(claim.operationId, 11);
     const finalization = store.finalize(claim.operationId, 12);
     assert.equal(finalization.state, "in-doubt");
     assert.match(finalization.lastError ?? "", /revalidation failed/);
     assert.equal(setup.runtime.inspectActivation(setup.runtime.agent(setup.child.agentId))?.state.kind, "active");
     assert.equal(setup.runtime.currentAgentRun(setup.runtime.agent(setup.child.agentId))?.runId, setup.run.ownership.runId);
+    const review = setup.runtime.inspectOperationReview(cancellationReviewId);
+    assert.equal(review?.evidenceCount, 1);
+    assert.deepEqual(review?.latestEvidence, {
+      kind: "cancellation-uncertainty",
+      detail: "Exact activation/run/epoch/revision/checkpoint revalidation failed",
+      observedAtMs: 12,
+    });
   });
 
   it("atomically orphans incoming Requests, cancels open outgoing Requests, and preserves answered undelivered Answers", async (test) => {

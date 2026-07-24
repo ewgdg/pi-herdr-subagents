@@ -2,6 +2,7 @@ import type { ActivationRecord, HumanInterruptRecord, UndeclaredSettlementEpisod
 import type { DirectSignalRecord, RequestRecord } from "./direct-signal-types.ts";
 import type { ActivationCancellationRecord } from "./activation-cancellation.ts";
 import type { ActivationRecoveryRecord } from "./activation-recovery.ts";
+import type { OperationReviewRecord } from "./operation-review.ts";
 import type { SQLiteWorkflowStore } from "./sqlite-workflow-store.ts";
 import { WorkflowProtocolError, type AgentRecord, type AgentReference, type WorkflowRecord } from "./workflow-types.ts";
 
@@ -20,6 +21,7 @@ export interface InspectionSources {
   inspectUndeclaredEpisode(agent: AgentReference): UndeclaredSettlementEpisode | undefined;
   inspectActivationCancellation?(agent: AgentReference): ActivationCancellationRecord | undefined;
   inspectActivationRecovery?(agent: AgentReference): ActivationRecoveryRecord | undefined;
+  inspectOperationReviews?(agent: AgentReference): OperationReviewRecord[];
   inspectRequestProjection(requestId: string): {
     request: RequestRecord;
     requestDeliveryStatus?: DirectSignalRecord["deliveryStatus"];
@@ -69,6 +71,9 @@ export class WorkflowInspection {
     const undeclared = activation ? this.#sources.inspectUndeclaredEpisode(reference) : undefined;
     const cancellation = activation ? this.#sources.inspectActivationCancellation?.(reference) : undefined;
     const recovery = activation ? this.#sources.inspectActivationRecovery?.(reference) : undefined;
+    const operationReviews = activation
+      ? this.#sources.inspectOperationReviews?.(reference) ?? []
+      : [];
     const currentCancellation = cancellation?.activationId === activation?.activationId ? cancellation : undefined;
     const dependencies = activation?.state.kind === "waiting"
       ? activation.state.dependencies.map((dependency) => dependency.kind === "agent"
@@ -107,6 +112,15 @@ export class WorkflowInspection {
         ...(currentCancellation.lastError ? { lastError: currentCancellation.lastError } : {}),
       } } : {}),
       ...(recovery ? { recovery: { state: recovery.state } } : {}),
+      ...(operationReviews.length ? { operationReviews: operationReviews.map((review) => ({
+        operationReviewId: review.operationReviewId,
+        dependencyId: review.dependencyId,
+        operationKind: review.operationKind,
+        status: review.status,
+        reviewDeadlineAtMs: review.reviewDeadlineAtMs,
+        reconciliationAttempts: review.reconciliationAttempts,
+        evidenceCount: review.evidenceCount,
+      })) } : {}),
     };
   }
 

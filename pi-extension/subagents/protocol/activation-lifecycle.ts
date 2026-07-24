@@ -13,6 +13,10 @@ import {
   resolveRecoveryReplacementIfWorkIsGone,
   resolveActiveRecovery,
 } from "./activation-recovery.ts";
+import {
+  initializeOperationReviewSchema,
+  transferOperationReviewsInTransaction,
+} from "./operation-review.ts";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 const HUMAN_DEPENDENCY_ID = "human";
@@ -255,6 +259,16 @@ export function startOwnedActivationInTransaction(
       WHERE agent_id = ? AND tool_call_id = ?`)
       .run(ownership.runId, now, ownership.agentId, recoveredHuman.tool_call_id);
   }
+  if (recoveredOperations.length > 0) {
+    transferOperationReviewsInTransaction(database, {
+      sourceActivationId: current!.activation_id,
+      targetActivationId: ownership.runId,
+      ownership: {
+        runId: ownership.runId,
+        fencingEpoch: ownership.epoch,
+      },
+    });
+  }
   for (const operation of recoveredOperations) {
     database.prepare(`INSERT INTO activation_dependencies (
       activation_id, dependency_kind, dependency_id, dependency_agent_id, created_at_ms
@@ -382,6 +396,7 @@ export class ActivationLifecycleStore {
       ) STRICT;
 
     `);
+    initializeOperationReviewSchema(this.#database);
     initializeActivationRecoverySchema(this.#database);
     const episodeColumns = this.#database.prepare("PRAGMA table_info(undeclared_settlement_episodes)").all() as Array<{ name: string }>;
     if (!episodeColumns.some((column) => column.name === "notice_text")) {

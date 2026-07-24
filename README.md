@@ -332,6 +332,8 @@ A caller may inspect a known Agent ID, but that does not grant control, ownershi
 
 Inspection reports Agent activation/waiting state, Human Interrupt state, undeclared-settlement correction state, automatic-recovery state, active or committed cancellation operation state, and Request `open`, `answered`, `resolved`, `cancelled`, or `orphaned` state. Automatic recovery is Owner-driven, uses the Agent's persisted launch policy, and is attempted once; its Herdr pane intent is durably identified by an exact workspace/label/cwd before creation, while `blocked-policy` and `exhausted` remain visible for operational follow-up. Request correlation includes requester/responder activation provenance. Cancelled and orphaned Request projections expose notice identity and delivery state without duplicating canonical notice payloads.
 
+Unresolved runtime operations receive durable, runtime-owned review deadlines and project `WATCH` while deterministic reconciliation remains eligible. See [Operation Review](docs/operation-review.md) for deadline, evidence, reconciliation, incident-trigger, and Owner offline/resume semantics.
+
 An explicit child `tools` allowlist remains exact: include `agent_inspect` or `agent_cancel` when that restricted child needs the corresponding operation. Without an explicit allowlist both are available by default; `deny-tools` removes either tool by name.
 
 ## caller_ping — Child-to-Parent Help Request

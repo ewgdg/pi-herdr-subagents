@@ -119,6 +119,10 @@ test("fused final Signal acceptance and completion commit together", () => {
 test("blocked fused completion rolls message acceptance back and exposes exact blockers", () => {
   const f = fixture();
   try {
+    f.owner.addActivationDependency(f.ownership, {
+      kind: "operation",
+      dependencyId: "side-effect:still-unknown",
+    });
     f.owner.beginHumanInterrupt(f.ownership, "human-1");
     const sender = f.owner.agent(f.worker.agentId);
     const message = "cannot finish yet";
@@ -130,7 +134,11 @@ test("blocked fused completion rolls message acceptance back and exposes exact b
         recipientAgentId: f.owner.currentAgent.agentId, sourceEntryId: "send-blocked", payloadDigest: digestPayload(message),
         deliveryTiming: "steer", responseRequired: false, onAccepted: "complete", message, completion: { ownership: f.ownership } } }),
     (error: unknown) => error instanceof CompletionRejectedError
-      && error.blockers.some((blocker) => blocker.kind === "human-interrupt" && blocker.toolCallId === "human-1"));
+      && error.blockers.some((blocker) =>
+        blocker.kind === "human-interrupt" && blocker.toolCallId === "human-1")
+      && error.blockers.some((blocker) =>
+        blocker.kind === "side-effect-uncertainty"
+        && blocker.dependencyId === "side-effect:still-unknown"));
     assert.equal(f.signals.inspectMessage(f.owner.workflow.ownerAgentId, "blocked-final")?.deliveryStatus, "bound");
     assert.equal(f.owner.inspectActivation(sender)?.state.kind, "waiting");
   } finally { f.gate.close(); f.signals.close(); f.owner.close(); }

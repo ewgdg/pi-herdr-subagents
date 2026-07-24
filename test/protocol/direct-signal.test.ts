@@ -54,6 +54,72 @@ function directSignalRuntime(test: TestContext, options: ConstructorParameters<t
 }
 
 describe("direct Signal protocol scenarios", () => {
+  it("continues direct recipient-router communication while the Workflow Owner is offline", async (test) => {
+    const scenario = new WorkflowScenario({ rootDirectory: await temporaryDirectory() });
+    const { runtime: ownerRuntime } = scenario.createOwner();
+    const senderSession = scenario.childSession(ownerRuntime, "offline-sender");
+    const recipientSession = scenario.childSession(ownerRuntime, "offline-recipient");
+    const sender = ownerRuntime.addAgent({
+      session: senderSession,
+      spawner: ownerRuntime.owner(),
+      name: "Sender",
+    });
+    const recipient = ownerRuntime.addAgent({
+      session: recipientSession,
+      spawner: ownerRuntime.owner(),
+      name: "Recipient",
+    });
+    const senderRun = ownerRuntime.startAgentRun(ownerRuntime.agent(sender.agentId));
+    const recipientRun = ownerRuntime.startAgentRun(ownerRuntime.agent(recipient.agentId));
+    const senderRuntime = scenario.startAgent(ownerRuntime.workflow, senderSession);
+    const recipientRuntime = scenario.startAgent(ownerRuntime.workflow, recipientSession);
+    test.after(() => {
+      senderRuntime.close();
+      recipientRuntime.close();
+    });
+    const delivered: string[] = [];
+    const senderSignals = directSignalRuntime(test, {
+      controlPlane: senderRuntime.controlPlane,
+      ownership: senderRun.ownership,
+      allocateMessageId: () => "offline-direct-message",
+      projectInboxBatch() {},
+    });
+    const recipientSignals = directSignalRuntime(test, {
+      controlPlane: recipientRuntime.controlPlane,
+      ownership: recipientRun.ownership,
+      projectInboxBatch(batch) {
+        delivered.push(...batch.messages.map((message) => message.messageId));
+      },
+    });
+    await senderSignals.start();
+    await recipientSignals.start();
+    ownerRuntime.close();
+
+    const sourceEntryId = scenario.transcripts.appendAgentSend(senderSession, {
+      targetAgentId: recipient.agentId,
+      message: "direct while owner offline",
+    });
+    const receipt = await senderSignals.sendMessage({
+      target: { agentId: recipient.agentId },
+      message: "direct while owner offline",
+      sourceEntryId,
+      onAccepted: "continue",
+    });
+    await waitFor(() => delivered.includes(receipt.messageId));
+
+    assert.equal(receipt.messageId, "offline-direct-message");
+    assert.equal(
+      senderSignals.listMessages().filter((message) =>
+        message.messageId === "offline-direct-message").length,
+      1,
+    );
+    const acceptanceReview = senderRuntime.listOperationReviews(
+      senderRuntime.agent(sender.agentId),
+    ).find((review) => review.dependencyId === "acceptance:offline-direct-message");
+    assert.equal(typeof acceptanceReview?.operationReviewId, "number");
+    assert.equal(acceptanceReview?.status, "resolved");
+  });
+
   it("reconciles the acceptance winner after losing conditional safe rejection", async (test) => {
     for (const onAccepted of ["continue", "complete"] as const) {
       const rootDirectory = await temporaryDirectory();

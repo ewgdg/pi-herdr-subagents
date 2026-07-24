@@ -42,6 +42,15 @@ import {
   type ActivationRecoveryRecord,
   type RecoveryPaneIntent,
 } from "./activation-recovery.ts";
+import {
+  OperationReviewStore,
+  type OperationEvidence,
+  type OperationReviewPolicy,
+  type OperationReviewRecord,
+  type OperationReconciliationOutcome,
+  type OperationIncidentTrigger,
+  type WatchAttention,
+} from "./operation-review.ts";
 
 export type {
   AgentCapabilityConfiguration,
@@ -70,6 +79,7 @@ export interface StartWorkflowOwnerOptions {
   ownerSessionPath: string;
   ownerName?: string;
   ownerCapabilities?: AgentCapabilityConfiguration;
+  operationReviewPolicy?: OperationReviewPolicy;
   now?: () => number;
 }
 
@@ -124,6 +134,7 @@ export class WorkflowControlPlane {
   readonly #messageInspection: DirectSignalInspectionStore;
   readonly #cancellations: ActivationCancellationStore;
   readonly #recoveries: ActivationRecoveryStore;
+  readonly #operationReviews: OperationReviewStore;
   readonly #now: () => number;
   readonly #currentAgentId: string;
   #closed = false;
@@ -135,6 +146,7 @@ export class WorkflowControlPlane {
     activations: ActivationLifecycleStore,
     now: () => number,
     currentAgentId: string,
+    operationReviewPolicy?: OperationReviewPolicy,
   ) {
     this.workflow = workflow;
     this.#store = store;
@@ -143,6 +155,8 @@ export class WorkflowControlPlane {
     this.#messageInspection = new DirectSignalInspectionStore(workflow.databasePath);
     this.#cancellations = new ActivationCancellationStore(workflow.databasePath);
     this.#recoveries = new ActivationRecoveryStore(workflow.databasePath);
+    this.#operationReviews = new OperationReviewStore(workflow.databasePath);
+    if (operationReviewPolicy) this.#operationReviews.configurePolicy(operationReviewPolicy);
     this.#now = now;
     this.#currentAgentId = currentAgentId;
   }
@@ -185,6 +199,7 @@ export class WorkflowControlPlane {
       new ActivationLifecycleStore(workflow.databasePath),
       now,
       workflow.ownerAgentId,
+      options.operationReviewPolicy,
     );
   }
 
@@ -303,6 +318,7 @@ export class WorkflowControlPlane {
     this.#messageInspection.close();
     this.#cancellations.close();
     this.#recoveries.close();
+    this.#operationReviews.close();
     this.#store.close();
     this.#closed = true;
   }
@@ -448,6 +464,7 @@ export class WorkflowControlPlane {
       inspectUndeclaredEpisode: (agent) => this.#activations.inspectUndeclaredEpisode(agent),
       inspectActivationCancellation: (agent) => this.#cancellations.inspectForAgent(agent),
       inspectActivationRecovery: (agent) => this.#recoveries.inspect(agent),
+      inspectOperationReviews: (agent) => this.#operationReviews.listForAgent(agent.agentId),
       inspectRequestProjection: (requestId) => this.#messageInspection.inspectRequestProjection(this.workflow.ownerAgentId, requestId),
       now: this.#now,
     }).inspect(target);
@@ -551,6 +568,93 @@ export class WorkflowControlPlane {
     this.#assertOpen();
     this.#assertReference(agent);
     return this.#activations.inspect(agent);
+  }
+
+  inspectOperationReview(operationReviewId: number): OperationReviewRecord | undefined {
+    this.#assertOpen();
+    return this.#operationReviews.inspect(operationReviewId);
+  }
+
+  listOperationReviews(agent: AgentReference): OperationReviewRecord[] {
+    this.#assertOpen();
+    this.#assertReference(agent);
+    return this.#operationReviews.listHistoryForAgent(agent.agentId);
+  }
+
+  listOperationReviewEvidence(operationReviewId: number): OperationEvidence[] {
+    this.#assertOpen();
+    if (!this.#operationReviews.inspect(operationReviewId)) {
+      throw new WorkflowProtocolError(
+        "UnknownLifecycleDependency",
+        `Unknown Operation Review ${operationReviewId}`,
+      );
+    }
+    return this.#operationReviews.listEvidence(operationReviewId);
+  }
+
+  recordOperationEvidence(
+    operationReviewId: number,
+    evidence: Omit<OperationEvidence, "observedAtMs">,
+  ): OperationReviewRecord {
+    this.#assertOpen();
+    return this.#operationReviews.recordEvidence(
+      this.currentAgent,
+      operationReviewId,
+      evidence,
+      this.#now(),
+    );
+  }
+
+  listWorkflowAttention(): WatchAttention[] {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError(
+        "WorkflowMismatch",
+        "Only the Workflow Owner can enumerate Workflow attention",
+      );
+    }
+    return this.#operationReviews.listWatchAttention();
+  }
+
+  async reconcileOperationReviews(
+    reconcile: (
+      review: OperationReviewRecord,
+    ) => OperationReconciliationOutcome | Promise<OperationReconciliationOutcome>,
+    options: { dueOnly?: boolean } = {},
+  ): Promise<OperationReviewRecord[]> {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError(
+        "WorkflowMismatch",
+        "Only the live Workflow Owner can run workflow-wide Operation Review",
+      );
+    }
+    const results: OperationReviewRecord[] = [];
+    const reviews = options.dueOnly
+      ? this.#operationReviews.listDue(this.#now())
+      : this.#operationReviews.listReconcilable();
+    for (const review of reviews) {
+      const outcome = await reconcile(review);
+      const result = this.#operationReviews.applyReconciliation(
+        this.currentAgent,
+        review,
+        outcome,
+        this.#now(),
+      );
+      if (result) results.push(result);
+    }
+    return results;
+  }
+
+  listOperationIncidentTriggers(): OperationIncidentTrigger[] {
+    this.#assertOpen();
+    if (this.#currentAgentId !== this.workflow.ownerAgentId) {
+      throw new WorkflowProtocolError(
+        "WorkflowMismatch",
+        "Only the Workflow Owner can enumerate incident triggers",
+      );
+    }
+    return this.#operationReviews.listIncidentTriggers();
   }
 
   addActivationDependency(
