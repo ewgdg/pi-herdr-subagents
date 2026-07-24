@@ -51,6 +51,11 @@ import {
   type OperationIncidentTrigger,
   type WatchAttention,
 } from "./operation-review.ts";
+import {
+  OperationalIncidentStore,
+  type IncidentBrief,
+  type OperationalIncident,
+} from "./operational-incidents.ts";
 
 export type {
   AgentCapabilityConfiguration,
@@ -60,6 +65,11 @@ export type {
   WorkflowRecord,
 } from "./workflow-types.ts";
 export { WorkflowProtocolError } from "./workflow-types.ts";
+export type {
+  IncidentBrief,
+  OperationalIncident,
+  OperationalIncidentTrigger,
+} from "./operational-incidents.ts";
 export type {
   ActivationDependency,
   ActivationRecord,
@@ -135,6 +145,7 @@ export class WorkflowControlPlane {
   readonly #cancellations: ActivationCancellationStore;
   readonly #recoveries: ActivationRecoveryStore;
   readonly #operationReviews: OperationReviewStore;
+  readonly #operationalIncidents: OperationalIncidentStore;
   readonly #now: () => number;
   readonly #currentAgentId: string;
   #closed = false;
@@ -156,6 +167,7 @@ export class WorkflowControlPlane {
     this.#cancellations = new ActivationCancellationStore(workflow.databasePath);
     this.#recoveries = new ActivationRecoveryStore(workflow.databasePath);
     this.#operationReviews = new OperationReviewStore(workflow.databasePath);
+    this.#operationalIncidents = new OperationalIncidentStore(workflow.databasePath);
     if (operationReviewPolicy) this.#operationReviews.configurePolicy(operationReviewPolicy);
     this.#now = now;
     this.#currentAgentId = currentAgentId;
@@ -319,6 +331,7 @@ export class WorkflowControlPlane {
     this.#cancellations.close();
     this.#recoveries.close();
     this.#operationReviews.close();
+    this.#operationalIncidents.close();
     this.#store.close();
     this.#closed = true;
   }
@@ -655,6 +668,26 @@ export class WorkflowControlPlane {
       );
     }
     return this.#operationReviews.listIncidentTriggers();
+  }
+
+  reconcileOperationalIncidents(): OperationalIncident[] {
+    this.#assertOpen();
+    return this.#operationalIncidents.reconcile(this.currentAgent, this.#now());
+  }
+
+  listOperationalIncidents(): OperationalIncident[] {
+    this.#assertOpen();
+    return this.#operationalIncidents.list(this.currentAgent);
+  }
+
+  inspectOperationalIncident(incidentId: string): OperationalIncident | undefined {
+    this.#assertOpen();
+    return this.#operationalIncidents.inspect(this.currentAgent, incidentId);
+  }
+
+  inspectIncidentBrief(incidentId: string): IncidentBrief | undefined {
+    this.#assertOpen();
+    return this.#operationalIncidents.inspectBrief(this.currentAgent, incidentId);
   }
 
   addActivationDependency(

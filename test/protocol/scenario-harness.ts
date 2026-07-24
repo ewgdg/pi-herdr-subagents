@@ -336,6 +336,7 @@ export class ControllableRuntimeAdapter {
     name: string;
     agentDefinition?: string;
     capabilities?: AgentCapabilityConfiguration;
+    launchPolicy?: import("../../pi-extension/subagents/protocol/workflow-types.ts").AgentLaunchPolicy;
   }): AgentRecord {
     if (!input.session.workflowBinding) {
       throw new Error(`Scenario session is not bound to a Workflow: ${input.session.sessionPath}`);
@@ -347,6 +348,7 @@ export class ControllableRuntimeAdapter {
       name: input.name,
       agentDefinition: input.agentDefinition,
       capabilities: input.capabilities,
+      launchPolicy: input.launchPolicy,
       sessionBinding: input.session.workflowBinding,
     });
   }
@@ -411,6 +413,22 @@ export class ControllableRuntimeAdapter {
 
   listOperationIncidentTriggers() {
     return this.#controlPlane.listOperationIncidentTriggers();
+  }
+
+  reconcileOperationalIncidents() {
+    return this.#controlPlane.reconcileOperationalIncidents();
+  }
+
+  listOperationalIncidents() {
+    return this.#controlPlane.listOperationalIncidents();
+  }
+
+  inspectOperationalIncident(incidentId: string) {
+    return this.#controlPlane.inspectOperationalIncident(incidentId);
+  }
+
+  inspectIncidentBrief(incidentId: string) {
+    return this.#controlPlane.inspectIncidentBrief(incidentId);
   }
 
   addActivationDependency(

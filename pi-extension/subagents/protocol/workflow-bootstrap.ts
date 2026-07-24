@@ -63,6 +63,7 @@ const SESSION_BOOTSTRAP_RETRY_MS = 25;
 const AUTOMATIC_RECOVERY_RECONCILIATION_RETRY_MS = 25;
 const AUTOMATIC_RECOVERY_RECONCILIATION_MAX_ATTEMPTS = 8;
 const OPERATION_REVIEW_DISCOVERY_INTERVAL_MS = 1_000;
+const OPERATIONAL_INCIDENT_DISCOVERY_INTERVAL_MS = 1_000;
 
 export interface WorkflowBootstrapContext {
   sessionManager?: {
@@ -174,6 +175,8 @@ export class WorkflowBootstrap {
   #operationReviewTimer: ReturnType<typeof setTimeout> | undefined;
   #operationReviewPromise: Promise<void> | undefined;
   #operationReviewGeneration = 0;
+  #operationalIncidentTimer: ReturnType<typeof setTimeout> | undefined;
+  #operationalIncidentGeneration = 0;
   #automaticRecoveryRequested: (() => void | Promise<void>) | undefined;
   #automaticRecoveryReconciled: ((results: AutomaticRecoveryRunReconciliation[]) => void | Promise<void>) | undefined;
   #directSignals: DirectSignalRuntime | undefined;
@@ -361,6 +364,7 @@ export class WorkflowBootstrap {
   close(): void {
     this.#stopAutomaticRecoveryReconciliation();
     this.#stopOperationReviewReconciliation();
+    this.#stopOperationalIncidentReconciliation();
     if (this.#directSignals) {
       const preserveRouterRegistration = Boolean(
         this.#selfOwnership && this.isCancellationOwnedRun(this.#selfOwnership),
@@ -448,6 +452,7 @@ export class WorkflowBootstrap {
       input.onAutomaticRecoveryRequested,
       input.onAutomaticRecoveryReconciled,
     );
+    this.#restartOperationalIncidentReconciliation();
     await this.#restartOperationReviewReconciliation();
   }
 
@@ -525,6 +530,7 @@ export class WorkflowBootstrap {
   async closeDirectSignalRouter(): Promise<void> {
     this.#stopAutomaticRecoveryReconciliation();
     this.#stopOperationReviewReconciliation();
+    this.#stopOperationalIncidentReconciliation();
     const runtime = this.#directSignals;
     this.#directSignals = undefined;
     const preserveRouterRegistration = Boolean(
@@ -539,6 +545,22 @@ export class WorkflowBootstrap {
 
   listOperationIncidentTriggers() {
     return this.#requireControlPlane().listOperationIncidentTriggers();
+  }
+
+  reconcileOperationalIncidents() {
+    return this.#requireControlPlane().reconcileOperationalIncidents();
+  }
+
+  listOperationalIncidents() {
+    return this.#requireControlPlane().listOperationalIncidents();
+  }
+
+  inspectOperationalIncident(incidentId: string) {
+    return this.#requireControlPlane().inspectOperationalIncident(incidentId);
+  }
+
+  inspectIncidentBrief(incidentId: string) {
+    return this.#requireControlPlane().inspectIncidentBrief(incidentId);
   }
 
   listWorkflowAttention() {
@@ -1199,6 +1221,57 @@ export class WorkflowBootstrap {
     this.#automaticRecoveryReconciliationAttempts = 0;
     this.#automaticRecoveryRequested = undefined;
     this.#automaticRecoveryReconciled = undefined;
+  }
+
+  #restartOperationalIncidentReconciliation(): void {
+    this.#stopOperationalIncidentReconciliation();
+    const controlPlane = this.#controlPlane;
+    if (!controlPlane || controlPlane.currentAgent.agentId !== controlPlane.workflow.ownerAgentId) return;
+    const generation = ++this.#operationalIncidentGeneration;
+    try {
+      this.#runOperationalIncidentReconciliation(generation);
+    } catch (error) {
+      this.#reportOperationalIncidentReconciliationFailure(error);
+      this.#scheduleOperationalIncidentReconciliation(generation);
+    }
+  }
+
+  #runOperationalIncidentReconciliation(generation: number): void {
+    if (generation !== this.#operationalIncidentGeneration) return;
+    const controlPlane = this.#controlPlane;
+    if (!controlPlane || controlPlane.currentAgent.agentId !== controlPlane.workflow.ownerAgentId) return;
+    controlPlane.reconcileOperationalIncidents();
+    this.#scheduleOperationalIncidentReconciliation(generation);
+  }
+
+  #scheduleOperationalIncidentReconciliation(generation: number): void {
+    if (generation !== this.#operationalIncidentGeneration || this.#operationalIncidentTimer) return;
+    this.#operationalIncidentTimer = setTimeout(() => {
+      this.#operationalIncidentTimer = undefined;
+      if (generation !== this.#operationalIncidentGeneration) return;
+      try {
+        this.#runOperationalIncidentReconciliation(generation);
+      } catch (error) {
+        this.#reportOperationalIncidentReconciliationFailure(error);
+        this.#scheduleOperationalIncidentReconciliation(generation);
+      }
+    }, OPERATIONAL_INCIDENT_DISCOVERY_INTERVAL_MS);
+    this.#operationalIncidentTimer.unref?.();
+  }
+
+  #stopOperationalIncidentReconciliation(): void {
+    this.#operationalIncidentGeneration += 1;
+    if (!this.#operationalIncidentTimer) return;
+    clearTimeout(this.#operationalIncidentTimer);
+    this.#operationalIncidentTimer = undefined;
+  }
+
+  #reportOperationalIncidentReconciliationFailure(error: unknown): void {
+    process.emitWarning(
+      `Scheduled Operational Incident reconciliation failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
   }
 
   async #restartOperationReviewReconciliation(): Promise<void> {
